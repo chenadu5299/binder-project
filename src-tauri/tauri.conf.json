@@ -1,0 +1,40 @@
+{
+  "productName": "Binder",
+  "version": "0.1.0",
+  "identifier": "com.binder.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Binder（合页）",
+        "width": 1200,
+        "height": 800,
+        "resizable": true,
+        "fullscreen": false,
+        "devtools": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png"
+    ],
+    "resources": [],
+    "copyright": "",
+    "category": "Productivity",
+    "shortDescription": "AI 智能办公套件",
+    "longDescription": "Binder（合页）是一个面向创作者的 AI 智能办公套件，提供文档、表格、演示文稿三大核心能力，配备全面的 AI 辅助功能和完善的本地资源管理系统。"
+  }
+}

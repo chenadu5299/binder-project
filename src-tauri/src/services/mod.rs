@@ -1,0 +1,14 @@
+pub mod file_system;
+pub mod file_tree;
+pub mod file_watcher;
+pub mod workspace;
+pub mod pandoc_service;
+pub mod image_service;
+pub mod ai_config;
+pub mod ai_error;
+pub mod ai_queue;
+pub mod ai_providers;
+pub mod ai_service;
+pub mod api_key_manager;
+pub mod search_service;
+pub mod memory_service;
