@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use crate::services::ai_error::AIError;
-use crate::services::ai_providers::{AIProvider, ChatMessage, ModelConfig};
+use crate::services::ai_providers::{AIProvider, ChatMessage, ModelConfig, ChatChunk, ToolDefinition};
 use serde::{Deserialize, Serialize};
 use tokio_stream::{Stream, StreamExt};
 use std::pin::Pin;
@@ -228,7 +228,8 @@ impl AIProvider for OpenAIProvider {
         messages: &[ChatMessage],
         model_config: &ModelConfig,
         _cancel_rx: &mut tokio::sync::oneshot::Receiver<()>,
-    ) -> Result<Box<dyn tokio_stream::Stream<Item = Result<String, AIError>> + Send + Unpin>, AIError> {
+        _tools: Option<&[ToolDefinition]>,
+    ) -> Result<Box<dyn tokio_stream::Stream<Item = Result<ChatChunk, AIError>> + Send + Unpin>, AIError> {
         let url = format!("{}/chat/completions", self.base_url);
         let request_body = ChatRequest {
             model: model_config.model.clone(),
@@ -277,14 +278,14 @@ impl AIProvider for OpenAIProvider {
                         if line.starts_with("data: ") {
                             let json_str = &line[6..];
                             if json_str == "[DONE]" {
-                                return Ok(String::new());
+                                return Ok(ChatChunk::Text(String::new()));
                             }
                             match serde_json::from_str::<ChatResponse>(json_str) {
                                 Ok(chat_response) => {
                                     if let Some(choice) = chat_response.choices.first() {
                                         if let Some(delta) = &choice.delta {
                                             if let Some(content) = &delta.content {
-                                                return Ok(content.clone());
+                                                return Ok(ChatChunk::Text(content.clone()));
                                             }
                                         }
                                     }
@@ -293,14 +294,14 @@ impl AIProvider for OpenAIProvider {
                             }
                         }
                     }
-                    Ok(String::new())
+                    Ok(ChatChunk::Text(String::new()))
                 }
                 Err(e) => Err(AIError::NetworkError(e.to_string())),
             }
         });
         
         // 包装为 Box<dyn Stream>
-        let boxed_stream: Box<dyn tokio_stream::Stream<Item = Result<String, AIError>> + Send + Unpin> = 
+        let boxed_stream: Box<dyn tokio_stream::Stream<Item = Result<ChatChunk, AIError>> + Send + Unpin> = 
             Box::new(stream);
         
         Ok(boxed_stream)

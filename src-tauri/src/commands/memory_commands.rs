@@ -72,3 +72,15 @@ pub async fn get_all_memories(
         .map_err(|e| format!("获取所有记忆失败: {}", e))
 }
 
+#[tauri::command]
+pub async fn check_memory_consistency(
+    workspace_path: String,
+) -> Result<Vec<crate::services::memory_service::ConsistencyIssue>, String> {
+    let path = PathBuf::from(workspace_path);
+    let service = MemoryService::new(&path)
+        .map_err(|e| format!("初始化记忆服务失败: {}", e))?;
+    
+    service.check_consistency()
+        .map_err(|e| format!("一致性检查失败: {}", e))
+}
+

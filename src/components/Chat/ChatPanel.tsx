@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { useLayoutStore } from '../../stores/layoutStore';
 import { useChatStore } from '../../stores/chatStore';
@@ -9,6 +9,9 @@ import { ModelSelector } from './ModelSelector';
 import MemoryTab from '../Memory/MemoryTab';
 import SearchPanel from '../Search/SearchPanel';
 import { PlusIcon, BookOpenIcon, MagnifyingGlassIcon } from '@heroicons/react/24/outline';
+import { parseToolCalls, removeToolCalls } from '../../utils/toolCallParser';
+import { ToolCall } from '../../types/tool';
+import { aggressiveJSONRepair, extractKeyParams } from '../../utils/jsonRepair';
 
 type TabType = 'chat' | 'memory' | 'search';
 
@@ -16,6 +19,21 @@ const ChatPanel: React.FC = () => {
     const { chat, setChatVisible } = useLayoutStore();
     const { tabs, activeTabId, createTab, setActiveTab } = useChatStore();
     const [activeSubTab, setActiveSubTab] = useState<TabType>('chat');
+    
+    // ⚠️ 关键修复：前端重复内容检测（二次防护）
+    // 用于跟踪每个 tab 的累积文本，防止重复追加
+    // 按照文档实现：前端累积文本用于二次去重防护
+    const accumulatedTextRef = useRef<Map<string, string>>(new Map());
+
+    // 暴露切换标签页的方法给外部使用（用于跳转功能）
+    useEffect(() => {
+        (window as any).switchToMemoryTab = () => {
+            setActiveSubTab('memory');
+        };
+        return () => {
+            delete (window as any).switchToMemoryTab;
+        };
+    }, []);
 
     // 如果没有标签页，创建一个默认标签页
     useEffect(() => {
@@ -43,23 +61,69 @@ const ChatPanel: React.FC = () => {
                         chunk: string;
                         done: boolean;
                         error?: string;
+                        tool_call?: {
+                            id: string;
+                            name: string;
+                            arguments: string | object;
+                            status?: 'pending' | 'executing' | 'completed' | 'failed';
+                            result?: any;
+                            error?: string;
+                        };
                     };
+                    
+                    // 关键修复：过滤空 chunk，避免处理空事件
+                    const chunk = (payload.chunk || '').toString();
+                    const isEmptyChunk = !payload.tool_call && chunk.length === 0 && !payload.done && !payload.error;
+                    
+                    if (isEmptyChunk) {
+                        // 跳过空 chunk，不记录日志，避免日志污染
+                        return;
+                    }
+                    
+                    // 如果只有 tool_call 但没有其他内容，也要检查 tool_call 是否有效
+                    if (payload.tool_call && !payload.tool_call.id) {
+                        // 无效的 tool_call，跳过
+                        return;
+                    }
                     
                     console.log('📨 收到聊天流式响应:', { 
                         tab_id: payload.tab_id, 
-                        chunk_length: payload.chunk.length,
+                        chunk_length: chunk.length,
                         done: payload.done,
-                        has_error: !!payload.error 
+                        has_error: !!payload.error,
+                        has_tool_call: !!payload.tool_call
                     });
                     
-                    const { tabs, appendToMessage, updateMessage, setMessageLoading } = useChatStore.getState();
+                    const { tabs, appendToMessage, updateMessage, setMessageLoading, addToolCall, updateToolCall } = useChatStore.getState();
                     const tab = tabs.find(t => t.id === payload.tab_id);
                     if (!tab) {
-                        console.warn('⚠️ 未找到对应的聊天标签页:', payload.tab_id);
+                        // ⚠️ 关键修复：如果找不到 tab，可能是 tab 被删除了，或者 tab_id 不匹配
+                        // 尝试查找所有 tab，看看是否有匹配的
+                        const allTabIds = tabs.map(t => t.id);
+                        console.warn('⚠️ 未找到对应的聊天标签页:', payload.tab_id, '当前所有 tab IDs:', allTabIds);
+                        
+                        // 如果没有任何 tab，可能是初始化问题，直接返回
+                        if (tabs.length === 0) {
+                            console.warn('⚠️ 没有任何标签页，跳过处理');
+                            return;
+                        }
+                        
+                        // 如果 tab_id 不匹配，可能是后端使用了错误的 tab_id
+                        // 尝试使用当前活动的 tab（作为后备方案）
+                        const activeTab = tabs.find(t => t.id === activeTabId);
+                        if (activeTab && activeTab.messages.length > 0) {
+                            console.warn('⚠️ 使用活动标签页作为后备:', activeTab.id);
+                            // 不直接使用，因为可能导致消息混乱
+                            // 直接返回，等待正确的 tab_id
+                        }
                         return;
                     }
                     
                     const lastMessage = tab.messages[tab.messages.length - 1];
+                    if (!lastMessage) {
+                        console.warn('⚠️ 标签页没有消息:', payload.tab_id);
+                        return;
+                    }
                     
                     if (payload.error) {
                         // 错误处理
@@ -77,13 +141,182 @@ const ChatPanel: React.FC = () => {
                         console.log('✅ 聊天流式响应完成');
                         if (lastMessage) {
                             setMessageLoading(payload.tab_id, lastMessage.id, false);
+                            
+                            // 按照文档：流式响应完成，同步累积文本
+                            const tabId = payload.tab_id;
+                            const messageId = lastMessage.id;
+                            const cacheKey = `${tabId}:${messageId}`;
+                            const accumulated = accumulatedTextRef.current.get(cacheKey) || '';
+                            if (accumulated && lastMessage.content !== accumulated) {
+                                updateMessage(payload.tab_id, lastMessage.id, accumulated);
+                            }
                         }
                         return;
                     }
                     
-                    // 追加内容
-                    if (lastMessage && lastMessage.role === 'assistant' && lastMessage.isLoading !== false) {
-                        appendToMessage(payload.tab_id, lastMessage.id, payload.chunk);
+                    // 处理工具调用
+                    if (payload.tool_call) {
+                        const toolCall = payload.tool_call;
+                        
+                        // 如果 arguments 是空字符串，跳过（避免解析错误）
+                        if (typeof toolCall.arguments === 'string' && toolCall.arguments.trim() === '') {
+                            console.warn('⚠️ 工具调用 arguments 为空，跳过处理:', toolCall.id, toolCall.name);
+                            return;
+                        }
+                        
+                        try {
+                            // 安全解析 arguments
+                            let parsedArguments: any = toolCall.arguments;
+                            if (typeof toolCall.arguments === 'string') {
+                                const argsStr = toolCall.arguments.trim();
+                                
+                                // 只有在工具调用完成或失败时才尝试解析 JSON
+                                // executing 状态时，arguments 可能不完整，不应该解析
+                                if (toolCall.status === 'completed' || toolCall.status === 'failed' || toolCall.result || toolCall.error) {
+                                    // 尝试解析 JSON
+                                    try {
+                                        parsedArguments = JSON.parse(argsStr);
+                                    } catch (e) {
+                                        console.warn('工具调用 arguments JSON 解析失败，使用增强修复工具:', e, '原始:', argsStr);
+                                        
+                                        // 使用增强的 JSON 修复工具
+                                        const repaired = aggressiveJSONRepair(argsStr);
+                                        if (repaired) {
+                                            parsedArguments = repaired;
+                                            console.log('✅ JSON 修复成功:', parsedArguments);
+                                        } else {
+                                            console.error('❌ JSON 修复失败，使用空对象');
+                                            parsedArguments = {};
+                                        }
+                                    }
+                                } else {
+                                    // 工具调用进行中（pending 或 executing），arguments 可能不完整，暂时使用空对象
+                                    parsedArguments = {};
+                                }
+                            }
+                            
+                            // 确定工具调用状态
+                            let toolCallStatus: 'pending' | 'executing' | 'completed' | 'failed' = 'pending';
+                            if (toolCall.status) {
+                                // 使用后端发送的 status
+                                if (toolCall.status === 'completed' || toolCall.status === 'failed') {
+                                    toolCallStatus = toolCall.status;
+                                } else if (toolCall.status === 'executing') {
+                                    toolCallStatus = 'executing';
+                                } else {
+                                    toolCallStatus = 'pending';
+                                }
+                            } else if (toolCall.result) {
+                                toolCallStatus = 'completed';
+                            } else if (toolCall.error) {
+                                toolCallStatus = 'failed';
+                            }
+                            
+                            const toolCallObj: ToolCall = {
+                                id: toolCall.id || `tool-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+                                name: toolCall.name,
+                                arguments: parsedArguments,
+                                status: toolCallStatus,
+                                timestamp: Date.now(),
+                                result: toolCall.result,
+                                error: toolCall.error,
+                            };
+                            
+                            console.log('🔧 处理工具调用:', {
+                                id: toolCallObj.id,
+                                name: toolCallObj.name,
+                                status: toolCallObj.status,
+                                arguments: parsedArguments,
+                                argumentsLength: typeof toolCall.arguments === 'string' ? toolCall.arguments.length : 'object',
+                                hasResult: !!toolCall.result,
+                                result: toolCall.result,
+                                hasError: !!toolCall.error,
+                                error: toolCall.error,
+                            });
+                            
+                            // 添加工具调用到消息
+                            if (lastMessage) {
+                                // 检查是否已存在该工具调用
+                                const existingToolCall = lastMessage.toolCalls?.find(tc => tc.id === toolCallObj.id);
+                                if (existingToolCall) {
+                                    // 更新现有工具调用
+                                    updateToolCall(payload.tab_id, lastMessage.id, toolCallObj.id, {
+                                        arguments: parsedArguments,
+                                        status: toolCallStatus,
+                                        result: toolCall.result,
+                                        error: toolCall.error,
+                                    });
+                                } else {
+                                    // 添加新工具调用
+                                    addToolCall(payload.tab_id, lastMessage.id, toolCallObj);
+                                }
+                                
+                                // 差异化确认逻辑：只有 edit_current_editor_document 需要确认
+                                // 其他文件操作（create_file, delete_file, update_file 等）自动执行
+                                const needsConfirmation = toolCallObj.name === 'edit_current_editor_document';
+                                
+                                if (!needsConfirmation && toolCallStatus === 'executing' && !toolCall.result && !toolCall.error) {
+                                    // 自动执行不需要确认的工具
+                                    console.log('🚀 自动执行工具调用（无需确认）:', toolCallObj.name);
+                                    // 工具已经在后端执行，这里只是标记状态
+                                    // 实际执行由后端完成，前端只需要等待结果
+                                }
+                                
+                                // 如果有结果或错误，更新工具调用状态
+                                if (toolCall.result) {
+                                    updateToolCall(payload.tab_id, lastMessage.id, toolCallObj.id, {
+                                        status: 'completed',
+                                        result: toolCall.result,
+                                    });
+                                } else if (toolCall.error) {
+                                    updateToolCall(payload.tab_id, lastMessage.id, toolCallObj.id, {
+                                        status: 'failed',
+                                        error: toolCall.error,
+                                    });
+                                }
+                            }
+                        } catch (e) {
+                            console.error('处理工具调用失败:', e, toolCall);
+                        }
+                    }
+                    
+                    // 追加内容（只有在没有工具调用事件时才处理 chunk）
+                    if (!payload.tool_call && lastMessage && lastMessage.role === 'assistant' && lastMessage.isLoading !== false) {
+                        // 关键修复：确保 chunk 不为空
+                        if (!chunk || chunk.length === 0) {
+                            return;
+                        }
+                        
+                        // 按照文档实现：前端二次去重防护
+                        const tabId = payload.tab_id;
+                        const messageId = lastMessage.id;
+                        const cacheKey = `${tabId}:${messageId}`;
+                        const accumulated = accumulatedTextRef.current.get(cacheKey) || '';
+                        
+                        // 检查是否重复
+                        if (accumulated.endsWith(chunk)) {
+                            console.warn('⚠️ [前端] 检测到重复 chunk，跳过:', 
+                                chunk.length > 50 ? chunk.substring(0, 50) + '...' : chunk);
+                            return;
+                        }
+                        
+                        // 更新累积文本
+                        accumulatedTextRef.current.set(cacheKey, accumulated + chunk);
+                        
+                        // 检查是否包含工具调用（XML 格式）
+                        const toolCalls = parseToolCalls(chunk);
+                        if (toolCalls.length > 0) {
+                            toolCalls.forEach(toolCall => {
+                                addToolCall(payload.tab_id, lastMessage.id, toolCall);
+                            });
+                            const cleanChunk = removeToolCalls(chunk);
+                            if (cleanChunk && cleanChunk.length > 0) {
+                                appendToMessage(payload.tab_id, lastMessage.id, cleanChunk);
+                            }
+                        } else {
+                            // 追加文本
+                            appendToMessage(payload.tab_id, lastMessage.id, chunk);
+                        }
                     }
                 });
                 
@@ -106,8 +339,23 @@ const ChatPanel: React.FC = () => {
                 console.log('🔧 清理聊天事件监听');
                 unlistenFn();
             }
+            // 组件卸载，清理累积文本
+            accumulatedTextRef.current.clear();
         };
     }, []); // 只在组件挂载时初始化一次
+    
+    // 按照文档：清理已完成消息的累积文本
+    useEffect(() => {
+        tabs.forEach(tab => {
+            const assistantMessages = tab.messages.filter(m => m.role === 'assistant');
+            assistantMessages.forEach((msg, idx) => {
+                const cacheKey = `${tab.id}:${msg.id}`;
+                if (msg.isLoading === false && idx < assistantMessages.length - 1) {
+                    accumulatedTextRef.current.delete(cacheKey);
+                }
+            });
+        });
+    }, [tabs]);
 
     const handleToggle = () => {
         setChatVisible(!chat.visible);
@@ -208,9 +456,19 @@ const ChatPanel: React.FC = () => {
                     {/* 消息区域 */}
                     {activeTab ? (
                         <>
+                            {/* Agent 模式：移除独立编辑窗口，通过对话和工具调用来编辑 */}
                             <ChatMessages
                                 messages={activeTab.messages}
                                 onCopy={handleCopy}
+                                tabId={activeTab.id}
+                                onRegenerate={() => {
+                                    const { regenerate } = useChatStore.getState();
+                                    regenerate(activeTab.id);
+                                }}
+                                onDelete={(messageId) => {
+                                    const { deleteMessage } = useChatStore.getState();
+                                    deleteMessage(activeTab.id, messageId);
+                                }}
                             />
                             <ChatInput tabId={activeTab.id} />
                         </>

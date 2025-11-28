@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
+use crate::utils::error_helpers::{db_lock_error, get_current_timestamp, json_serialize_error};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Memory {
@@ -116,10 +117,17 @@ impl MemoryService {
     
     /// 添加记忆
     pub fn add_memory(&self, memory: Memory) -> SqlResult<()> {
-        let conn = self.db.lock().unwrap();
+        let conn = self.db.lock()
+            .map_err(|e| rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
+                Some(format!("获取数据库连接失败: {}", e))
+            ))?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .map_err(|e| rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
+                Some(format!("获取时间失败: {}", e))
+            ))?
             .as_secs() as i64;
         
         let entity_type_str = match &memory.entity_type {
@@ -146,7 +154,8 @@ impl MemoryService {
                 entity_type_str,
                 memory.entity_name,
                 memory.content,
-                serde_json::to_string(&memory.metadata).unwrap(),
+                serde_json::to_string(&memory.metadata)
+                    .map_err(json_serialize_error)?,
                 source_str,
                 memory.confidence,
                 now,
@@ -159,7 +168,7 @@ impl MemoryService {
     
     /// 获取文档的所有记忆
     pub fn get_memories(&self, document_path: &str) -> SqlResult<Vec<Memory>> {
-        let conn = self.db.lock().unwrap();
+        let conn = self.db.lock().map_err(db_lock_error)?;
         
         let mut stmt = conn.prepare(
             "SELECT id, document_path, entity_type, entity_name, content, metadata, source, confidence
@@ -211,7 +220,7 @@ impl MemoryService {
     
     /// 搜索记忆
     pub fn search_memories(&self, query: &str) -> SqlResult<Vec<Memory>> {
-        let conn = self.db.lock().unwrap();
+        let conn = self.db.lock().map_err(db_lock_error)?;
         
         let mut stmt = conn.prepare(
             "SELECT id, document_path, entity_type, entity_name, content, metadata, source, confidence
@@ -265,7 +274,7 @@ impl MemoryService {
     
     /// 删除记忆
     pub fn delete_memory(&self, memory_id: &str) -> SqlResult<()> {
-        let conn = self.db.lock().unwrap();
+        let conn = self.db.lock().map_err(db_lock_error)?;
         
         conn.execute("DELETE FROM memories WHERE id = ?1", params![memory_id])?;
         
@@ -274,7 +283,7 @@ impl MemoryService {
     
     /// 获取所有记忆（用于记忆库视图）
     pub fn get_all_memories(&self) -> SqlResult<Vec<Memory>> {
-        let conn = self.db.lock().unwrap();
+        let conn = self.db.lock().map_err(db_lock_error)?;
         
         let mut stmt = conn.prepare(
             "SELECT id, document_path, entity_type, entity_name, content, metadata, source, confidence
@@ -322,5 +331,67 @@ impl MemoryService {
         
         Ok(memories)
     }
+
+    /// 检查记忆库一致性
+    pub fn check_consistency(&self) -> SqlResult<Vec<ConsistencyIssue>> {
+        let conn = self.db.lock().map_err(db_lock_error)?;
+        let mut issues = Vec::new();
+
+        // 检查重复名称
+        let mut stmt = conn.prepare(
+            "SELECT entity_name, entity_type, COUNT(*) as count, GROUP_CONCAT(id) as ids
+             FROM memories
+             GROUP BY entity_name, entity_type
+             HAVING count > 1"
+        )?;
+
+        let duplicate_rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+
+        for row in duplicate_rows {
+            let (name, entity_type, count, ids_str) = row?;
+            let ids: Vec<String> = ids_str.split(',').map(|s| s.to_string()).collect();
+            issues.push(ConsistencyIssue {
+                issue_type: IssueType::DuplicateName,
+                description: format!("发现 {} 个重复的{}名称: {}", count, entity_type, name),
+                affected_items: ids,
+                severity: Severity::Medium,
+            });
+        }
+
+        // 检查缺失关系（如果关系类型存在但目标实体不存在）
+        // 这个检查需要更复杂的逻辑，暂时跳过
+
+        Ok(issues)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsistencyIssue {
+    pub issue_type: IssueType,
+    pub description: String,
+    pub affected_items: Vec<String>,
+    pub severity: Severity,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum IssueType {
+    DuplicateName,        // 重复的名称
+    ConflictingAttribute, // 冲突的属性
+    MissingRelationship,  // 缺失的关系
+    CircularReference,    // 循环引用
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Severity {
+    Low,
+    Medium,
+    High,
 }
 

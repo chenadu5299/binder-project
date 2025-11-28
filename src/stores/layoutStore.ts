@@ -19,6 +19,12 @@ interface LayoutState {
     visible: boolean;
   };
   
+  // 分析面板状态（编辑器右侧）
+  analysis: {
+    width: number;
+    visible: boolean;
+  };
+  
   // 首次打开标志
   isFirstOpen: boolean;
   showWelcomeDialog: boolean;
@@ -28,6 +34,8 @@ interface LayoutState {
   setFileTreeVisible: (visible: boolean) => void;
   setChatWidth: (width: number) => void;
   setChatVisible: (visible: boolean) => void;
+  setAnalysisWidth: (width: number) => void;
+  setAnalysisVisible: (visible: boolean) => void;
   setShowWelcomeDialog: (show: boolean) => void;
   markFirstOpenComplete: () => void;
 }
@@ -41,6 +49,10 @@ const defaultState = {
   chat: {
     width: 350,
     visible: true,
+  },
+  analysis: {
+    width: 300,
+    visible: false,
   },
   isFirstOpen: true,
   showWelcomeDialog: true,
@@ -69,6 +81,16 @@ export const useLayoutStore = create<LayoutState>()(
       setChatVisible: (visible) =>
         set((state) => ({
           chat: { ...state.chat, visible },
+        })),
+      
+      setAnalysisWidth: (width) =>
+        set((state) => ({
+          analysis: { ...state.analysis, width },
+        })),
+      
+      setAnalysisVisible: (visible) =>
+        set((state) => ({
+          analysis: { ...state.analysis, visible },
         })),
       
       setShowWelcomeDialog: (show) =>

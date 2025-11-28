@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use crate::services::ai_config::AIConfig;
 use crate::services::ai_error::AIError;
 use crate::services::ai_queue::{AIRequestQueue, AIRequest, RequestPriority, RequestType};
-use crate::services::ai_providers::{AIProvider, ChatMessage, ModelConfig};
+use crate::services::ai_providers::{AIProvider, ChatMessage, ModelConfig, ChatChunk};
 use crate::services::api_key_manager::APIKeyManager;
 use uuid::Uuid;
 
@@ -153,7 +153,7 @@ impl AIService {
         provider_name: &str,
         messages: &[ChatMessage],
         model_config: &ModelConfig,
-    ) -> Result<Box<dyn tokio_stream::Stream<Item = Result<String, AIError>> + Send + Unpin>, AIError> {
+    ) -> Result<Box<dyn tokio_stream::Stream<Item = Result<ChatChunk, AIError>> + Send + Unpin>, AIError> {
         let provider = self.get_provider(provider_name)
             .ok_or_else(|| AIError::Unknown(format!("提供商 {} 不存在", provider_name)))?;
         
@@ -171,7 +171,7 @@ impl AIService {
             return Err(AIError::Cancelled);
         }
         
-        provider.chat_stream(messages, model_config, &mut cancel_rx).await
+        provider.chat_stream(messages, model_config, &mut cancel_rx, None).await
     }
 
     /// 取消请求

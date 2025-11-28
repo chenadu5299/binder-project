@@ -4,6 +4,7 @@ import Image from '@tiptap/extension-image';
 import Link from '@tiptap/extension-link';
 import { useEffect, useRef } from 'react';
 import { useAutoComplete } from '../../hooks/useAutoComplete';
+import { GhostTextExtension } from './extensions/GhostTextExtension';
 
 interface TipTapEditorProps {
   content: string;
@@ -27,7 +28,10 @@ const TipTapEditor: React.FC<TipTapEditorProps> = ({
   const lastContentRef = useRef<string>(content);
   const lastTabIdRef = useRef<string | undefined>(tabId);
   
-  // 创建编辑器实例（先不传入 extensions，稍后添加）
+  // 使用 ref 存储 getGhostText 函数，供 Extension 使用
+  const getGhostTextRef = useRef<() => { text: string; position: number } | null>(() => null);
+  
+  // 创建编辑器实例
   const editor = useEditor({
     extensions: [
       StarterKit.configure({
@@ -44,6 +48,14 @@ const TipTapEditor: React.FC<TipTapEditorProps> = ({
       }),
       Link.configure({
         openOnClick: false,
+      }),
+      // 添加幽灵文字扩展
+      GhostTextExtension.configure({
+        getGhostText: () => {
+          const result = getGhostTextRef.current();
+          console.log('[TipTapEditor] Extension getGhostText 被调用', { hasResult: !!result });
+          return result;
+        },
       }),
     ],
     content,
@@ -64,18 +76,57 @@ const TipTapEditor: React.FC<TipTapEditorProps> = ({
     },
   });
 
+  // 自动补全功能 Hook（必须在 editor 创建后调用）
+  const autoComplete = useAutoComplete({
+    editor,
+    triggerDelay: 7000, // 7秒延迟
+    minContextLength: 50, // 最小50字符
+    maxLength: 50, // 最大50字符
+    enabled: true, // 启用自动续写
+  });
+
+  // 调试：监听自动续写状态
+  useEffect(() => {
+    console.log('[TipTapEditor] 自动续写状态变化', {
+      isVisible: autoComplete.state.isVisible,
+      isLoading: autoComplete.state.isLoading,
+      hasText: !!autoComplete.state.text,
+      position: autoComplete.state.position,
+      editor: !!editor,
+    });
+  }, [autoComplete.state.isVisible, autoComplete.state.isLoading, autoComplete.state.text, autoComplete.state.position, editor]);
+
+  // 更新 getGhostTextRef 并强制更新插件
+  useEffect(() => {
+    getGhostTextRef.current = autoComplete.getGhostText;
+    console.log('[TipTapEditor] 更新 getGhostTextRef', { 
+      hasGhostText: !!autoComplete.state.text,
+      isVisible: autoComplete.state.isVisible,
+      position: autoComplete.state.position 
+    });
+    
+    // 当幽灵文字状态变化时，强制更新插件装饰
+    if (editor && editor.view && autoComplete.state.isVisible) {
+      console.log('[TipTapEditor] 强制更新插件装饰');
+      // 使用 setTimeout 确保状态已经更新
+      setTimeout(() => {
+        if (editor && editor.view) {
+          const { state, dispatch } = editor.view;
+          const tr = state.tr;
+          tr.setMeta('ghostTextUpdate', true);
+          dispatch(tr);
+          console.log('[TipTapEditor] 已分发事务更新插件');
+        }
+      }, 0);
+    }
+  }, [editor, autoComplete.getGhostText, autoComplete.state.isVisible, autoComplete.state.text, autoComplete.state.position]);
+
   // 编辑器就绪时通知父组件（标签页切换时重置）
   useEffect(() => {
     if (tabId !== lastTabIdRef.current) {
       lastTabIdRef.current = tabId;
     }
   }, [tabId]);
-
-  // 自动补全功能
-  useAutoComplete(editor);
-  
-  // ⚠️ 暂时移除幽灵文字插件集成，避免错误
-  // TODO: 后续通过 TipTap Extension 方式实现幽灵文字
   
   useEffect(() => {
     if (editor && onEditorReady) {
@@ -138,4 +189,3 @@ const TipTapEditor: React.FC<TipTapEditorProps> = ({
 };
 
 export default TipTapEditor;
-

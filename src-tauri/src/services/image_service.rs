@@ -68,5 +68,49 @@ impl ImageService {
         
         Ok(())
     }
+    
+    // 保存聊天引用的图片
+    pub async fn save_chat_image(
+        &self,
+        workspace_path: &Path,
+        image_data: Vec<u8>,
+        file_name: String,
+    ) -> Result<String, String> {
+        // 1. 确定 assets/ 文件夹路径（在工作区根目录）
+        let assets_dir = workspace_path.join("assets");
+        
+        // 2. 创建 assets/ 文件夹（如果不存在）
+        if !assets_dir.exists() {
+            std::fs::create_dir_all(&assets_dir)
+                .map_err(|e| format!("创建 assets 文件夹失败: {}", e))?;
+        }
+        
+        // 3. 生成唯一文件名（时间戳 + 原文件名）
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| format!("获取时间戳失败: {}", e))?
+            .as_secs();
+        
+        // 清理文件名（移除特殊字符）
+        let sanitized_name = file_name
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '.' || *c == '-' || *c == '_')
+            .collect::<String>();
+        
+        let ext = Path::new(&sanitized_name)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("png");
+        
+        let filename = format!("chat-{}-{}", timestamp, sanitized_name);
+        let dest_path = assets_dir.join(&filename);
+        
+        // 4. 保存图片
+        std::fs::write(&dest_path, image_data)
+            .map_err(|e| format!("保存图片失败: {}", e))?;
+        
+        // 5. 返回相对路径（assets/xxx.png）
+        Ok(format!("assets/{}", filename))
+    }
 }
 

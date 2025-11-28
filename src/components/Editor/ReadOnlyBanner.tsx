@@ -2,6 +2,7 @@ import React from 'react';
 import { useEditorStore } from '../../stores/editorStore';
 import { invoke } from '@tauri-apps/api/core';
 import { PencilIcon } from '@heroicons/react/24/outline';
+import { toast } from '../Common/Toast';
 
 interface ReadOnlyBannerProps {
   tabId: string;
@@ -31,7 +32,7 @@ const ReadOnlyBanner: React.FC<ReadOnlyBannerProps> = ({ tabId }) => {
       }
     } catch (error) {
       console.error('启用编辑模式失败:', error);
-      alert(`启用编辑模式失败: ${error instanceof Error ? error.message : String(error)}`);
+      toast.error(`启用编辑模式失败: ${error instanceof Error ? error.message : String(error)}`);
     }
   };
   

@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { KeyIcon, EyeIcon, EyeSlashIcon } from '@heroicons/react/24/outline';
+import ThemeSelector from './ThemeSelector';
 
 interface APIKeyConfigProps {
     onClose?: () => void;
@@ -203,6 +204,11 @@ const APIKeyConfig: React.FC<APIKeyConfigProps> = ({ onClose }) => {
                     <li>至少配置一个 API key 才能使用 AI 功能</li>
                     <li>DeepSeek 性价比更高，适合日常使用</li>
                 </ul>
+            </div>
+
+            {/* 主题选择器 */}
+            <div className="mt-6 pt-6 border-t border-gray-200 dark:border-gray-700">
+                <ThemeSelector />
             </div>
         </div>
     );
