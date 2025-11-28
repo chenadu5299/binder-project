@@ -5,11 +5,13 @@ import WelcomeDialog from './WelcomeDialog';
 import FileTreePanel from '../FileTree/FileTreePanel';
 import EditorPanel from '../Editor/EditorPanel';
 import ChatPanel from '../Chat/ChatPanel';
+import { ToastContainer, useToastStore, toast } from '../Common/Toast';
 import { fileService } from '../../services/fileService';
 
 const MainLayout: React.FC = () => {
   const { showWelcomeDialog, setShowWelcomeDialog, fileTree, chat, setChatVisible } = useLayoutStore();
   const { currentWorkspace, setCurrentWorkspace } = useFileStore();
+  const { toasts, removeToast } = useToastStore();
 
   // 如果没有工作区，强制显示欢迎对话框
   const shouldShowWelcome = showWelcomeDialog || !currentWorkspace;
@@ -35,7 +37,7 @@ const MainLayout: React.FC = () => {
             }
           } catch (error) {
             console.error('快捷键打开工作区失败:', error);
-            alert(`打开工作区失败: ${error}`);
+            toast.error(`打开工作区失败: ${error}`);
           }
         }
       }
@@ -93,6 +95,9 @@ const MainLayout: React.FC = () => {
           ▶
         </button>
       )}
+
+      {/* Toast 通知 */}
+      <ToastContainer toasts={toasts} onClose={removeToast} />
     </div>
   );
 };

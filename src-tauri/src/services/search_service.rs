@@ -2,6 +2,7 @@ use rusqlite::{Connection, Result as SqlResult, params};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use crate::utils::error_helpers::{db_lock_error, get_current_timestamp, time_error};
 
 pub struct SearchService {
     db: Arc<Mutex<Connection>>,
@@ -59,7 +60,7 @@ impl SearchService {
     
     /// 索引或更新文档
     pub fn index_document(&self, path: &Path, content: &str) -> SqlResult<()> {
-        let conn = self.db.lock().unwrap();
+        let conn = self.db.lock().map_err(db_lock_error)?;
         
         // 获取文件的相对路径
         let relative_path = path.strip_prefix(&self.workspace_path)
@@ -76,13 +77,12 @@ impl SearchService {
         
         let modified_time = path.metadata()
             .and_then(|m| m.modified())
-            .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64)
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         
-        let indexed_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+        let indexed_time = get_current_timestamp()?;
         
         // 更新或插入文档元数据
         conn.execute(
@@ -103,7 +103,7 @@ impl SearchService {
     
     /// 删除文档索引
     pub fn remove_document(&self, path: &Path) -> SqlResult<()> {
-        let conn = self.db.lock().unwrap();
+        let conn = self.db.lock().map_err(db_lock_error)?;
         
         let relative_path = path.strip_prefix(&self.workspace_path)
             .unwrap_or(path)
@@ -118,7 +118,7 @@ impl SearchService {
     
     /// 全文搜索
     pub fn search(&self, query: &str, limit: usize) -> SqlResult<Vec<SearchResult>> {
-        let conn = self.db.lock().unwrap();
+        let conn = self.db.lock().map_err(db_lock_error)?;
         
         // 使用 FTS5 的 MATCH 语法进行搜索
         let sql = format!(
@@ -151,7 +151,7 @@ impl SearchService {
     
     /// 检查文档是否需要重新索引
     pub fn needs_reindex(&self, path: &Path) -> SqlResult<bool> {
-        let conn = self.db.lock().unwrap();
+        let conn = self.db.lock().map_err(db_lock_error)?;
         
         let relative_path = path.strip_prefix(&self.workspace_path)
             .unwrap_or(path)
@@ -160,7 +160,9 @@ impl SearchService {
         
         let modified_time = path.metadata()
             .and_then(|m| m.modified())
-            .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64)
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         
         let mut stmt = conn.prepare(
@@ -177,7 +179,7 @@ impl SearchService {
     
     /// 清理不存在的文档索引
     pub fn cleanup_orphaned_documents(&self) -> SqlResult<usize> {
-        let conn = self.db.lock().unwrap();
+        let conn = self.db.lock().map_err(db_lock_error)?;
         
         let mut stmt = conn.prepare("SELECT path FROM documents")?;
         let rows = stmt.query_map([], |row| {
@@ -198,6 +200,77 @@ impl SearchService {
         }
         
         Ok(deleted_count)
+    }
+    
+    // ⚠️ Week 19.1：批量索引更新（提高性能）
+    pub fn batch_update_index(
+        &self,
+        updates: Vec<(PathBuf, String)>, // (path, content)
+    ) -> SqlResult<()> {
+        let mut conn = self.db.lock().map_err(db_lock_error)?;
+        let tx = conn.transaction()?;
+        
+        for (path, content) in updates {
+            // 获取文件的相对路径
+            let relative_path = path.strip_prefix(&self.workspace_path)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .to_string();
+            
+            // 提取标题
+            let title = Path::new(&relative_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&relative_path)
+                .to_string();
+            
+            let modified_time = path.metadata()
+                .and_then(|m| m.modified())
+                .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64)
+                .unwrap_or(0);
+            
+            let indexed_time = get_current_timestamp()?;
+            
+            // 使用 UPSERT 避免重复
+            tx.execute(
+                "INSERT OR REPLACE INTO documents (path, title, modified_time, indexed_time)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![relative_path, title, modified_time, indexed_time],
+            )?;
+            
+            tx.execute(
+                "INSERT OR REPLACE INTO documents_fts (path, title, content)
+                 VALUES (?1, ?2, ?3)",
+                params![relative_path, title, content],
+            )?;
+        }
+        
+        tx.commit()?;
+        Ok(())
+    }
+    
+    // ⚠️ Week 19.1：检查文件是否需要索引（基于修改时间）
+    pub fn should_index(&self, path: &Path) -> SqlResult<bool> {
+        // 只索引文本文件
+        if !self.is_text_file(path) {
+            return Ok(false);
+        }
+        
+        // 检查是否需要重新索引
+        self.needs_reindex(path)
+    }
+    
+    // 判断是否为文本文件
+    fn is_text_file(&self, path: &Path) -> bool {
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            let ext_lower = ext.to_lowercase();
+            matches!(
+                ext_lower.as_str(),
+                "md" | "txt" | "html" | "htm" | "css" | "js" | "ts" | "json" | "xml" | "yaml" | "yml" | "toml" | "ini" | "cfg" | "conf"
+            )
+        } else {
+            false
+        }
     }
 }
 

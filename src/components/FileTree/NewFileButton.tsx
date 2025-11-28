@@ -3,6 +3,7 @@ import { useFileStore } from '../../stores/fileStore';
 import { fileService } from '../../services/fileService';
 import { FileTreeRef } from './FileTree';
 import InputDialog from './InputDialog';
+import { toast } from '../Common/Toast';
 
 interface NewFileButtonProps {
   fileTreeRef?: React.RefObject<FileTreeRef>;
@@ -28,7 +29,7 @@ const NewFileButton: React.FC<NewFileButtonProps> = ({ fileTreeRef }) => {
 
   const handleCreateFileClick = (fileType: string) => {
     if (!currentWorkspace) {
-      alert('请先选择工作区！\n\n请点击"打开工作区"或"新建工作区"按钮选择文件夹。');
+      toast.warning('请先选择工作区！请点击"打开工作区"或"新建工作区"按钮选择文件夹。');
       setIsOpen(false);
       return;
     }
@@ -68,7 +69,7 @@ const NewFileButton: React.FC<NewFileButtonProps> = ({ fileTreeRef }) => {
     } catch (error) {
       console.error('创建文件失败:', error);
       const errorMessage = error instanceof Error ? error.message : String(error);
-      alert(`创建${fileType === 'folder' ? '文件夹' : '文件'}失败:\n${errorMessage}`);
+      toast.error(`创建${fileType === 'folder' ? '文件夹' : '文件'}失败: ${errorMessage}`);
     }
   };
 

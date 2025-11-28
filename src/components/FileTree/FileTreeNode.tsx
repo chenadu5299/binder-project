@@ -1,6 +1,7 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { FileTreeNode as FileTreeNodeType } from '../../types/file';
 import FileIcon from './FileIcon';
+import FileTreeContextMenu from './FileTreeContextMenu';
 
 interface FileTreeNodeProps {
   node: FileTreeNodeType;
@@ -8,6 +9,10 @@ interface FileTreeNodeProps {
   expandedPaths: Set<string>;
   onToggleExpand: (path: string) => void;
   onSelectFile: (path: string) => void;
+  onRename?: (path: string) => void;
+  onDelete?: (path: string) => void;
+  onDuplicate?: (path: string) => void;
+  onOrganize?: (path: string) => void;
 }
 
 const FileTreeNode: React.FC<FileTreeNodeProps> = ({
@@ -16,7 +21,12 @@ const FileTreeNode: React.FC<FileTreeNodeProps> = ({
   expandedPaths,
   onToggleExpand,
   onSelectFile,
+  onRename,
+  onDelete,
+  onDuplicate,
+  onOrganize,
 }) => {
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
   const isExpanded = expandedPaths.has(node.path);
   const hasChildren = node.children && node.children.length > 0;
 
@@ -28,6 +38,12 @@ const FileTreeNode: React.FC<FileTreeNodeProps> = ({
     }
   };
 
+  const handleContextMenu = (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setContextMenu({ x: e.clientX, y: e.clientY });
+  };
+
   return (
     <div>
       <div
@@ -36,6 +52,7 @@ const FileTreeNode: React.FC<FileTreeNodeProps> = ({
         }`}
         style={{ paddingLeft: `${level * 16 + 8}px` }}
         onClick={handleClick}
+        onContextMenu={handleContextMenu}
       >
         {node.is_directory && (
           <span className="mr-1 text-xs text-gray-400">
@@ -59,9 +76,28 @@ const FileTreeNode: React.FC<FileTreeNodeProps> = ({
               expandedPaths={expandedPaths}
               onToggleExpand={onToggleExpand}
               onSelectFile={onSelectFile}
+              onRename={onRename}
+              onDelete={onDelete}
+              onDuplicate={onDuplicate}
+              onOrganize={onOrganize}
             />
           ))}
         </div>
+      )}
+      
+      {/* 右键菜单 */}
+      {contextMenu && (onRename || onDelete || onDuplicate || onOrganize) && (
+        <FileTreeContextMenu
+          x={contextMenu.x}
+          y={contextMenu.y}
+          filePath={node.path}
+          isDirectory={node.is_directory}
+          onRename={() => onRename?.(node.path)}
+          onDelete={() => onDelete?.(node.path)}
+          onDuplicate={onDuplicate ? () => onDuplicate(node.path) : undefined}
+          onOrganize={onOrganize ? () => onOrganize(node.path) : undefined}
+          onClose={() => setContextMenu(null)}
+        />
       )}
     </div>
   );

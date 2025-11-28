@@ -11,4 +11,8 @@ pub mod ai_providers;
 pub mod ai_service;
 pub mod api_key_manager;
 pub mod search_service;
+pub mod file_classifier;
 pub mod memory_service;
+pub mod document_analysis;
+pub mod tool_service;
+pub mod tool_definitions;

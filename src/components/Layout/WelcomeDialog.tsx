@@ -3,13 +3,15 @@ import { useFileStore } from '../../stores/fileStore';
 import { fileService } from '../../services/fileService';
 import APIKeyConfig from '../Settings/APIKeyConfig';
 import { KeyIcon } from '@heroicons/react/24/outline';
+import { Workspace } from '../../types/workspace';
+import { toast } from '../Common/Toast';
 
 interface WelcomeDialogProps {
   onClose: () => void;
 }
 
 const WelcomeDialog: React.FC<WelcomeDialogProps> = ({ onClose }) => {
-  const [recentWorkspaces, setRecentWorkspaces] = useState<string[]>([]);
+  const [recentWorkspaces, setRecentWorkspaces] = useState<Workspace[]>([]);
   const [showAPIKeyConfig, setShowAPIKeyConfig] = useState(false);
   const { setCurrentWorkspace } = useFileStore();
 
@@ -36,7 +38,7 @@ const WelcomeDialog: React.FC<WelcomeDialogProps> = ({ onClose }) => {
       }
     } catch (error) {
       console.error('打开工作区失败:', error);
-      alert(`打开工作区失败: ${error instanceof Error ? error.message : String(error)}`);
+      toast.error(`打开工作区失败: ${error instanceof Error ? error.message : String(error)}`);
     }
   };
 
@@ -50,7 +52,7 @@ const WelcomeDialog: React.FC<WelcomeDialogProps> = ({ onClose }) => {
       }
     } catch (error) {
       console.error('创建工作区失败:', error);
-      alert(`创建工作区失败: ${error instanceof Error ? error.message : String(error)}`);
+      toast.error(`创建工作区失败: ${error instanceof Error ? error.message : String(error)}`);
     }
   };
 
@@ -103,17 +105,18 @@ const WelcomeDialog: React.FC<WelcomeDialogProps> = ({ onClose }) => {
                   key={index}
                   onClick={async () => {
                     try {
-                      await fileService.openWorkspace(workspace);
-                      setCurrentWorkspace(workspace);
+                      await fileService.openWorkspace(workspace.path);
+                      setCurrentWorkspace(workspace.path);
                       onClose();
                     } catch (error) {
                       console.error('打开工作区失败:', error);
-                      alert('打开工作区失败');
+                      toast.error('打开工作区失败');
                     }
                   }}
                   className="w-full text-left px-4 py-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors"
                 >
-                  {workspace}
+                  <div className="font-medium">{workspace.name}</div>
+                  <div className="text-xs text-gray-500 dark:text-gray-400 truncate">{workspace.path}</div>
                 </button>
               ))}
             </div>

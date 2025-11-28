@@ -3,6 +3,9 @@ import { useFileStore } from '../../stores/fileStore';
 import { fileService } from '../../services/fileService';
 import { documentService } from '../../services/documentService';
 import FileTreeNode from './FileTreeNode';
+import OrganizeFilesDialog from './OrganizeFilesDialog';
+import LoadingSpinner from '../Common/LoadingSpinner';
+import { toast } from '../Common/Toast';
 import { listen } from '@tauri-apps/api/event';
 
 export interface FileTreeRef {
@@ -13,6 +16,8 @@ const FileTree = forwardRef<FileTreeRef>((_props, ref) => {
   const { currentWorkspace, fileTree, setFileTree, setSelectedFile, addOpenFile } = useFileStore();
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(new Set());
   const [isLoading, setIsLoading] = useState(false);
+  const [isDragOver, setIsDragOver] = useState(false);
+  const [organizeFiles, setOrganizeFiles] = useState<string[] | null>(null);
 
   const loadFileTree = async () => {
     if (!currentWorkspace) return;
@@ -95,12 +100,132 @@ const FileTree = forwardRef<FileTreeRef>((_props, ref) => {
         addOpenFile(path);
       } catch (error) {
         console.error('打开文件失败:', error);
-        alert(`打开文件失败: ${error instanceof Error ? error.message : String(error)}`);
+        toast.error(`打开文件失败: ${error instanceof Error ? error.message : String(error)}`);
       }
     } else {
       // 不支持的文件类型，提示用户
-      alert(`不支持的文件类型: ${ext || '未知'}`);
+      toast.warning(`不支持的文件类型: ${ext || '未知'}`);
     }
+  };
+
+  // ⚠️ Week 18.1：处理文件拖拽
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (currentWorkspace) {
+      setIsDragOver(true);
+    }
+  };
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragOver(false);
+  };
+
+  const handleDrop = async (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragOver(false);
+
+    if (!currentWorkspace) {
+      toast.warning('请先选择工作区');
+      return;
+    }
+
+    const items = Array.from(e.dataTransfer.items);
+    const files: File[] = [];
+
+    // 处理拖拽的文件
+    for (const item of items) {
+      if (item.kind === 'file') {
+        const file = item.getAsFile();
+        if (file) {
+          files.push(file);
+        }
+      }
+    }
+
+    if (files.length === 0) {
+      return;
+    }
+
+    // 处理每个文件
+    for (const file of files) {
+      try {
+        // 在 Tauri 环境中，从外部拖拽的文件需要通过 FileReader 读取
+        // 然后写入到工作区
+        const destPath = `${currentWorkspace}/${file.name}`;
+        
+        // 读取文件内容
+        const arrayBuffer = await file.arrayBuffer();
+        const uint8Array = new Uint8Array(arrayBuffer);
+        
+        // 尝试作为文本文件读取，如果失败则作为二进制文件处理
+        let content: string;
+        try {
+          content = new TextDecoder('utf-8', { fatal: false }).decode(uint8Array);
+        } catch {
+          // 如果是二进制文件，使用 base64 编码
+          const base64 = btoa(String.fromCharCode(...uint8Array));
+          content = base64;
+        }
+        
+        // 写入文件到工作区
+        await fileService.writeFile(destPath, content);
+        
+        console.log(`✅ 文件已导入: ${file.name}`);
+          } catch (error) {
+            console.error(`❌ 导入文件失败: ${file.name}`, error);
+            toast.error(`导入文件失败: ${file.name} - ${error instanceof Error ? error.message : String(error)}`);
+          }
+    }
+
+    // 刷新文件树
+    await loadFileTree();
+  };
+
+  // ⚠️ Week 18.2：处理文件重命名
+  const handleRename = async (filePath: string) => {
+    const newName = prompt('请输入新名称:', filePath.split('/').pop() || '');
+    if (!newName || newName.trim() === '') {
+      return;
+    }
+
+    try {
+      await fileService.renameFile(filePath, newName.trim());
+      await loadFileTree();
+    } catch (error) {
+      console.error('重命名文件失败:', error);
+      toast.error(`重命名文件失败: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  // ⚠️ Week 18.2：处理文件删除
+  const handleDelete = async (filePath: string) => {
+    try {
+      await fileService.deleteFile(filePath);
+      await loadFileTree();
+    } catch (error) {
+      console.error('删除文件失败:', error);
+      toast.error(`删除文件失败: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  // ⚠️ Week 18.2：处理文件复制
+  const handleDuplicate = async (filePath: string) => {
+    try {
+      await fileService.duplicateFile(filePath);
+      await loadFileTree();
+    } catch (error) {
+      console.error('复制文件失败:', error);
+      toast.error(`复制文件失败: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  // ⚠️ Week 20：处理 AI 智能分类
+  const handleOrganize = (filePath: string) => {
+    setOrganizeFiles([filePath]);
   };
 
   if (!currentWorkspace) {
@@ -112,7 +237,14 @@ const FileTree = forwardRef<FileTreeRef>((_props, ref) => {
   }
 
   return (
-    <div className="h-full overflow-y-auto flex flex-col">
+    <div
+      className={`h-full overflow-y-auto flex flex-col ${
+        isDragOver ? 'border-2 border-blue-500 border-dashed bg-blue-50 dark:bg-blue-900/20' : ''
+      }`}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+    >
       {/* 工作区根目录显示 ⚠️ 关键：必须显示当前工作区 */}
       {currentWorkspace ? (
         <div className="px-3 py-2 bg-blue-50 dark:bg-blue-900/20 border-b border-blue-200 dark:border-blue-800">
@@ -137,8 +269,7 @@ const FileTree = forwardRef<FileTreeRef>((_props, ref) => {
       <div className="flex-1 overflow-y-auto">
         {isLoading ? (
           <div className="p-4 text-center text-gray-500 dark:text-gray-400">
-            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600 mx-auto mb-2"></div>
-            <div>加载文件树中...</div>
+            <LoadingSpinner size="md" text="加载文件树中..." />
           </div>
         ) : fileTree ? (
           <FileTreeNode
@@ -147,6 +278,10 @@ const FileTree = forwardRef<FileTreeRef>((_props, ref) => {
             expandedPaths={expandedPaths}
             onToggleExpand={toggleExpand}
             onSelectFile={handleFileSelect}
+            onRename={handleRename}
+            onDelete={handleDelete}
+            onDuplicate={handleDuplicate}
+            onOrganize={handleOrganize}
           />
         ) : (
           <div className="p-4 text-gray-500 dark:text-gray-400">
@@ -154,6 +289,17 @@ const FileTree = forwardRef<FileTreeRef>((_props, ref) => {
           </div>
         )}
       </div>
+
+      {/* ⚠️ Week 20：AI 智能分类整理对话框 */}
+      {organizeFiles && (
+        <OrganizeFilesDialog
+          filePaths={organizeFiles}
+          onClose={() => setOrganizeFiles(null)}
+          onComplete={async () => {
+            await loadFileTree();
+          }}
+        />
+      )}
     </div>
   );
 });

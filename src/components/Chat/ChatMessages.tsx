@@ -1,19 +1,72 @@
-import React, { useEffect, useRef } from 'react';
-import { ChatMessage } from '../../stores/chatStore';
+import React, { useEffect, useRef, useState } from 'react';
+import { ChatMessage, useChatStore } from '../../stores/chatStore';
 import { ClipboardDocumentIcon } from '@heroicons/react/24/outline';
+import { ToolCallCard } from './ToolCallCard';
+import { ToolResult } from '../../types/tool';
+import { MessageContextMenu } from './MessageContextMenu';
 
 interface ChatMessagesProps {
     messages: ChatMessage[];
     onCopy?: (messageId: string) => void;
+    tabId: string;
+    onRegenerate?: (messageId: string) => void;
+    onDelete?: (messageId: string) => void;
 }
 
-export const ChatMessages: React.FC<ChatMessagesProps> = ({ messages, onCopy }) => {
+export const ChatMessages: React.FC<ChatMessagesProps> = ({ 
+    messages, 
+    onCopy, 
+    tabId,
+    onRegenerate,
+    onDelete,
+}) => {
     const messagesEndRef = useRef<HTMLDivElement>(null);
+    const { updateToolCall, regenerate, deleteMessage } = useChatStore();
+    const [contextMenu, setContextMenu] = useState<{
+        message: ChatMessage;
+        position: { x: number; y: number };
+    } | null>(null);
     
     // 自动滚动到底部
     useEffect(() => {
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     }, [messages]);
+
+    // 处理右键菜单
+    const handleContextMenu = (e: React.MouseEvent, message: ChatMessage) => {
+        e.preventDefault();
+        setContextMenu({
+            message,
+            position: { x: e.clientX, y: e.clientY },
+        });
+    };
+
+    const handleCopyMessage = (messageId: string) => {
+        if (onCopy) {
+            onCopy(messageId);
+        } else {
+            const message = messages.find(m => m.id === messageId);
+            if (message) {
+                navigator.clipboard.writeText(message.content).catch(console.error);
+            }
+        }
+    };
+
+    const handleRegenerateMessage = (messageId: string) => {
+        if (onRegenerate) {
+            onRegenerate(messageId);
+        } else {
+            regenerate(tabId);
+        }
+    };
+
+    const handleDeleteMessage = (messageId: string) => {
+        if (onDelete) {
+            onDelete(messageId);
+        } else {
+            deleteMessage(tabId, messageId);
+        }
+    };
     
     return (
         <div className="flex-1 overflow-y-auto p-4 space-y-4">
@@ -41,12 +94,13 @@ export const ChatMessages: React.FC<ChatMessagesProps> = ({ messages, onCopy }) 
                         
                         <div
                             className={`
-                                max-w-[80%] rounded-lg p-3
+                                max-w-[80%] rounded-lg p-3 cursor-context-menu
                                 ${message.role === 'user'
                                     ? 'bg-blue-500 text-white'
                                     : 'bg-gray-100 dark:bg-gray-700 text-gray-900 dark:text-gray-100'
                                 }
                             `}
+                            onContextMenu={(e) => handleContextMenu(e, message)}
                         >
                             <div className="whitespace-pre-wrap break-words">
                                 {message.content || (message.isLoading ? (
@@ -58,9 +112,33 @@ export const ChatMessages: React.FC<ChatMessagesProps> = ({ messages, onCopy }) 
                                 ) : null)}
                             </div>
                             
+                            {/* 显示工具调用 */}
+                            {message.toolCalls && message.toolCalls.length > 0 && (
+                                <div className="mt-3 space-y-2">
+                                    {message.toolCalls.map((toolCall) => (
+                                        <ToolCallCard
+                                            key={toolCall.id}
+                                            toolCall={toolCall}
+                                            onResult={(result: ToolResult) => {
+                                                // 找到当前消息的 tabId（需要从 props 传递或从 context 获取）
+                                                // 暂时使用 activeTabId，但更好的方式是从父组件传递
+                                                const activeTabId = useChatStore.getState().activeTabId;
+                                                if (activeTabId) {
+                                                    updateToolCall(activeTabId, message.id, toolCall.id, {
+                                                        status: result.success ? 'completed' : 'failed',
+                                                        result,
+                                                        error: result.error,
+                                                    });
+                                                }
+                                            }}
+                                        />
+                                    ))}
+                                </div>
+                            )}
+                            
                             {message.role === 'assistant' && message.content && (
                                 <button
-                                    onClick={() => onCopy?.(message.id)}
+                                    onClick={() => handleCopyMessage(message.id)}
                                     className="mt-2 opacity-0 group-hover:opacity-100 transition-opacity text-xs text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 flex items-center gap-1"
                                 >
                                     <ClipboardDocumentIcon className="w-3 h-3" />
@@ -78,6 +156,19 @@ export const ChatMessages: React.FC<ChatMessagesProps> = ({ messages, onCopy }) 
                 ))
             )}
             <div ref={messagesEndRef} />
+
+            {/* 右键菜单 */}
+            {contextMenu && (
+                <MessageContextMenu
+                    message={contextMenu.message}
+                    position={contextMenu.position}
+                    onClose={() => setContextMenu(null)}
+                    onCopy={() => handleCopyMessage(contextMenu.message.id)}
+                    onRegenerate={() => handleRegenerateMessage(contextMenu.message.id)}
+                    onDelete={() => handleDeleteMessage(contextMenu.message.id)}
+                    tabId={tabId}
+                />
+            )}
         </div>
     );
 };

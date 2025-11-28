@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { useFileStore } from '../../stores/fileStore';
 import { MagnifyingGlassIcon, XMarkIcon } from '@heroicons/react/24/outline';
 import { documentService } from '../../services/documentService';
+import { toast } from '../Common/Toast';
 
 interface SearchResult {
     path: string;
@@ -34,7 +35,7 @@ const SearchPanel: React.FC = () => {
             setResults(searchResults);
         } catch (error) {
             console.error('搜索失败:', error);
-            alert(`搜索失败: ${error instanceof Error ? error.message : String(error)}`);
+            toast.error(`搜索失败: ${error instanceof Error ? error.message : String(error)}`);
             setResults([]);
         } finally {
             setIsSearching(false);

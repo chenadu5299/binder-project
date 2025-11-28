@@ -35,3 +35,15 @@ pub async fn delete_image(
     service.delete_image(&doc_path, &image_path).await
 }
 
+#[tauri::command]
+pub async fn save_chat_image(
+    workspace_path: String,
+    image_data: Vec<u8>,
+    file_name: String,
+) -> Result<String, String> {
+    let service = ImageService::new();
+    let workspace = PathBuf::from(workspace_path);
+    
+    service.save_chat_image(&workspace, image_data, file_name).await
+}
+

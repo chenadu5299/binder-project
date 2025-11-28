@@ -21,10 +21,14 @@ export const InlineAssistInput: React.FC<InlineAssistInputProps> = ({
     const inputRef = useRef<HTMLInputElement>(null);
     
     useEffect(() => {
-        // 自动聚焦输入框
-        if (inputRef.current) {
-            inputRef.current.focus();
-        }
+        // 延迟聚焦，确保不会影响编辑器的选中状态
+        const timer = setTimeout(() => {
+            if (inputRef.current) {
+                inputRef.current.focus();
+            }
+        }, 100);
+        
+        return () => clearTimeout(timer);
     }, []);
     
     const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -86,4 +90,3 @@ export const InlineAssistInput: React.FC<InlineAssistInputProps> = ({
         </div>
     );
 };
-

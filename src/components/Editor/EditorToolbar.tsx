@@ -7,7 +7,10 @@ import {
   LinkIcon,
   PhotoIcon,
   DocumentTextIcon,
+  ChartBarIcon,
 } from '@heroicons/react/24/outline';
+import { useLayoutStore } from '../../stores/layoutStore';
+import { toast } from '../Common/Toast';
 
 interface EditorToolbarProps {
   editor: Editor | null;
@@ -16,6 +19,8 @@ interface EditorToolbarProps {
 }
 
 const EditorToolbar: React.FC<EditorToolbarProps> = ({ editor, fileType, documentPath }) => {
+  const { analysis, setAnalysisVisible } = useLayoutStore();
+  
   if (!editor) return null;
   
   // PDF 和图片文件不显示工具栏
@@ -162,7 +167,7 @@ const EditorToolbar: React.FC<EditorToolbarProps> = ({ editor, fileType, documen
                 }
                 
                 if (!documentPath) {
-                  alert('无法插入图片：未指定文档路径');
+                  toast.warning('无法插入图片：未指定文档路径');
                   return;
                 }
                 
@@ -176,7 +181,7 @@ const EditorToolbar: React.FC<EditorToolbarProps> = ({ editor, fileType, documen
                 editor.chain().focus().setImage({ src: relativePath }).run();
               } catch (error) {
                 console.error('插入图片失败:', error);
-                alert(`插入图片失败: ${error instanceof Error ? error.message : String(error)}`);
+                toast.error(`插入图片失败: ${error instanceof Error ? error.message : String(error)}`);
               }
             }}
             className="p-2 rounded hover:bg-gray-100 dark:hover:bg-gray-700"
@@ -186,6 +191,22 @@ const EditorToolbar: React.FC<EditorToolbarProps> = ({ editor, fileType, documen
           </button>
         </>
       )}
+
+      {/* 分析面板切换按钮 */}
+      <div className="w-px h-6 bg-gray-300 dark:bg-gray-600 mx-1" />
+      <button
+        onClick={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          setAnalysisVisible(!analysis.visible);
+        }}
+        className={`p-2 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${
+          analysis.visible ? 'bg-blue-100 dark:bg-blue-900' : ''
+        }`}
+        title="切换文档分析面板"
+      >
+        <ChartBarIcon className="w-5 h-5" />
+      </button>
     </div>
   );
 };

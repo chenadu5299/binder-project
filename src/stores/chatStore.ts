@@ -1,12 +1,15 @@
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
 
+import { ToolCall } from '../types/tool';
+
 export interface ChatMessage {
     id: string;
     role: 'user' | 'assistant' | 'system';
     content: string;
     timestamp: number;
     isLoading?: boolean;
+    toolCalls?: ToolCall[];  // 工具调用列表
 }
 
 export interface ChatTab {
@@ -30,8 +33,11 @@ interface ChatState {
     updateMessage: (tabId: string, messageId: string, content: string) => void;
     appendToMessage: (tabId: string, messageId: string, chunk: string) => void;
     setMessageLoading: (tabId: string, messageId: string, isLoading: boolean) => void;
+    addToolCall: (tabId: string, messageId: string, toolCall: ToolCall) => void;
+    updateToolCall: (tabId: string, messageId: string, toolCallId: string, updates: Partial<ToolCall>) => void;
     setModel: (tabId: string, model: string) => void;
     clearMessages: (tabId: string) => void;
+    deleteMessage: (tabId: string, messageId: string) => void;
     
     // AI 交互
     sendMessage: (tabId: string, content: string) => Promise<void>;
@@ -160,6 +166,54 @@ export const useChatStore = create<ChatState>((set, get) => {
             });
         },
         
+        addToolCall: (tabId: string, messageId: string, toolCall: ToolCall) => {
+            const { tabs } = get();
+            set({
+                tabs: tabs.map(t =>
+                    t.id === tabId
+                        ? {
+                            ...t,
+                            messages: t.messages.map(m =>
+                                m.id === messageId
+                                    ? {
+                                        ...m,
+                                        toolCalls: [...(m.toolCalls || []), toolCall],
+                                    }
+                                    : m
+                            ),
+                            updatedAt: Date.now(),
+                        }
+                        : t
+                ),
+            });
+        },
+        
+        updateToolCall: (tabId: string, messageId: string, toolCallId: string, updates: Partial<ToolCall>) => {
+            const { tabs } = get();
+            set({
+                tabs: tabs.map(t =>
+                    t.id === tabId
+                        ? {
+                            ...t,
+                            messages: t.messages.map(m =>
+                                m.id === messageId
+                                    ? {
+                                        ...m,
+                                        toolCalls: m.toolCalls?.map(tc =>
+                                            tc.id === toolCallId
+                                                ? { ...tc, ...updates }
+                                                : tc
+                                        ),
+                                    }
+                                    : m
+                            ),
+                            updatedAt: Date.now(),
+                        }
+                        : t
+                ),
+            });
+        },
+        
         setModel: (tabId: string, model: string) => {
             const { tabs } = get();
             set({
@@ -182,6 +236,49 @@ export const useChatStore = create<ChatState>((set, get) => {
             });
         },
         
+        deleteMessage: (tabId: string, messageId: string) => {
+            const { tabs } = get();
+            set({
+                tabs: tabs.map(t =>
+                    t.id === tabId
+                        ? {
+                            ...t,
+                            messages: t.messages.filter(m => m.id !== messageId),
+                            updatedAt: Date.now(),
+                        }
+                        : t
+                ),
+            });
+        },
+        
+        setTabMode: (tabId: string, mode: 'chat' | 'edit') => {
+            const { tabs } = get();
+            set({
+                tabs: tabs.map(t =>
+                    t.id === tabId
+                        ? { ...t, mode, updatedAt: Date.now() }
+                        : t
+                ),
+            });
+        },
+        
+        setEditModeFile: (tabId: string, filePath: string, content: string) => {
+            const { tabs } = get();
+            set({
+                tabs: tabs.map(t =>
+                    t.id === tabId
+                        ? {
+                            ...t,
+                            mode: 'edit',
+                            editModeFile: filePath,
+                            editModeContent: content,
+                            updatedAt: Date.now(),
+                        }
+                        : t
+                ),
+            });
+        },
+        
         sendMessage: async (tabId: string, content: string) => {
             const { tabs, addMessage, setMessageLoading } = get();
             const tab = tabs.find(t => t.id === tabId);
@@ -193,6 +290,10 @@ export const useChatStore = create<ChatState>((set, get) => {
                 content,
             });
             
+            // ⚠️ 关键修复：新消息开始时，清理之前消息的累积文本
+            // 这可以通过事件通知 ChatPanel 组件来清理
+            // 但更好的方式是直接在 ChatPanel 中监听消息变化
+            
             // 添加助手消息（占位符）
             const assistantMessageId = `msg-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
             addMessage(tabId, {
@@ -202,15 +303,26 @@ export const useChatStore = create<ChatState>((set, get) => {
             });
             
             try {
-                // 构建消息列表
-                const messages = tab.messages.map(m => ({
-                    role: m.role,
-                    content: m.content,
-                }));
+                // 构建消息列表（排除刚添加的空的助手消息）
+                const messages = tab.messages
+                    .filter(m => m.role !== 'assistant' || m.content.length > 0 || m.id !== assistantMessageId)
+                    .map(m => ({
+                        role: m.role,
+                        content: m.content,
+                    }));
+                
+                // 获取当前工作区路径
+                const { currentWorkspace } = (await import('./fileStore')).useFileStore.getState();
+                if (!currentWorkspace) {
+                    throw new Error('未打开工作区');
+                }
+                
+                // ⚠️ 关键修复：确保 tabId 正确传递
+                console.log('📤 发送消息到后端:', { tabId, messageCount: messages.length });
                 
                 // 调用后端流式聊天
                 await invoke('ai_chat_stream', {
-                    tabId,
+                    tabId, // Tauri 会自动转换为 tab_id
                     messages: [
                         ...messages,
                         { role: 'user', content },
@@ -221,6 +333,7 @@ export const useChatStore = create<ChatState>((set, get) => {
                         top_p: 1.0,
                         max_tokens: 2000,
                     },
+                    workspacePath: currentWorkspace,
                 });
             } catch (error) {
                 console.error('发送消息失败:', error);
@@ -231,7 +344,21 @@ export const useChatStore = create<ChatState>((set, get) => {
                 if (updatedTab) {
                     const errorMessage = updatedTab.messages.find(m => m.id === assistantMessageId);
                     if (errorMessage) {
-                        get().updateMessage(tabId, assistantMessageId, '[错误: 发送消息失败]');
+                        // 提供更友好的错误信息
+                        let errorText = '发送消息失败';
+                        if (error instanceof Error) {
+                            const errorMsg = error.message;
+                            if (errorMsg.includes('网络错误') || errorMsg.includes('connection') || errorMsg.includes('网络')) {
+                                errorText = '网络连接失败，请检查网络连接后重试';
+                            } else if (errorMsg.includes('timeout') || errorMsg.includes('超时')) {
+                                errorText = '请求超时，请稍后重试';
+                            } else if (errorMsg.includes('API') || errorMsg.includes('api')) {
+                                errorText = 'API 调用失败，请检查 API 密钥配置';
+                            } else {
+                                errorText = `错误: ${errorMsg}`;
+                            }
+                        }
+                        get().updateMessage(tabId, assistantMessageId, `[${errorText}]`);
                     }
                 }
             }

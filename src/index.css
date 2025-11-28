@@ -4,10 +4,19 @@
 
 /* 幽灵文字样式 */
 .ghost-text {
-  color: #9ca3af;
-  opacity: 0.5;
-  pointer-events: none;
-  user-select: none;
+  color: rgba(156, 163, 175, 0.7) !important; /* gray-400 with opacity - 提高可见度 */
+  opacity: 0.7 !important; /* 提高可见度 */
+  pointer-events: none !important;
+  user-select: none !important;
+  font-style: italic !important;
+  position: relative !important;
+  z-index: 0 !important; /* 改为 0，确保可见 */
+  display: inline !important;
+}
+
+.dark .ghost-text {
+  color: rgba(156, 163, 175, 0.6) !important;
+  opacity: 0.6 !important;
 }
 
 /* 隐藏滚动条但保持滚动功能 */
