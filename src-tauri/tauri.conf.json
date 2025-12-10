@@ -16,7 +16,8 @@
         "height": 800,
         "resizable": true,
         "fullscreen": false,
-        "devtools": true
+        "devtools": true,
+        "dragDropEnabled": false
       }
     ],
     "security": {
@@ -31,7 +32,10 @@
       "icons/128x128.png",
       "icons/128x128@2x.png"
     ],
-    "resources": [],
+    "resources": [
+      "resources/reference.docx",
+      "resources/preserve-styles.lua"
+    ],
     "copyright": "",
     "category": "Productivity",
     "shortDescription": "AI 智能办公套件",

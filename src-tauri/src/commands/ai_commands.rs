@@ -3,7 +3,9 @@ use crate::services::ai_providers::{ChatMessage, ModelConfig, ChatChunk};
 use crate::services::document_analysis::{DocumentAnalysisService, AnalysisType};
 use crate::services::tool_definitions::get_tool_definitions;
 use crate::services::tool_service::{ToolService, ToolCall};
+use crate::services::file_watcher::FileWatcherService;
 use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
 use tauri::{State, Emitter};
 
 /// 验证和规范化工具调用参数
@@ -160,8 +162,10 @@ pub async fn ai_chat_stream(
     tab_id: String, // 注意：前端发送的是 tabId (camelCase)，Tauri 会自动转换为 tab_id (snake_case)
     messages: Vec<ChatMessage>,
     model_config: ModelConfig,
+    enable_tools: Option<bool>, // 是否启用工具调用（Agent 模式为 true，Chat 模式为 false）
     app: tauri::AppHandle,
     service: State<'_, AIServiceState>,
+    watcher: State<'_, Mutex<FileWatcherService>>,
 ) -> Result<(), String> {
     // ⚠️ 关键修复：记录 tab_id 以便调试
     eprintln!("📥 收到流式聊天请求: tab_id={}, messages_count={}", tab_id, messages.len());
@@ -199,34 +203,48 @@ pub async fn ai_chat_stream(
     // 创建取消令牌（暂时不使用）
     let (_, mut cancel_rx) = tokio::sync::oneshot::channel();
     
-    // 获取工具定义
-    let tool_definitions = get_tool_definitions();
+    // 根据 enable_tools 参数决定是否获取工具定义（默认为 true，保持向后兼容）
+    let enable_tools = enable_tools.unwrap_or(true);
+    let tool_definitions = if enable_tools {
+        Some(get_tool_definitions())
+    } else {
+        None
+    };
     
-    // 构建增强的消息列表，添加系统提示词规范 JSON 格式
+    // 构建增强的消息列表，添加系统提示词规范 JSON 格式（仅在启用工具时）
     let mut enhanced_messages = messages.clone();
     
-    // 如果没有系统消息，添加一个系统提示词来规范工具调用的 JSON 格式
-    let has_system_message = enhanced_messages.iter().any(|m| m.role == "system");
-    if !has_system_message {
-        enhanced_messages.insert(0, ChatMessage {
-            role: "system".to_string(),
-            content: "你是一个专业的编程助手。当你调用工具时，必须严格遵守 JSON 格式规范：\n1. 所有键名必须用双引号包裹，例如 \"path\" 而不是 path\n2. 所有字符串值必须用双引号包裹，例如 \"test.md\" 而不是 test.md\n3. JSON 必须完整闭合，以 } 结尾\n4. 不要省略任何引号或括号\n5. 确保 JSON 格式完全正确，可以被 JSON.parse() 解析\n\n示例正确格式：{\"path\":\"test.md\",\"content\":\"# Hello\"}\n错误格式：{path:test.md,content:# Hello} 或 {\"path\":test.md}".to_string(),
-        });
-    } else {
-        // 如果有系统消息，在开头添加 JSON 格式要求
-        if let Some(first_msg) = enhanced_messages.first_mut() {
-            if first_msg.role == "system" {
-                first_msg.content = format!("{}\n\n重要：调用工具时，必须严格遵守 JSON 格式规范。所有键名和字符串值必须用双引号包裹，JSON 必须完整闭合。", first_msg.content);
+    if enable_tools {
+        // 如果没有系统消息，添加一个系统提示词来规范工具调用的 JSON 格式
+        let has_system_message = enhanced_messages.iter().any(|m| m.role == "system");
+        if !has_system_message {
+            enhanced_messages.insert(0, ChatMessage {
+                role: "system".to_string(),
+                content: "你是一个专业的编程助手。当你调用工具时，必须严格遵守 JSON 格式规范：\n1. 所有键名必须用双引号包裹，例如 \"path\" 而不是 path\n2. 所有字符串值必须用双引号包裹，例如 \"test.md\" 而不是 test.md\n3. JSON 必须完整闭合，以 } 结尾\n4. 不要省略任何引号或括号\n5. 确保 JSON 格式完全正确，可以被 JSON.parse() 解析\n\n示例正确格式：{\"path\":\"test.md\",\"content\":\"# Hello\"}\n错误格式：{path:test.md,content:# Hello} 或 {\"path\":test.md}".to_string(),
+            });
+        } else {
+            // 如果有系统消息，在开头添加 JSON 格式要求
+            if let Some(first_msg) = enhanced_messages.first_mut() {
+                if first_msg.role == "system" {
+                    first_msg.content = format!("{}\n\n重要：调用工具时，必须严格遵守 JSON 格式规范。所有键名和字符串值必须用双引号包裹，JSON 必须完整闭合。", first_msg.content);
+                }
             }
         }
     }
     
-    // 调用流式聊天（传递工具定义和增强的消息）
-    match provider.chat_stream(&enhanced_messages, &model_config, &mut cancel_rx, Some(&tool_definitions)).await {
+    // 获取工作区路径（优先从文件监听器获取，否则使用当前目录）
+    let workspace_path: PathBuf = {
+        let watcher_guard = watcher.lock().unwrap();
+        watcher_guard.get_workspace_path()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+    };
+    
+    // 调用流式聊天（根据模式决定是否传递工具定义）
+    match provider.chat_stream(&enhanced_messages, &model_config, &mut cancel_rx, tool_definitions.as_deref()).await {
         Ok(mut stream) => {
             // 在后台任务中处理流式响应
             let app_handle = app.clone();
-            let workspace_path = std::env::current_dir().unwrap_or_default();
+            let workspace_path = workspace_path.clone();
             let tool_service = ToolService::new();
             
             tokio::spawn(async move {
@@ -272,29 +290,23 @@ pub async fn ai_chat_stream(
                                     }
                                 }
                                 ChatChunk::ToolCall { id, name, arguments, is_complete } => {
-                                    eprintln!("🔧 收到工具调用 chunk: id={}, name={}, is_complete={}, arguments_len={}, arguments_preview={}", 
-                                        id, name, is_complete, arguments.len(), 
-                                        if arguments.len() > 100 { &arguments[..100] } else { &arguments });
-                                    
-                                    // 更新累积的工具调用
-                                    // 注意：deepseek.rs 已经累积了 arguments，所以这里直接使用即可
-                                    // 但如果收到 is_complete=false 的 chunk，说明还在累积中，需要保存状态
-                                    let entry = tool_calls.entry(id.clone()).or_insert_with(|| (name.clone(), String::new()));
-                                    
-                                    if is_complete {
-                                        // 工具调用完成，使用完整的 arguments
+                                    // 参考 void 的实现：只处理完整的工具调用
+                                    // 不完整的工具调用在 deepseek.rs 中已经被过滤，不会到达这里
+                                    if !is_complete {
+                                        eprintln!("⚠️ 收到不完整的工具调用，跳过: id={}, name={}", id, name);
+                                        // 保存状态，等待完成
+                                        let entry = tool_calls.entry(id.clone()).or_insert_with(|| (name.clone(), String::new()));
                                         entry.1 = arguments.clone();
-                                    } else {
-                                        // 工具调用进行中，累积 arguments（虽然 deepseek.rs 已经累积，但这里作为备份）
-                                        // 实际上，deepseek.rs 已经处理了累积，所以这里应该直接使用
-                                        entry.1 = arguments.clone();
+                                        continue;
                                     }
                                     
-                                    // 只有在工具调用完成时才发送事件和执行
-                                    if is_complete {
-                                        eprintln!("✅ 工具调用完成，开始处理: id={}, name={}, arguments={}", id, name, arguments);
-                                        
-                                        // 解析工具调用参数
+                                    eprintln!("🔧 收到完整的工具调用 chunk: id={}, name={}, arguments_len={}, arguments_preview={}", 
+                                        id, name, arguments.len(), 
+                                        if arguments.len() > 100 { &arguments[..100] } else { &arguments });
+                                    
+                                    eprintln!("✅ 工具调用完成，开始处理: id={}, name={}, arguments={}", id, name, arguments);
+                                    
+                                    // 解析工具调用参数
                                         let parsed_arguments = match serde_json::from_str::<serde_json::Value>(&arguments) {
                                             Ok(args) => {
                                                 eprintln!("✅ 成功解析工具调用参数: {}", serde_json::to_string(&args).unwrap_or_default());
@@ -330,87 +342,102 @@ pub async fn ai_chat_stream(
                                                     serde_json::json!({})
                                                 }
                                             }
-                                        };
-                                        
-                                        // 发送工具调用事件到前端
-                                        let payload = serde_json::json!({
-                                            "tab_id": tab_id,
-                                            "chunk": "",
-                                            "done": false,
-                                            "tool_call": {
-                                                "id": id.clone(),
-                                                "name": name.clone(),
-                                                "arguments": arguments.clone(),
-                                                "status": "executing",
-                                            },
-                                        });
-                                        if let Err(e) = app_handle.emit("ai-chat-stream", payload) {
-                                            eprintln!("发送工具调用事件失败: {}", e);
-                                        }
-                                        
-                                        // 执行工具调用
-                                        let tool_call = ToolCall {
-                                            id: id.clone(),
-                                            name: name.clone(),
-                                            arguments: parsed_arguments,
-                                        };
-                                        
-                                        eprintln!("🚀 开始执行工具调用: {}", name);
-                                        match tool_service.execute_tool(&tool_call, &workspace_path).await {
-                                            Ok(tool_result) => {
-                                                eprintln!("✅ 工具执行成功: {}", name);
-                                                // 将工具结果添加到消息中，继续对话
-                                                let tool_result_message = format!(
-                                                    "\n\n[工具调用: {}]\n结果: {}",
-                                                    name,
-                                                    serde_json::to_string_pretty(&tool_result).unwrap_or_default()
-                                                );
-                                                
-                                                // 发送工具调用结果到前端
-                                                let payload = serde_json::json!({
-                                                    "tab_id": tab_id,
-                                                    "chunk": tool_result_message,
-                                                    "done": false,
-                                                    "tool_call": {
-                                                        "id": id,
-                                                        "name": name,
-                                                        "arguments": arguments,
-                                                        "result": tool_result,
-                                                        "status": "completed",
-                                                    },
-                                                });
-                                                if let Err(e) = app_handle.emit("ai-chat-stream", payload) {
-                                                    eprintln!("发送工具调用结果失败: {}", e);
-                                                }
-                                            }
-                                            Err(e) => {
-                                                eprintln!("❌ 工具执行失败: {} - {}", name, e);
-                                                // 工具执行失败
-                                                let error_message = format!("\n\n[工具调用失败: {}]\n错误: {}", name, e);
-                                                let payload = serde_json::json!({
-                                                    "tab_id": tab_id,
-                                                    "chunk": error_message,
-                                                    "done": false,
-                                                    "tool_call": {
-                                                        "id": id,
-                                                        "name": name,
-                                                        "arguments": arguments,
-                                                        "error": e,
-                                                        "status": "failed",
-                                                    },
-                                                });
-                                                if let Err(e) = app_handle.emit("ai-chat-stream", payload) {
-                                                    eprintln!("发送工具调用错误失败: {}", e);
-                                                }
-                                            }
-                                        }
-                                        
-                                        // 移除已完成的工具调用
-                                        tool_calls.remove(&id);
-                                    } else {
-                                        // 工具调用进行中，不发送事件（避免前端解析不完整的 JSON）
-                                        eprintln!("⏳ 工具调用进行中，累积参数: id={}, name={}, arguments_len={}", id, name, arguments.len());
+                                    };
+                                    
+                                    // 发送工具调用事件到前端（使用解析后的 arguments）
+                                    let payload = serde_json::json!({
+                                        "tab_id": tab_id,
+                                        "chunk": "",
+                                        "done": false,
+                                        "tool_call": {
+                                            "id": id.clone(),
+                                            "name": name.clone(),
+                                            "arguments": parsed_arguments.clone(), // 使用解析后的 JSON 对象
+                                            "status": "executing",
+                                        },
+                                    });
+                                    if let Err(e) = app_handle.emit("ai-chat-stream", payload) {
+                                        eprintln!("发送工具调用事件失败: {}", e);
                                     }
+                                    
+                                    // 执行工具调用
+                                    let tool_call = ToolCall {
+                                        id: id.clone(),
+                                        name: name.clone(),
+                                        arguments: parsed_arguments,
+                                    };
+                                    
+                                    eprintln!("🚀 开始执行工具调用: {}", name);
+                                    match tool_service.execute_tool(&tool_call, &workspace_path).await {
+                                        Ok(tool_result) => {
+                                            eprintln!("✅ 工具执行成功: {}", name);
+                                            
+                                            // 如果是文件操作工具，且执行成功，手动触发文件树刷新事件
+                                            let file_operation_tools = [
+                                                "create_file",
+                                                "create_folder",
+                                                "delete_file",
+                                                "rename_file",
+                                                "move_file",
+                                                "update_file",
+                                            ];
+                                            
+                                            if file_operation_tools.contains(&name.as_str()) && tool_result.success {
+                                                let workspace_path_str = workspace_path.to_string_lossy().to_string();
+                                                eprintln!("🔄 文件操作成功，触发文件树刷新: workspace={}", workspace_path_str);
+                                                if let Err(e) = app_handle.emit("file-tree-changed", workspace_path_str) {
+                                                    eprintln!("⚠️ 触发文件树刷新事件失败: {}", e);
+                                                }
+                                            }
+                                            
+                                            // 将工具结果添加到消息中，继续对话
+                                            let tool_result_message = format!(
+                                                "\n\n[工具调用: {}]\n结果: {}",
+                                                name,
+                                                serde_json::to_string_pretty(&tool_result).unwrap_or_default()
+                                            );
+                                            
+                                            // 发送工具调用结果到前端
+                                            let payload = serde_json::json!({
+                                                "tab_id": tab_id,
+                                                "chunk": tool_result_message,
+                                                "done": false,
+                                                "tool_call": {
+                                                    "id": id,
+                                                    "name": name,
+                                                    "arguments": arguments,
+                                                    "result": tool_result,
+                                                    "status": "completed",
+                                                },
+                                            });
+                                            if let Err(e) = app_handle.emit("ai-chat-stream", payload) {
+                                                eprintln!("发送工具调用结果失败: {}", e);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            eprintln!("❌ 工具执行失败: {} - {}", name, e);
+                                            // 工具执行失败
+                                            let error_message = format!("\n\n[工具调用失败: {}]\n错误: {}", name, e);
+                                            let payload = serde_json::json!({
+                                                "tab_id": tab_id,
+                                                "chunk": error_message,
+                                                "done": false,
+                                                "tool_call": {
+                                                    "id": id,
+                                                    "name": name,
+                                                    "arguments": arguments,
+                                                    "error": e,
+                                                    "status": "failed",
+                                                },
+                                            });
+                                            if let Err(e) = app_handle.emit("ai-chat-stream", payload) {
+                                                eprintln!("发送工具调用错误失败: {}", e);
+                                            }
+                                        }
+                                    }
+                                    
+                                    // 移除已完成的工具调用
+                                    tool_calls.remove(&id);
                                 }
                             }
                         }
@@ -500,6 +527,25 @@ pub async fn ai_chat_stream(
                         match tool_service.execute_tool(&tool_call, &workspace_path).await {
                             Ok(tool_result) => {
                                 eprintln!("✅ 工具执行成功: {}", name);
+                                
+                                // 如果是文件操作工具，且执行成功，手动触发文件树刷新事件
+                                let file_operation_tools = [
+                                    "create_file",
+                                    "create_folder",
+                                    "delete_file",
+                                    "rename_file",
+                                    "move_file",
+                                    "update_file",
+                                ];
+                                
+                                if file_operation_tools.contains(&name.as_str()) && tool_result.success {
+                                    let workspace_path_str = workspace_path.to_string_lossy().to_string();
+                                    eprintln!("🔄 文件操作成功，触发文件树刷新: workspace={}", workspace_path_str);
+                                    if let Err(e) = app_handle.emit("file-tree-changed", workspace_path_str) {
+                                        eprintln!("⚠️ 触发文件树刷新事件失败: {}", e);
+                                    }
+                                }
+                                
                                 // 将工具结果添加到消息中
                                 let tool_result_message = format!(
                                     "\n\n[工具调用: {}]\n结果: {}",

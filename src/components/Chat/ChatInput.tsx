@@ -13,11 +13,13 @@ import { memoryService } from '../../services/memoryService';
 import { extractUrls } from '../../utils/urlDetector';
 
 interface ChatInputProps {
-    tabId: string;
+    tabId: string | null; // 可以为 null（没有标签页时）
+    pendingMode?: 'agent' | 'chat'; // 待创建标签页的模式
+    onCreateTab?: (mode: 'agent' | 'chat') => void; // 创建标签页的回调
 }
 
-export const ChatInput: React.FC<ChatInputProps> = ({ tabId }) => {
-    const { sendMessage, regenerate, tabs } = useChatStore();
+export const ChatInput: React.FC<ChatInputProps> = ({ tabId, pendingMode = 'agent', onCreateTab }) => {
+    const { sendMessage, regenerate, tabs, createTab, setActiveTab } = useChatStore();
     const { addReference, removeReference, getReferences, clearReferences } = useReferenceStore();
     const { currentWorkspace, fileTree } = useFileStore();
     const { getActiveTab: getEditorActiveTab } = useEditorStore();
@@ -30,10 +32,12 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId }) => {
     } | null>(null);
     const textareaRef = useRef<HTMLTextAreaElement>(null);
     const containerRef = useRef<HTMLDivElement>(null);
-    const tab = tabs.find(t => t.id === tabId);
+    const isComposingRef = useRef<boolean>(false); // 用于跟踪是否正在使用中文输入法
+    const compositionEndTimeRef = useRef<number>(0); // 记录输入法结束的时间，用于判断回车是否用于确认输入
+    const tab = tabId ? tabs.find(t => t.id === tabId) : null;
     const hasMessages = tab && tab.messages.length > 0;
     const isStreaming = tab && tab.messages.some(m => m.isLoading);
-    const references = getReferences(tabId);
+    const references = tabId ? getReferences(tabId) : [];
     
     // 自动调整高度
     useEffect(() => {
@@ -87,9 +91,9 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId }) => {
         }
     }, [input]);
 
-    // 检测输入中的 URL 并自动创建链接引用
+    // 检测输入中的 URL 并自动创建链接引用（仅在已有标签页时）
     useEffect(() => {
-        if (!input.trim()) return;
+        if (!input.trim() || !tabId) return; // 没有标签页时不处理
         
         const urls = extractUrls(input);
         const currentRefs = getReferences(tabId);
@@ -112,8 +116,10 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId }) => {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [input, tabId]);
 
-    // Agent 模式：自动引用当前编辑器打开的文档
+    // Agent 模式：自动引用当前编辑器打开的文档（仅在已有标签页时）
     useEffect(() => {
+        if (!tabId) return; // 没有标签页时不自动引用
+        
         const activeEditorTab = getEditorActiveTab();
         if (!activeEditorTab || !activeEditorTab.filePath) return;
 
@@ -143,8 +149,62 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId }) => {
         e.preventDefault();
         e.stopPropagation();
         
+        // 如果没有标签页，先创建标签页
+        let currentTabId = tabId;
+        if (!currentTabId) {
+            if (onCreateTab) {
+                onCreateTab(pendingMode);
+                await new Promise(resolve => setTimeout(resolve, 100));
+                const latestTab = tabs[tabs.length - 1];
+                if (latestTab) {
+                    currentTabId = latestTab.id;
+                    setActiveTab(currentTabId);
+                } else {
+                    console.error('❌ 创建标签页失败');
+                    return;
+                }
+            } else {
+                currentTabId = createTab(undefined, pendingMode);
+                setActiveTab(currentTabId);
+            }
+        }
+        
+        if (!currentTabId) {
+            console.error('❌ 无法获取标签页 ID');
+            return;
+        }
+        
+        console.log('📥 聊天窗口收到拖拽:', {
+            types: Array.from(e.dataTransfer.types),
+            files: e.dataTransfer.files.length,
+        });
+        
+        // 优先检查是否是从文件树拖拽的文件路径
+        // 尝试多种方式获取数据（兼容性）
+        let filePath = e.dataTransfer.getData('application/file-path');
+        if (!filePath) {
+            filePath = e.dataTransfer.getData('text/plain');
+        }
+        
+        const isDirectory = e.dataTransfer.getData('application/is-directory') === 'true';
+        
+        console.log('📥 拖拽数据:', { filePath, isDirectory });
+        
+        if (filePath && !isDirectory) {
+            // 从文件树拖拽的文件，创建文件引用
+            console.log('✅ 检测到文件树拖拽，创建文件引用:', filePath);
+            await handleFileTreeReference(filePath);
+            return;
+        }
+        
+        // 处理外部拖拽的文件
         const files = Array.from(e.dataTransfer.files);
-        if (files.length === 0) return;
+        if (files.length === 0) {
+            console.log('❌ 没有检测到文件');
+            return;
+        }
+        
+        console.log('✅ 检测到外部文件拖拽:', files.length);
         
         for (const file of files) {
             if (file.type.startsWith('image/')) {
@@ -190,12 +250,78 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId }) => {
         }
     };
     
+    // 处理从文件树拖拽的文件引用
+    const handleFileTreeReference = async (filePath: string) => {
+        try {
+            console.log('📄 处理文件树引用:', filePath);
+            
+            if (!filePath || filePath.trim() === '') {
+                console.error('❌ 文件路径为空');
+                return;
+            }
+            
+            const fileName = filePath.split('/').pop() || filePath;
+            const ext = filePath.split('.').pop()?.toLowerCase();
+            
+            // 检查是否是图片文件
+            const imageExtensions = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico'];
+            if (ext && imageExtensions.includes(ext)) {
+                // 创建图片引用
+                const imageRef: ImageReference = {
+                    id: `ref-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+                    type: ReferenceType.IMAGE,
+                    createdAt: Date.now(),
+                    path: filePath,
+                    name: fileName,
+                    mimeType: `image/${ext === 'jpg' ? 'jpeg' : ext}`,
+                };
+                console.log('✅ 创建图片引用:', imageRef);
+                addReference(tabId, imageRef);
+                return;
+            }
+            
+            // 处理文本文件：读取文件内容
+            let content: string | undefined;
+            let lineCount: number | undefined;
+            
+            const textExtensions = ['md', 'txt', 'html', 'js', 'ts', 'tsx', 'jsx', 'json', 'css', 'py', 'java', 'cpp', 'c', 'h', 'hpp', 'xml', 'yaml', 'yml', 'sh', 'bat', 'ps1'];
+            
+            if (ext && textExtensions.includes(ext)) {
+                try {
+                    console.log('📖 读取文本文件内容:', filePath);
+                    content = await invoke<string>('read_file_content', { path: filePath });
+                    lineCount = content.split('\n').length;
+                    console.log('✅ 文件内容读取成功，行数:', lineCount);
+                } catch (error) {
+                    console.warn('⚠️ 读取文件内容失败:', error);
+                    // 如果读取失败，继续创建引用但不包含内容
+                }
+            }
+            
+            // 创建文件引用
+            const fileRef: FileReference = {
+                id: `ref-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+                type: ReferenceType.FILE,
+                createdAt: Date.now(),
+                path: filePath,
+                name: fileName,
+                content: content,
+                lineCount: lineCount,
+            };
+            
+            console.log('✅ 创建文件引用:', fileRef);
+            addReference(tabId, fileRef);
+        } catch (error) {
+            console.error('❌ 创建文件引用失败:', error);
+        }
+    };
+    
     // 处理文件引用
     const handleFileReference = async (file: File) => {
         // 对于拖拽的文件，需要获取完整路径
         // 这里暂时使用文件名，后续可以通过文件选择器获取路径
         const fileRef: FileReference = {
-            id: '',
+            id: `ref-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
             type: ReferenceType.FILE,
             createdAt: Date.now(),
             path: file.name, // 临时使用文件名
@@ -223,26 +349,101 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId }) => {
             }
         }
         
-        // 检查是否有文本和来源信息
+        // 检查是否有文本和来源信息（来自编辑器的引用）
         const text = e.clipboardData.getData('text/plain');
-        const sourceData = e.clipboardData.getData('application/x-binder-source');
+        let sourceData: string | null = null;
         
+        // 方法 1：尝试从剪贴板数据中获取自定义类型
+        try {
+            sourceData = e.clipboardData.getData('application/x-binder-source');
+        } catch (error) {
+            // 某些浏览器可能不支持自定义 MIME 类型
+            console.log('⚠️ 无法从剪贴板获取自定义类型数据');
+        }
+        
+        // 方法 2：如果剪贴板中没有，尝试从全局变量获取（备用方案）
+        if (!sourceData) {
+            const globalSource = (window as any).__binderClipboardSource;
+            const globalTimestamp = (window as any).__binderClipboardTimestamp;
+            
+            // 检查时间戳是否在 5 秒内（避免使用过期的引用数据）
+            if (globalSource && globalTimestamp && Date.now() - globalTimestamp < 5000) {
+                sourceData = globalSource;
+                console.log('✅ 从全局变量获取引用元数据');
+                // 清除全局变量
+                delete (window as any).__binderClipboardSource;
+                delete (window as any).__binderClipboardTimestamp;
+            }
+        }
+        
+        // 方法 3：检查是否是从当前编辑器复制的内容（通过检查文件路径匹配）
+        if (!sourceData && text) {
+            const activeEditorTab = getEditorActiveTab();
+            if (activeEditorTab?.filePath) {
+                // 如果粘贴的文本与编辑器当前内容的一部分匹配，可能是从编辑器复制的
+                // 这里使用简单的启发式方法：如果文本长度合理且编辑器包含这段文字
+                if (text.length > 10 && text.length < 10000 && activeEditorTab.content.includes(text)) {
+                    console.log('🔍 检测到可能是从编辑器复制的文本，创建引用');
+                    sourceData = JSON.stringify({
+                        filePath: activeEditorTab.filePath,
+                        fileName: activeEditorTab.fileName,
+                        lineRange: { start: 1, end: 1 }, // 无法精确获取行号，使用默认值
+                        charRange: { start: 0, end: text.length },
+                    });
+                }
+            }
+        }
+        
+        // 如果有文本和来源信息，创建文本引用
         if (text && sourceData) {
             try {
+                e.preventDefault(); // 阻止默认粘贴行为，改为创建引用
+                
                 const source = JSON.parse(sourceData);
+                
+                // 使用辅助函数创建完整的 TextReference
+                const { createTextReferenceFromClipboard } = await import('../../utils/referenceHelpers');
+                const textRefBase = createTextReferenceFromClipboard(
+                    {
+                        filePath: source.filePath,
+                        fileName: source.fileName,
+                        lineRange: source.lineRange,
+                        charRange: source.charRange,
+                    },
+                    text
+                );
+                
                 const textRef: TextReference = {
-                    id: '',
-                    type: ReferenceType.TEXT,
+                    ...textRefBase,
+                    id: `ref-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
                     createdAt: Date.now(),
-                    content: text,
-                    sourceFile: source.filePath,
-                    lineRange: source.lineRange,
-                    charRange: source.charRange,
                 };
                 
-                addReference(tabId, textRef);
+                console.log('✅ 创建文本引用:', {
+                    contentLength: text.length,
+                    sourceFile: source.filePath,
+                    lineRange: source.lineRange,
+                });
+                
+                if (tabId) {
+                    addReference(tabId, textRef);
+                } else {
+                    // 如果没有标签页，先创建标签页再添加引用
+                    const newTabId = onCreateTab ? (() => {
+                        onCreateTab(pendingMode);
+                        return tabs[tabs.length - 1]?.id;
+                    })() : createTab(undefined, pendingMode);
+                    if (newTabId) {
+                        addReference(newTabId, textRef);
+                        setActiveTab(newTabId);
+                    }
+                }
+                
+                // 显示提示（可选）
+                // toast.success(`已添加引用: ${source.fileName || '未命名文件'}`);
             } catch (error) {
-                console.error('解析来源信息失败:', error);
+                console.error('❌ 解析来源信息失败:', error);
+                // 解析失败时，允许正常粘贴
             }
         }
     };
@@ -250,9 +451,38 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId }) => {
     const handleSend = async () => {
         if (!input.trim() || isStreaming) return;
         
+        // 如果没有标签页，先创建标签页
+        let currentTabId = tabId;
+        if (!currentTabId) {
+            // 如果有 onCreateTab 回调，使用它创建标签页（避免重复创建）
+            if (onCreateTab) {
+                onCreateTab(pendingMode);
+                // 等待标签页创建完成
+                await new Promise(resolve => setTimeout(resolve, 50));
+                // 获取最新创建的标签页
+                const latestTab = tabs[tabs.length - 1];
+                if (latestTab) {
+                    currentTabId = latestTab.id;
+                    setActiveTab(currentTabId);
+                } else {
+                    console.error('❌ 创建标签页失败');
+                    return;
+                }
+            } else {
+                // 直接创建标签页（使用 pendingMode）
+                currentTabId = createTab(undefined, pendingMode);
+                setActiveTab(currentTabId);
+            }
+        }
+        
+        if (!currentTabId) {
+            console.error('❌ 无法获取标签页 ID');
+            return;
+        }
+        
         // 格式化引用信息
         const { formatForAI } = useReferenceStore.getState();
-        const referenceText = await formatForAI(tabId);
+        const referenceText = await formatForAI(currentTabId);
         
         // 合并消息内容和引用
         let content = input.trim();
@@ -260,14 +490,15 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId }) => {
             content = `${content}\n\n[引用信息]\n${referenceText}`;
         }
         
+        const inputContent = input.trim();
         setInput('');
         if (textareaRef.current) {
             textareaRef.current.style.height = 'auto';
         }
         
         // 发送消息后清除引用
-        await sendMessage(tabId, content);
-        clearReferences(tabId);
+        await sendMessage(currentTabId, content);
+        clearReferences(currentTabId);
     };
     
     const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -277,10 +508,53 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId }) => {
             return;
         }
         
+        // 处理回车键发送消息
         if (e.key === 'Enter' && !e.shiftKey) {
+            // 检查是否正在使用中文输入法（输入法组合中）
+            // 方法1：使用原生事件属性 isComposing（最准确，实时反映输入法状态）
+            const nativeIsComposing = (e.nativeEvent as KeyboardEvent).isComposing;
+            
+            // 方法2：检查 ref 状态
+            const refIsComposing = isComposingRef.current;
+            
+            // 方法3：检查输入法是否刚刚结束（在 100ms 内，可能是回车确认输入）
+            const justEndedComposition = Date.now() - compositionEndTimeRef.current < 100;
+            
+            // 如果满足任一条件，说明正在或刚刚在输入法组合中，回车应该用于确认输入
+            if (nativeIsComposing || refIsComposing || justEndedComposition) {
+                // 正在输入法组合中或刚刚结束，让输入法处理回车（确认输入），不发送消息
+                console.log('🔤 输入法状态检测:', { 
+                    nativeIsComposing, 
+                    refIsComposing, 
+                    justEndedComposition,
+                    timeSinceEnd: Date.now() - compositionEndTimeRef.current 
+                });
+                return;
+            }
+            
             e.preventDefault();
             handleSend();
         }
+    };
+    
+    // 处理中文输入法开始
+    const handleCompositionStart = () => {
+        isComposingRef.current = true;
+        compositionEndTimeRef.current = 0; // 重置结束时间
+        console.log('🔤 输入法组合开始');
+    };
+    
+    // 处理中文输入法结束（确认输入）
+    const handleCompositionEnd = (e: React.CompositionEvent<HTMLTextAreaElement>) => {
+        // 记录输入法结束的时间
+        compositionEndTimeRef.current = Date.now();
+        
+        // 延迟重置状态，确保 keydown 事件能正确检测到
+        // 因为 compositionend 可能在 keydown 之后触发
+        setTimeout(() => {
+            isComposingRef.current = false;
+            console.log('🔤 输入法组合结束，时间戳:', compositionEndTimeRef.current);
+        }, 0);
     };
     
     // 处理 @ 选择器选择
@@ -414,7 +688,20 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId }) => {
             ref={containerRef}
             className="flex-shrink-0 border-t border-gray-200 dark:border-gray-700 p-4 bg-white dark:bg-gray-800"
             onDrop={handleDrop}
-            onDragOver={(e) => e.preventDefault()}
+            onDragOver={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                // 检查是否是从文件树拖拽的文件（通过检查数据类型）
+                const types = Array.from(e.dataTransfer.types);
+                const hasFilePath = types.includes('application/file-path') || types.includes('text/plain');
+                const hasFiles = types.includes('Files');
+                
+                if (hasFilePath || hasFiles) {
+                    e.dataTransfer.dropEffect = 'copy'; // 显示复制图标（创建引用）
+                } else {
+                    e.dataTransfer.dropEffect = 'none';
+                }
+            }}
         >
             {hasMessages && !isStreaming && (
                 <div className="mb-2 flex justify-end">
@@ -428,11 +715,13 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId }) => {
                 </div>
             )}
             
-            {/* 引用标签 */}
-            <ReferenceTags 
-                references={references} 
-                onRemove={(refId) => removeReference(tabId, refId)} 
-            />
+            {/* 引用标签（仅在已有标签页时显示） */}
+            {tabId && (
+                <ReferenceTags 
+                    references={references} 
+                    onRemove={(refId) => removeReference(tabId, refId)} 
+                />
+            )}
             
             <div className="flex items-end gap-2 relative">
                 {/* @ 语法选择器 */}
@@ -452,6 +741,8 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId }) => {
                     onChange={(e) => setInput(e.target.value)}
                     onKeyDown={handleKeyDown}
                     onPaste={handlePaste}
+                    onCompositionStart={handleCompositionStart}
+                    onCompositionEnd={handleCompositionEnd}
                     placeholder="输入消息... (Shift+Enter 换行, 可拖拽文件/图片)"
                     disabled={isStreaming}
                     rows={1}

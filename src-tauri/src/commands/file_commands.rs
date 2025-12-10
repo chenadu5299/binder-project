@@ -2,10 +2,14 @@ use crate::services::file_tree::{FileTreeService, FileTreeNode};
 use crate::services::workspace::{WorkspaceService, Workspace};
 use crate::services::file_watcher::FileWatcherService;
 use crate::services::file_system::FileSystemService;
-use std::path::PathBuf;
-use std::sync::Mutex;
+use crate::services::pandoc_service::PandocService;
+use crate::services::libreoffice_service::LibreOfficeService;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
-use tauri::{State, Emitter};
+use tauri::{State, Emitter, AppHandle};
+use uuid::Uuid;
+use serde::{Serialize, Deserialize};
 
 // 全局文件监听器（单例）
 type FileWatcherState = Mutex<FileWatcherService>;
@@ -88,23 +92,53 @@ pub async fn create_file(path: String, file_type: String) -> Result<(), String> 
             })?;
     }
     
-    // 根据文件类型创建内容
-    let content = match file_type.as_str() {
-        "md" => "# 新文档\n\n",
-        "html" => "<!DOCTYPE html>\n<html>\n<head>\n  <meta charset=\"UTF-8\">\n  <title>新文档</title>\n</head>\n<body>\n  <h1>新文档</h1>\n</body>\n</html>\n",
-        "txt" => "新文档\n\n",
-        _ => "",
-    };
+    // 检查文件扩展名，如果是 DOCX，需要特殊处理
+    let ext = path_buf.extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_lowercase());
     
-    eprintln!("[create_file] 写入文件内容: path={}", path);
-    std::fs::write(&path_buf, content)
-        .map_err(|e| {
-            eprintln!("[create_file] 写入文件失败: {}", e);
-            format!("创建文件失败: {}", e)
-        })?;
-    
-    eprintln!("[create_file] 文件创建成功: {}", path);
-    Ok(())
+    if ext.as_deref() == Some("docx") {
+        // DOCX 文件：使用 Pandoc 创建空 DOCX 文件
+        use crate::services::pandoc_service::PandocService;
+        let pandoc_service = PandocService::new();
+        
+        if !pandoc_service.is_available() {
+            return Err("Pandoc 不可用，无法创建 DOCX 文件。请安装 Pandoc 或使用其他格式。".to_string());
+        }
+        
+        // 创建空 HTML 内容
+        let empty_html = "<!DOCTYPE html>\n<html>\n<head>\n  <meta charset=\"UTF-8\">\n  <title>新文档</title>\n</head>\n<body>\n  <h1>新文档</h1>\n</body>\n</html>";
+        
+        // 使用 Pandoc 转换为 DOCX
+        match pandoc_service.convert_html_to_docx(empty_html, &path_buf) {
+            Ok(_) => {
+                eprintln!("[create_file] DOCX 文件创建成功: {}", path);
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("[create_file] DOCX 文件创建失败: {}", e);
+                Err(format!("创建 DOCX 文件失败: {}", e))
+            }
+        }
+    } else {
+        // 其他文件：直接写入文本内容
+        let content = match file_type.as_str() {
+            "md" => "# 新文档\n\n",
+            "html" => "<!DOCTYPE html>\n<html>\n<head>\n  <meta charset=\"UTF-8\">\n  <title>新文档</title>\n</head>\n<body>\n  <h1>新文档</h1>\n</body>\n</html>\n",
+            "txt" => "新文档\n\n",
+            _ => "",
+        };
+        
+        eprintln!("[create_file] 写入文件内容: path={}", path);
+        std::fs::write(&path_buf, content)
+            .map_err(|e| {
+                eprintln!("[create_file] 写入文件失败: {}", e);
+                format!("创建文件失败: {}", e)
+            })?;
+        
+        eprintln!("[create_file] 文件创建成功: {}", path);
+        Ok(())
+    }
 }
 
 #[tauri::command]
@@ -448,3 +482,628 @@ pub async fn duplicate_file(path: String) -> Result<String, String> {
     
     Ok(dest.to_string_lossy().to_string())
 }
+
+// 工作区内移动文件或文件夹
+#[tauri::command]
+pub async fn move_file(
+    source_path: String,
+    destination_path: String,
+    workspace_path: Option<String>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let source = PathBuf::from(&source_path);
+    let dest = PathBuf::from(&destination_path);
+    
+    // 检查源文件是否存在
+    if !source.exists() {
+        return Err(format!("源文件不存在: {}", source_path));
+    }
+    
+    // 检查目标文件是否已存在
+    if dest.exists() {
+        return Err(format!("目标文件已存在: {}", destination_path));
+    }
+    
+    // 检查是否尝试移动到自己的子目录
+    if dest.starts_with(&source) {
+        return Err("不能将文件移动到自己的子目录中".to_string());
+    }
+    
+    // 创建目标目录的父目录（如果不存在）
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("创建目标目录失败: {}", e))?;
+    }
+    
+    // 移动文件或文件夹
+    if source.is_dir() {
+        // 移动文件夹
+        match std::fs::rename(&source, &dest) {
+            Ok(_) => {}
+            Err(_) => {
+                // 如果 rename 失败（可能是跨分区），尝试复制后删除
+                copy_dir_all(&source, &dest)
+                    .map_err(|e| format!("移动文件夹失败: {}", e))?;
+                std::fs::remove_dir_all(&source)
+                    .map_err(|e| format!("删除源文件夹失败: {}", e))?;
+            }
+        }
+    } else {
+        // 移动文件
+        match std::fs::rename(&source, &dest) {
+            Ok(_) => {}
+            Err(_) => {
+                // 如果 rename 失败（可能是跨分区），尝试复制后删除
+                std::fs::copy(&source, &dest)
+                    .map_err(|e| format!("复制文件失败: {}", e))?;
+                std::fs::remove_file(&source)
+                    .map_err(|e| format!("删除源文件失败: {}", e))?;
+            }
+        }
+    }
+    
+    // 触发文件树变化事件
+    if let Some(ws_path) = workspace_path {
+        let _ = app.emit("file-tree-changed", ws_path);
+    } else if let Some(parent) = source.parent() {
+        // 如果没有提供工作区路径，尝试从源路径推断（使用父目录作为工作区）
+        let workspace_str = parent.to_string_lossy().to_string();
+        let _ = app.emit("file-tree-changed", workspace_str);
+    }
+    
+    Ok(())
+}
+
+// 递归复制目录的辅助函数
+fn copy_dir_all(src: &PathBuf, dst: &PathBuf) -> Result<(), String> {
+    std::fs::create_dir_all(dst)
+        .map_err(|e| format!("创建目标目录失败: {}", e))?;
+    
+    let entries = std::fs::read_dir(src)
+        .map_err(|e| format!("读取源目录失败: {}", e))?;
+    
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("读取目录项失败: {}", e))?;
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let dest_path = dst.join(&file_name);
+        
+        if path.is_dir() {
+            copy_dir_all(&path, &dest_path)?;
+        } else {
+            std::fs::copy(&path, &dest_path)
+                .map_err(|e| format!("复制文件失败: {}", e))?;
+        }
+    }
+    
+    Ok(())
+}
+
+/// 检查 Pandoc 是否可用
+#[tauri::command]
+pub async fn check_pandoc_available() -> Result<serde_json::Value, String> {
+    let pandoc_service = PandocService::new();
+    
+    let is_available = pandoc_service.is_available();
+    let is_bundled = if is_available {
+        pandoc_service.is_bundled()
+    } else {
+        false
+    };
+    
+    let path = pandoc_service.get_path()
+        .map(|p| p.to_string_lossy().to_string());
+    
+    Ok(serde_json::json!({
+        "available": is_available,
+        "is_bundled": is_bundled,
+        "path": path,
+    }))
+}
+
+/// 打开 DOCX 文件进行编辑（使用 Pandoc 转换）
+/// 返回 HTML 内容，供 TipTap 编辑器使用
+#[tauri::command]
+pub async fn open_docx_for_edit(path: String) -> Result<String, String> {
+    let docx_path = PathBuf::from(&path);
+    
+    // 1. 检查文件是否存在
+    if !docx_path.exists() {
+        return Err(format!("文件不存在: {}", path));
+    }
+    
+    // 2. 检查文件大小（限制 100MB）
+    let metadata = std::fs::metadata(&docx_path)
+        .map_err(|e| format!("获取文件信息失败: {}", e))?;
+    let file_size = metadata.len();
+    const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024; // 100MB
+    
+    if file_size > MAX_FILE_SIZE {
+        return Err(format!(
+            "文件过大（{:.2} MB），超过限制（100 MB）。请使用较小的文件。",
+            file_size as f64 / 1024.0 / 1024.0
+        ));
+    }
+    
+    eprintln!("📂 [open_docx_for_edit] 开始打开 DOCX 文件进行编辑（测试：使用 Pandoc 方案）: {}", path);
+    
+    // 3. 使用 Pandoc 方案（与预览模式相同）
+    let pandoc_service = PandocService::new();
+    
+    if !pandoc_service.is_available() {
+        return Err("Pandoc 不可用，请安装 Pandoc 或确保内置 Pandoc 可用。\n访问 https://pandoc.org/installing.html 获取安装指南。".to_string());
+    }
+    
+    // 4. 转换 DOCX 到 HTML（使用与预览模式相同的逻辑）
+    let html = pandoc_service.convert_document_to_html(&docx_path)?;
+    
+    eprintln!("✅ [open_docx_for_edit] Pandoc 转换完成，HTML 长度: {} 字符", html.len());
+    
+    Ok(html)
+}
+
+/// 创建 DOCX 文件的草稿副本
+/// 返回草稿文件路径
+#[tauri::command]
+pub async fn create_draft_docx(original_path: String) -> Result<String, String> {
+    let original = PathBuf::from(&original_path);
+    
+    if !original.exists() {
+        return Err(format!("原文件不存在: {}", original_path));
+    }
+    
+    // 生成草稿文件路径：document.docx -> document.draft.docx
+    let parent = original.parent()
+        .ok_or_else(|| "无法获取文件父目录".to_string())?;
+    let stem = original.file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| "无法获取文件名".to_string())?;
+    
+    let draft_path = parent.join(format!("{}.draft.docx", stem));
+    
+    // 如果草稿文件已存在，先删除
+    if draft_path.exists() {
+        std::fs::remove_file(&draft_path)
+            .map_err(|e| format!("删除已存在的草稿文件失败: {}", e))?;
+    }
+    
+    // 复制原文件到草稿文件
+    std::fs::copy(&original, &draft_path)
+        .map_err(|e| format!("创建草稿文件失败: {}", e))?;
+    
+    // 注意：草稿文件保持原格式，不需要立即转换
+    // 转换在打开时进行（open_docx），这样可以确保使用最新的 Pandoc 转换逻辑
+    
+    Ok(draft_path.to_string_lossy().to_string())
+}
+
+/// 创建文件的草稿副本（通用方法，支持所有文件类型）
+/// 返回草稿文件路径
+#[tauri::command]
+pub async fn create_draft_file(original_path: String) -> Result<String, String> {
+    let original = PathBuf::from(&original_path);
+    
+    if !original.exists() {
+        return Err(format!("原文件不存在: {}", original_path));
+    }
+    
+    // 生成草稿文件路径：document.html -> document.draft.html
+    let parent = original.parent()
+        .ok_or_else(|| "无法获取文件父目录".to_string())?;
+    let stem = original.file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| "无法获取文件名".to_string())?;
+    let extension = original.extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    
+    let draft_path = if extension.is_empty() {
+        parent.join(format!("{}.draft", stem))
+    } else {
+        parent.join(format!("{}.draft.{}", stem, extension))
+    };
+    
+    // 如果草稿文件已存在，先删除
+    if draft_path.exists() {
+        std::fs::remove_file(&draft_path)
+            .map_err(|e| format!("删除已存在的草稿文件失败: {}", e))?;
+    }
+    
+    // 复制原文件到草稿文件（保持原格式）
+    std::fs::copy(&original, &draft_path)
+        .map_err(|e| format!("创建草稿文件失败: {}", e))?;
+    
+    Ok(draft_path.to_string_lossy().to_string())
+}
+
+/// 保存 DOCX 文件（将 HTML 内容转换为 DOCX）
+/// 列出文件夹内的所有文件路径（递归）
+#[tauri::command]
+pub async fn list_folder_files(path: String) -> Result<Vec<String>, String> {
+    let folder_path = PathBuf::from(&path);
+    
+    if !folder_path.exists() {
+        return Err(format!("文件夹不存在: {}", path));
+    }
+    
+    if !folder_path.is_dir() {
+        return Err(format!("路径不是文件夹: {}", path));
+    }
+    
+    let mut files = Vec::new();
+    let mut dirs = vec![folder_path.clone()];
+    
+    // 递归遍历所有子目录
+    while let Some(current_dir) = dirs.pop() {
+        let entries = std::fs::read_dir(&current_dir)
+            .map_err(|e| format!("读取目录失败: {}", e))?;
+        
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("读取目录项失败: {}", e))?;
+            let entry_path = entry.path();
+            
+            // 跳过隐藏文件
+            if let Some(name) = entry_path.file_name() {
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with('.') && name_str != "." && name_str != ".." {
+                    continue;
+                }
+            }
+            
+            if entry_path.is_dir() {
+                // 如果是目录，加入待处理列表
+                dirs.push(entry_path);
+            } else {
+                // 如果是文件，加入文件列表
+                files.push(entry_path.to_string_lossy().to_string());
+            }
+        }
+    }
+    
+    Ok(files)
+}
+
+/// 保存外部文件到临时目录（用于文件引用）
+#[tauri::command]
+pub async fn save_external_file(
+    workspace_path: String,
+    file_data: Vec<u8>,
+    file_name: String,
+) -> Result<String, String> {
+    let workspace = PathBuf::from(&workspace_path);
+    
+    // 1. 确定临时文件目录（工作区根目录下的 .binder/temp 目录）
+    let temp_dir = workspace.join(".binder").join("temp");
+    
+    // 2. 创建临时目录（如果不存在）
+    if !temp_dir.exists() {
+        std::fs::create_dir_all(&temp_dir)
+            .map_err(|e| format!("创建临时目录失败: {}", e))?;
+    }
+    
+    // 3. 生成唯一文件名（时间戳 + UUID + 原文件名）
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("获取时间戳失败: {}", e))?
+        .as_secs();
+    
+    let uuid = Uuid::new_v4();
+    
+    // 清理文件名（移除特殊字符，保留扩展名）
+    let sanitized_name = file_name
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '.' || *c == '-' || *c == '_' || *c == ' ')
+        .collect::<String>();
+    
+    let file_name_without_ext = Path::new(&sanitized_name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file");
+    let ext = Path::new(&sanitized_name)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    
+    let final_file_name = if !ext.is_empty() {
+        format!("{}_{}_{}.{}", timestamp, uuid, file_name_without_ext, ext)
+    } else {
+        format!("{}_{}_{}", timestamp, uuid, file_name_without_ext)
+    };
+    
+    let temp_file_path = temp_dir.join(&final_file_name);
+    
+    // 4. 写入文件
+    std::fs::write(&temp_file_path, file_data)
+        .map_err(|e| format!("写入临时文件失败: {}", e))?;
+    
+    // 5. 返回相对路径（相对于工作区）
+    let relative_path = temp_file_path
+        .strip_prefix(&workspace)
+        .map_err(|e| format!("获取相对路径失败: {}", e))?
+        .to_string_lossy()
+        .to_string();
+    
+    Ok(relative_path)
+}
+
+/// 清理临时文件
+/// 删除指定的临时文件（用于文件引用）
+#[tauri::command]
+pub async fn cleanup_temp_files(
+    workspace_path: String,
+    file_paths: Vec<String>,
+) -> Result<usize, String> {
+    let workspace = PathBuf::from(&workspace_path);
+    let mut cleaned_count = 0;
+    
+    for file_path in file_paths {
+        let full_path = workspace.join(&file_path);
+        
+        // 验证路径安全性：确保路径在 .binder/temp 目录下
+        if !file_path.starts_with(".binder/temp/") {
+            eprintln!("⚠️ 跳过不安全的路径: {}", file_path);
+            continue;
+        }
+        
+        // 删除文件
+        if full_path.exists() && full_path.is_file() {
+            match std::fs::remove_file(&full_path) {
+                Ok(_) => {
+                    cleaned_count += 1;
+                    eprintln!("✅ 已清理临时文件: {}", file_path);
+                }
+                Err(e) => {
+                    eprintln!("⚠️ 清理临时文件失败: {} - {}", file_path, e);
+                }
+            }
+        }
+    }
+    
+    Ok(cleaned_count)
+}
+
+/// 清理过期的临时文件（超过指定时间的文件）
+#[tauri::command]
+pub async fn cleanup_expired_temp_files(
+    workspace_path: String,
+    max_age_hours: u64,
+) -> Result<usize, String> {
+    let workspace = PathBuf::from(&workspace_path);
+    let temp_dir = workspace.join(".binder").join("temp");
+    
+    if !temp_dir.exists() {
+        return Ok(0);
+    }
+    
+    let max_age = std::time::Duration::from_secs(max_age_hours * 3600);
+    let now = SystemTime::now();
+    let mut cleaned_count = 0;
+    
+    // 遍历临时目录中的所有文件
+    let entries = std::fs::read_dir(&temp_dir)
+        .map_err(|e| format!("读取临时目录失败: {}", e))?;
+    
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("读取目录项失败: {}", e))?;
+        let path = entry.path();
+        
+        if !path.is_file() {
+            continue;
+        }
+        
+        // 获取文件修改时间
+        if let Ok(metadata) = path.metadata() {
+            if let Ok(modified) = metadata.modified() {
+                if let Ok(age) = now.duration_since(modified) {
+                    // 如果文件超过指定时间，删除它
+                    if age > max_age {
+                        match std::fs::remove_file(&path) {
+                            Ok(_) => {
+                                cleaned_count += 1;
+                                eprintln!("✅ 已清理过期临时文件: {:?}", path);
+                            }
+                            Err(e) => {
+                                eprintln!("⚠️ 清理过期临时文件失败: {:?} - {}", path, e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(cleaned_count)
+}
+
+/// 清理所有临时文件（谨慎使用）
+#[tauri::command]
+pub async fn cleanup_all_temp_files(workspace_path: String) -> Result<usize, String> {
+    let workspace = PathBuf::from(&workspace_path);
+    let temp_dir = workspace.join(".binder").join("temp");
+    
+    if !temp_dir.exists() {
+        return Ok(0);
+    }
+    
+    let mut cleaned_count = 0;
+    
+    // 遍历临时目录中的所有文件
+    let entries = std::fs::read_dir(&temp_dir)
+        .map_err(|e| format!("读取临时目录失败: {}", e))?;
+    
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("读取目录项失败: {}", e))?;
+        let path = entry.path();
+        
+        if path.is_file() {
+            match std::fs::remove_file(&path) {
+                Ok(_) => {
+                    cleaned_count += 1;
+                }
+                Err(e) => {
+                    eprintln!("⚠️ 清理临时文件失败: {:?} - {}", path, e);
+                }
+            }
+        }
+    }
+    
+    Ok(cleaned_count)
+}
+
+#[tauri::command]
+pub async fn save_docx(path: String, html_content: String, app: tauri::AppHandle) -> Result<(), String> {
+    let pandoc_service = PandocService::new();
+    
+    if !pandoc_service.is_available() {
+        return Err("Pandoc 不可用，请安装 Pandoc 以支持 DOCX 文件".to_string());
+    }
+    
+    let docx_path = PathBuf::from(&path);
+    
+    // 触发开始事件
+    app.emit("fs-save-progress", serde_json::json!({
+        "file_path": path,
+        "status": "started",
+        "progress": 0,
+    })).map_err(|e| format!("发送进度事件失败: {}", e))?;
+    
+    // 转换 HTML 到 DOCX
+    app.emit("fs-save-progress", serde_json::json!({
+        "file_path": path,
+        "status": "converting",
+        "progress": 50,
+    })).map_err(|e| format!("发送进度事件失败: {}", e))?;
+    
+    pandoc_service.convert_html_to_docx(&html_content, &docx_path)?;
+    
+    // 触发完成事件
+    app.emit("fs-save-progress", serde_json::json!({
+        "file_path": path,
+        "status": "completed",
+        "progress": 100,
+    })).map_err(|e| format!("发送进度事件失败: {}", e))?;
+    
+    Ok(())
+}
+
+// ==================== 预览相关命令 ====================
+
+/// 预览 DOCX 文件为 PDF（新方案）
+/// 
+/// **功能**：转换 DOCX → PDF，返回 PDF 文件路径
+/// 
+/// **使用场景**：
+/// - DocxPdfPreview 组件内部调用
+/// - 预览模式（isReadOnly = true）
+/// 
+/// **返回**：PDF 文件路径（file:// 绝对路径）
+/// 
+/// **缓存机制**：
+/// - 缓存键：文件路径 + 修改时间
+/// - 缓存过期：1 小时
+/// - 缓存位置：应用缓存目录
+#[tauri::command]
+pub async fn preview_docx_as_pdf(
+    path: String,
+    app: AppHandle,
+) -> Result<String, String> {
+    let docx_path = PathBuf::from(&path);
+    
+    // 检查文件是否存在
+    if !docx_path.exists() {
+        return Err(format!("文件不存在: {}", path));
+    }
+    
+    eprintln!("🔍 [preview_docx_as_pdf] 开始预览: {:?}", docx_path);
+    
+    // 发送预览进度事件：开始
+    app.emit("preview-progress", serde_json::json!({
+        "status": "started",
+        "message": "正在预览..."
+    })).ok();
+    
+    // 创建 LibreOffice 服务
+    let lo_service = LibreOfficeService::new()
+        .map_err(|e| {
+            let error_msg = format!("LibreOffice 服务初始化失败: {}", e);
+            app.emit("preview-progress", serde_json::json!({
+                "status": "failed",
+                "message": &error_msg
+            })).ok();
+            error_msg
+        })?;
+    
+    // 检查 LibreOffice 是否可用（获取实际错误消息）
+    let libreoffice_path_result = lo_service.get_libreoffice_path();
+    if libreoffice_path_result.is_err() {
+        let error_msg = libreoffice_path_result.unwrap_err();
+        app.emit("preview-progress", serde_json::json!({
+            "status": "failed",
+            "message": &error_msg
+        })).ok();
+        return Err(error_msg);
+    }
+    
+    // 发送预览进度事件：预览中
+    app.emit("preview-progress", serde_json::json!({
+        "status": "converting",
+        "message": "正在预览..."
+    })).ok();
+    
+    // 执行转换（带超时：30秒）
+    let docx_path_clone = docx_path.clone();
+    let lo_service_arc = Arc::new(lo_service);
+    let pdf_path_result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || {
+            lo_service_arc.convert_docx_to_pdf(&docx_path_clone)
+        })
+    ).await;
+    
+    let pdf_path = match pdf_path_result {
+        Ok(Ok(Ok(path))) => path,
+        Ok(Ok(Err(e))) => {
+            // 转换失败
+            let error_msg = format!("预览失败: {}", e);
+            app.emit("preview-progress", serde_json::json!({
+                "status": "failed",
+                "message": &error_msg
+            })).ok();
+            return Err(error_msg);
+        }
+        Ok(Err(e)) => {
+            // spawn_blocking 失败
+            let error_msg = format!("预览失败: {}", e);
+            app.emit("preview-progress", serde_json::json!({
+                "status": "failed",
+                "message": &error_msg
+            })).ok();
+            return Err(error_msg);
+        }
+        Err(_) => {
+            // 超时
+            let error_msg = "预览失败，你的文件过大或存在无法预览的格式，请调整文档。".to_string();
+            app.emit("preview-progress", serde_json::json!({
+                "status": "failed",
+                "message": &error_msg
+            })).ok();
+            eprintln!("⏱️ [preview_docx_as_pdf] 预览超时（30秒）");
+            return Err(error_msg);
+        }
+    };
+    
+    // 转换为 file:// URL
+    let pdf_url = format!("file://{}", pdf_path.to_string_lossy());
+    
+    eprintln!("✅ [preview_docx_as_pdf] 转换完成: {}", pdf_url);
+    
+    // 发送预览进度事件：完成
+    app.emit("preview-progress", serde_json::json!({
+        "status": "completed",
+        "message": "预览完成",
+        "pdf_path": &pdf_url
+    })).ok();
+    
+    Ok(pdf_url)
+}
+

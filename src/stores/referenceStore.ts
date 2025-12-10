@@ -54,12 +54,18 @@ export const useReferenceStore = create<ReferenceState>((set, get) => {
         referencesByTab: new Map(),
         
         addReference: (tabId: string, ref: Reference) => {
-            const id = `ref-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-            const newRef = { ...ref, id, createdAt: Date.now() };
+            // 如果传入的 ref 已经有 id，使用原有的 id，否则生成新的 id
+            const id = ref.id || `ref-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+            const createdAt = ref.createdAt || Date.now();
+            const newRef = { ...ref, id, createdAt };
             
             const { referencesByTab } = get();
             const currentRefs = referencesByTab.get(tabId) || [];
-            const newRefs = [...currentRefs, newRef];
+            // 检查是否已存在相同 id 的引用，如果存在则替换，否则添加
+            const existingIndex = currentRefs.findIndex(r => r.id === id);
+            const newRefs = existingIndex >= 0
+                ? currentRefs.map((r, idx) => idx === existingIndex ? newRef : r)
+                : [...currentRefs, newRef];
             
             set({
                 referencesByTab: new Map(referencesByTab).set(tabId, newRefs),

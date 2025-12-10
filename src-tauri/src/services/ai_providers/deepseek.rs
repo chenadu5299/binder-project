@@ -526,16 +526,9 @@ impl AIProvider for DeepSeekProvider {
                                                                 processed_any = true;
                                                                 break; // 工具调用完成后不再处理其他行
                                                             } else {
-                                                                // 未完成，返回累积中的工具调用（但不中断循环，继续处理其他行）
-                                                                // 只在还没有工具调用 chunk 时添加
-                                                                if !result_chunks.iter().any(|c| matches!(c, ChatChunk::ToolCall { .. })) {
-                                                                    result_chunks.push(ChatChunk::ToolCall {
-                                                                        id: id.clone(),
-                                                                        name: name.clone(),
-                                                                        arguments: state_guard.2.clone(),
-                                                                        is_complete: false,
-                                                                    });
-                                                                }
+                                                                // 未完成，不返回 chunk，继续累积
+                                                                // 参考 void 的实现：只有完整的工具调用才返回
+                                                                // 这样可以避免前端收到不完整的 JSON 导致解析失败
                                                             }
                                                         }
                                                     }

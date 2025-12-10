@@ -31,6 +31,12 @@ uuid = { version = "1.0", features = ["v4"] }
 base64 = "0.22.1"
 rusqlite = { version = "0.31", features = ["bundled"] }
 walkdir = "2.4"
+regex = "1.10"
+zip = "0.6"
+quick-xml = { version = "0.31", features = ["serialize"] }
+sha2 = "0.10"
+once_cell = "1.19"
+image = "0.24"
 
 [features]
 # This feature is used for production builds or when `devPath` points to the filesystem

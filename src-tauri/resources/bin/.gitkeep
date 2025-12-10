@@ -1,0 +1,3 @@
+# This file ensures the bin directory exists for glob pattern matching
+# Pandoc binary files can be placed here when needed
+

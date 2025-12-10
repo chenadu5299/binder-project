@@ -1,6 +1,6 @@
 import React from 'react';
 import { XMarkIcon, DocumentIcon, PhotoIcon, LinkIcon, BookOpenIcon } from '@heroicons/react/24/outline';
-import { Reference, ReferenceType, TextReference, FileReference, ImageReference, MemoryReference, LinkReference } from '../../types/reference';
+import { Reference, ReferenceType, TextReference, FileReference, ImageReference, MemoryReference, LinkReference, FolderReference, ChatReference } from '../../types/reference';
 import { CollapsibleReference } from './CollapsibleReference';
 import { LinkPreview } from './LinkPreview';
 
@@ -29,20 +29,38 @@ export const ReferenceTags: React.FC<ReferenceTagsProps> = ({ references, onRemo
     
     const getLabel = (ref: Reference): string => {
         switch (ref.type) {
-            case ReferenceType.TEXT:
-                return `文本引用`;
-            case ReferenceType.FILE:
+            case ReferenceType.TEXT: {
+                const textRef = ref as TextReference;
+                // 显示位置信息而非完整内容
+                if (textRef.displayText) {
+                    return textRef.displayText;
+                }
+                return `${textRef.fileName || '未知文件'} (行 ${textRef.lineRange?.start || 0}-${textRef.lineRange?.end || 0})`;
+            }
+            case ReferenceType.FILE: {
                 const fileRef = ref as FileReference;
-                return `文件: ${fileRef.name}`;
-            case ReferenceType.IMAGE:
+                return fileRef.name;
+            }
+            case ReferenceType.FOLDER: {
+                const folderRef = ref as import('../../types/reference').FolderReference;
+                return `${folderRef.name} (${folderRef.fileCount || 0} 个文件)`;
+            }
+            case ReferenceType.IMAGE: {
                 const imageRef = ref as ImageReference;
-                return `图片: ${imageRef.name}`;
-            case ReferenceType.MEMORY:
+                return imageRef.name;
+            }
+            case ReferenceType.MEMORY: {
                 const memoryRef = ref as MemoryReference;
-                return `记忆库: ${memoryRef.name}`;
-            case ReferenceType.LINK:
+                return `${memoryRef.name} (${memoryRef.itemCount || 0} 项)`;
+            }
+            case ReferenceType.CHAT: {
+                const chatRef = ref as import('../../types/reference').ChatReference;
+                return `${chatRef.chatTabTitle} (消息 ${chatRef.messageRange?.start || 0}-${chatRef.messageRange?.end || 0})`;
+            }
+            case ReferenceType.LINK: {
                 const linkRef = ref as LinkReference;
-                return `链接: ${linkRef.url.substring(0, 30)}${linkRef.url.length > 30 ? '...' : ''}`;
+                return linkRef.title || linkRef.url.substring(0, 30) + (linkRef.url.length > 30 ? '...' : '');
+            }
             default:
                 return '引用';
         }
@@ -74,9 +92,9 @@ export const ReferenceTags: React.FC<ReferenceTagsProps> = ({ references, onRemo
                         <span className="text-xs font-medium text-blue-700 dark:text-blue-300">
                             {getLabel(ref)}
                         </span>
-                        {ref.type === ReferenceType.TEXT && (ref as TextReference).sourceFile && (
+                        {ref.type === ReferenceType.TEXT && (ref as TextReference).fileName && (
                             <span className="text-xs text-gray-500 dark:text-gray-400">
-                                ({(ref as TextReference).sourceFile})
+                                {(ref as TextReference).fileName}
                             </span>
                         )}
                         <button

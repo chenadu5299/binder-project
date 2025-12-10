@@ -2,9 +2,26 @@ import { useEditor, EditorContent } from '@tiptap/react';
 import StarterKit from '@tiptap/starter-kit';
 import Image from '@tiptap/extension-image';
 import Link from '@tiptap/extension-link';
+import { TextStyle } from '@tiptap/extension-text-style';
+import { Color } from '@tiptap/extension-color';
+import { TextAlign } from '@tiptap/extension-text-align';
+import { Underline } from '@tiptap/extension-underline';
+import { Subscript } from '@tiptap/extension-subscript';
+import { Superscript } from '@tiptap/extension-superscript';
+import { FontFamily } from '@tiptap/extension-font-family';
+import { Table } from '@tiptap/extension-table';
+import { TableRow } from '@tiptap/extension-table-row';
+import { TableCell } from '@tiptap/extension-table-cell';
+import { TableHeader } from '@tiptap/extension-table-header';
+import { Highlight } from '@tiptap/extension-highlight';
+import { TaskList } from '@tiptap/extension-task-list';
+import { TaskItem } from '@tiptap/extension-task-item';
 import { useEffect, useRef } from 'react';
 import { useAutoComplete } from '../../hooks/useAutoComplete';
 import { GhostTextExtension } from './extensions/GhostTextExtension';
+import { CopyReferenceExtension } from './extensions/CopyReferenceExtension';
+import { FontSize } from './extensions/FontSize';
+import { useEditorStore } from '../../stores/editorStore';
 
 interface TipTapEditorProps {
   content: string;
@@ -31,12 +48,32 @@ const TipTapEditor: React.FC<TipTapEditorProps> = ({
   // 使用 ref 存储 getGhostText 函数，供 Extension 使用
   const getGhostTextRef = useRef<() => { text: string; position: number } | null>(() => null);
   
+  // 获取当前标签页信息（用于复制引用功能）
+  const { tabs, activeTabId } = useEditorStore();
+  const activeTab = tabs.find(t => t.id === activeTabId);
+  
   // 创建编辑器实例
   const editor = useEditor({
+    // 关键：配置编辑器以保留 HTML 属性和内联样式
+    parseOptions: {
+      preserveWhitespace: 'full',
+    },
+    editorProps: {
+      attributes: {
+        class: 'prose dark:prose-invert max-w-none',
+      },
+      // 确保解析时保留所有 HTML 属性（包括 style）
+      transformPastedHTML: (html) => {
+        // 保留原始 HTML，包括所有内联样式
+        return html;
+      },
+    },
     extensions: [
       StarterKit.configure({
         // 禁用 StarterKit 中的 Link 扩展，使用自定义配置的 Link
         link: false,
+        // 禁用 StarterKit 中的 Underline 扩展，使用自定义配置的 Underline
+        underline: false,
       }),
       Image.configure({
         inline: true,
@@ -49,6 +86,33 @@ const TipTapEditor: React.FC<TipTapEditorProps> = ({
       Link.configure({
         openOnClick: false,
       }),
+      // 文本样式扩展
+      TextStyle,
+      Color,
+      TextAlign.configure({
+        types: ['heading', 'paragraph'],
+      }),
+      Underline,
+      Subscript,
+      Superscript,
+      FontFamily,
+      FontSize,
+      // 背景颜色（高亮）
+      Highlight.configure({
+        multicolor: true,
+      }),
+      // 表格扩展
+      Table.configure({
+        resizable: true,
+      }),
+      TableRow,
+      TableHeader,
+      TableCell,
+      // 任务列表
+      TaskList,
+      TaskItem.configure({
+        nested: true,
+      }),
       // 添加幽灵文字扩展
       GhostTextExtension.configure({
         getGhostText: () => {
@@ -57,17 +121,54 @@ const TipTapEditor: React.FC<TipTapEditorProps> = ({
           return result;
         },
       }),
+      // 添加复制引用扩展
+      // 使用闭包动态获取最新的 tab 信息（从 store 实时读取）
+      CopyReferenceExtension.configure({
+        tabId: tabId,
+        getFilePath: () => {
+          // 从 store 动态获取最新的 tab 信息
+          const store = useEditorStore.getState();
+          const currentTab = tabId 
+            ? store.tabs.find(t => t.id === tabId)
+            : store.tabs.find(t => t.id === store.activeTabId);
+          return currentTab?.filePath || null;
+        },
+        getFileName: () => {
+          // 从 store 动态获取最新的 tab 信息
+          const store = useEditorStore.getState();
+          const currentTab = tabId 
+            ? store.tabs.find(t => t.id === tabId)
+            : store.tabs.find(t => t.id === store.activeTabId);
+          return currentTab?.fileName || null;
+        },
+      }),
     ],
     content,
     editable,
-    // ⚠️ 关键：优化 onUpdate 触发频率，避免每次输入都触发保存
     onUpdate: ({ editor }) => {
+      // 添加日志：显示编辑器内容变化
+      const html = editor.getHTML();
+      const json = editor.getJSON();
+      console.log('[TipTapEditor] 内容更新', {
+        htmlLength: html.length,
+        jsonLength: JSON.stringify(json).length,
+        hasContent: html.trim().length > 0,
+      });
+      
+      // 检查样式信息
+      const { from, to } = editor.state.selection;
+      const marks = editor.state.storedMarks || editor.state.selection.$from.marks();
+      if (marks.length > 0) {
+        console.log('[TipTapEditor] 当前选中文本的样式', {
+          marks: marks.map(m => ({ type: m.type.name, attrs: m.attrs })),
+        });
+      }
+      
       // 如果正在从外部设置内容，不触发 onChange
       if (isSettingContentRef.current) {
         return;
       }
       
-      const html = editor.getHTML();
       // 只有内容真正变化时才触发 onChange
       if (html !== lastContentRef.current) {
         lastContentRef.current = html;
@@ -144,7 +245,13 @@ const TipTapEditor: React.FC<TipTapEditorProps> = ({
       isSettingContentRef.current = true;
       lastContentRef.current = content;
       // 使用 emitUpdate: false 避免触发 onUpdate
-      editor.commands.setContent(content, { emitUpdate: false });
+      // 关键：使用 parseOptions 确保保留所有 HTML 属性和内联样式
+      editor.commands.setContent(content, { 
+        emitUpdate: false,
+        parseOptions: {
+          preserveWhitespace: 'full',
+        },
+      });
       // 使用 setTimeout 确保在下一个事件循环中重置标志
       setTimeout(() => {
         isSettingContentRef.current = false;

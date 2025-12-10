@@ -1,0 +1,10 @@
+# 排除 LibreOffice.app 内部的帮助文件和文档
+libreoffice/**/*.html
+libreoffice/**/*.css
+libreoffice/**/*.js
+libreoffice/**/help/**
+libreoffice/**/LICENSE*
+libreoffice/**/README*
+libreoffice/**/Python.framework/**
+libreoffice/**/site-packages/**
+

@@ -16,6 +16,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { emit } from '@tauri-apps/api/event';
 import { useFileStore } from '../../stores/fileStore';
 import { useEditorStore } from '../../stores/editorStore';
+import { documentService } from '../../services/documentService';
 import { DocumentDiffView } from './DocumentDiffView';
 
 interface ToolCallCardProps {
@@ -361,6 +362,24 @@ export const ToolCallCard: React.FC<ToolCallCardProps> = ({ toolCall, onResult }
                                     {toolCall.result.data.full_path && (
                                         <div className="text-xs text-gray-500 dark:text-gray-400 mb-2">
                                             完整路径: {toolCall.result.data.full_path}
+                                        </div>
+                                    )}
+                                    {/* AI 创建文件后自动打开 */}
+                                    {toolCall.name === 'create_file' && toolCall.result.data.path && currentWorkspace && (
+                                        <div className="mt-2">
+                                            <button
+                                                onClick={async () => {
+                                                    try {
+                                                        const filePath = currentWorkspace + '/' + toolCall.result.data.path;
+                                                        await documentService.openFile(filePath, { source: 'ai_generated' });
+                                                    } catch (error) {
+                                                        console.error('打开文件失败:', error);
+                                                    }
+                                                }}
+                                                className="text-xs px-2 py-1 bg-blue-500 text-white rounded hover:bg-blue-600 transition-colors"
+                                            >
+                                                📂 在编辑器中打开
+                                            </button>
                                         </div>
                                     )}
                                     <details className="mt-1">

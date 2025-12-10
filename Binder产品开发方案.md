@@ -145,7 +145,6 @@ src/
 │   │   ├── ImageHandler.tsx        # 图片处理组件（插入、显示、删除）
 │   │   ├── GhostText.tsx            # 层次一：幽灵文字组件
 │   │   ├── InlineAssistInput.tsx    # 层次二：Inline Assist 输入框
-│   │   └── DocumentOutline.tsx     # 文档大纲
 │   ├── Chat/            # AI 聊天组件（层次三）
 │   │   ├── ChatWindow.tsx          # 聊天窗口
 │   │   ├── ChatTabs.tsx            # 聊天标签栏（多线程聊天）
@@ -294,7 +293,6 @@ listen<FileChangedEvent>('file-changed', (event) => {
 - 链接插入
 - 代码块支持
 - Markdown 支持
-- 文档大纲自动生成
 - **撤销/重做**：支持 50 步历史记录（默认，可配置）
 
 **工具栏动态显示**：
@@ -320,6 +318,24 @@ listen<FileChangedEvent>('file-changed', (event) => {
 
 **处理流程（最终方案）**：
 
+**预览模式（外部导入 DOCX，只读）**：
+```
+打开 DOCX 文件（外部导入）
+  ↓
+预览模式（isReadOnly = true）
+  ↓
+使用 DocxPdfPreview 组件 → 调用 preview_docx_as_pdf() 命令
+  ↓
+LibreOffice 转换 DOCX → PDF（带字体嵌入参数）
+  ↓
+读取 PDF 为 base64 → 创建 data URL
+  ↓
+使用 iframe 加载 data URL（浏览器原生 PDF 查看器）
+  ↓
+显示预览界面（工具栏：打印、编辑按钮，搜索和缩放提示）
+```
+
+**编辑模式（新建/AI生成/点击编辑）**：
 ```
 打开 DOCX 文件
   ↓
@@ -335,6 +351,19 @@ listen<FileChangedEvent>('file-changed', (event) => {
 TipTap 导出 HTML → Pandoc 转换 → 保存为原格式 DOCX（直接覆盖或保存到草稿文件）
 ```
 
+**预览与编辑模式区分**：
+- **预览模式**：使用 `preview_docx_as_pdf()` 命令，LibreOffice 转换为 PDF，由 `DocxPdfPreview` 组件使用 iframe + data URL 显示
+- **编辑模式**：使用 `open_docx_for_edit()` 命令，Pandoc 转换 + CSS 样式表，返回 HTML，由 TipTap 编辑器显示
+
+**编辑界面模式**：
+- **分页式编辑界面**（DOCX 专用）：模拟 A4 纸张的固定尺寸编辑区域，支持横向/纵向页面方向，窗口宽度变化时自动切换单排/多排显示
+  - 页面尺寸：纵向 210mm × 297mm，横向 297mm × 210mm
+  - 自动分页：内容超出单页时自动创建新页面
+  - 响应式布局：窗口缩放时页面保持固定尺寸，自动计算可容纳的列数
+  - 详细方案：参考 `DOCX分页式编辑界面方案.md`
+  - 开发计划：参考 `DOCX分页式编辑界面开发计划.md`
+- 预览模式不显示编辑按钮（ReadOnlyBanner），工具栏包含打印和编辑按钮
+
 **Pandoc 优势**：
 - ✅ 转换质量比 mammoth 更好
 - ✅ 支持更多格式
@@ -344,63 +373,132 @@ TipTap 导出 HTML → Pandoc 转换 → 保存为原格式 DOCX（直接覆盖�
 **Rust 后端接口**：
 
 ```rust
-// src-tauri/src/services/docx_service.rs
-pub struct DocxService {
-    pandoc: PandocService,
+// src-tauri/src/commands/file_commands.rs
+
+/// 打开 DOCX 文件并转换为 HTML（用于编辑模式）
+/// 
+/// **使用场景**：
+/// - 编辑模式（新建/AI生成/点击编辑）
+/// - TipTap 编辑器显示
+/// 
+/// **处理流程**：
+/// 1. Pandoc 转换 DOCX → HTML（提取基础样式）
+/// 2. CSS 类转换为内联样式（段落对齐）
+/// 3. 添加预设样式表（CSS 样式表，不修改 HTML）
+/// 
+/// **返回**：HTML 内容（带预设样式，可直接加载到 TipTap）
+#[tauri::command]
+pub async fn open_docx_for_edit(path: String) -> Result<String, String> {
+    // 实现：Pandoc 转换 + CSS 类转换 + 预设样式表
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum DocxError {
-    PandocNotAvailable,
-    FileTooLarge(u64),
-    CorruptedFile,
-    ConversionFailed(String),
-    InvalidPath,
+/// 预览 DOCX 文件（预览模式专用）
+/// 
+/// **重要说明**：此命令与 `open_docx` 的区别
+/// - `open_docx`：用于编辑模式，返回 HTML 供 TipTap 编辑器使用（Pandoc 转换）
+/// - `preview_docx_as_pdf`：用于预览模式，LibreOffice 转换为 PDF，返回 PDF 文件路径
+/// 
+/// **转换流程**：
+/// - LibreOffice 转换 DOCX → PDF（带字体嵌入参数）
+/// - 缓存 PDF 文件（1小时过期）
+/// - 返回 PDF 文件路径（file:// 绝对路径）
+/// 
+/// **使用场景**：
+/// - DocxPdfPreview 组件内部调用
+/// - 预览模式（isReadOnly = true）
+/// 
+/// **不使用场景**：
+/// - 编辑模式（应使用 `open_docx`）
+#[tauri::command]
+pub async fn preview_docx_as_pdf(
+    path: String,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    // 实现：检查文件存在 → LibreOffice 转换 DOCX → PDF → 返回 PDF 路径
+    // 发送 preview-progress 事件（"正在预览..."）
+    // 超时机制：30秒超时，超时后提示失败并放弃转换
 }
 
-impl DocxService {
-    // 检测 DOCX 复杂度（复杂表格、VBA 宏、复杂样式等）
-    pub async fn detect_complexity(path: &Path) -> Result<bool, Error>;
-    
-    // 创建草稿副本：document.docx -> document.draft.docx
-    pub async fn create_draft_copy(original_path: &Path) -> Result<PathBuf, Error>;
-    
-    // 打开 DOCX：返回 (HTML 内容, 实际文件路径, 是否为草稿)
-    pub async fn open_docx(path: &Path) -> Result<(String, PathBuf, bool), DocxError> {
-        // 1. 检查 Pandoc 可用性
-        if !self.pandoc.is_available() {
-            return Err(DocxError::PandocNotAvailable);
-        }
-        
-        // 2. 检查文件大小（限制 100MB）
-        let file_size = std::fs::metadata(path)?.len();
-        if file_size > 100 * 1024 * 1024 {
-            return Err(DocxError::FileTooLarge(file_size));
-        }
-        
-        // 3. 检测文件是否损坏
-        if !self.is_valid_docx(path)? {
-            return Err(DocxError::CorruptedFile);
-        }
-        
-        // 4. 尝试转换，失败时降级为纯文本提取
-        match self.pandoc.convert_docx_to_html(path).await {
-            Ok(html) => Ok((html, path.to_path_buf(), false)),
-            Err(e) => {
-                // 降级策略：提取纯文本
-                let text = self.extract_text_only(path)?;
-                Ok((format!("<p>{}</p>", text), path.to_path_buf(), true))
-            }
-        }
-    }
-    
-    // 保存 DOCX：HTML → DOCX（直接覆盖原文件或草稿文件）
-    pub async fn save_docx(path: &Path, html: &str) -> Result<(), DocxError> {
-        // Pandoc 会自动处理 HTML 中的图片引用
-        // 图片路径为 file:// 或相对路径时，Pandoc 会自动打包进 DOCX
-    }
+
+/// 创建 DOCX 文件的草稿副本
+/// 返回草稿文件路径
+#[tauri::command]
+pub async fn create_draft_docx(original_path: String) -> Result<String, String> {
+    // 实现：创建草稿副本（document.draft.docx）
+}
+
+/// 保存 DOCX 文件（将 HTML 内容转换为 DOCX）
+#[tauri::command]
+pub async fn save_docx(
+    path: String,
+    html_content: String,
+    app: tauri::AppHandle
+) -> Result<(), String> {
+    // 实现：Pandoc 转换 HTML → DOCX（含进度事件）
 }
 ```
+
+**前端组件**：
+
+```typescript
+// src/components/Editor/EditorPanel.tsx
+
+import DocxPdfPreview from './DocxPdfPreview';
+import HTMLPreview from './HTMLPreview'; // 继续用于 HTML 文件
+
+// 在渲染逻辑中
+{activeTab ? (() => {
+  const fileType = getFileType(activeTab.filePath);
+  
+  // PDF 和图片文件使用预览组件
+  if (fileType === 'pdf' || fileType === 'image') {
+    return (
+      <div className="h-full overflow-hidden">
+        <FilePreview filePath={activeTab.filePath} fileType={fileType} />
+      </div>
+    );
+  }
+  
+  // HTML 文件（只读模式）：使用 HTMLPreview（保持不变）
+  if (fileType === 'html' && activeTab.isReadOnly) {
+    return <HTMLPreview content={activeTab.content} />;
+  }
+  
+  // DOCX 文件（只读模式）：使用 DocxPdfPreview（新方案：LibreOffice + PDF）
+  if (fileType === 'docx' && activeTab.isReadOnly) {
+    // 注意：不再使用 activeTab.content
+    // 组件内部调用 preview_docx_as_pdf 命令获取 PDF，使用 iframe + data URL 显示
+    return <DocxPdfPreview filePath={activeTab.filePath} />;
+  }
+  
+  // 其他文件（包括 DOCX 可编辑模式）：使用编辑器
+  return (
+    <div className="h-full overflow-hidden relative">
+      <TipTapEditor
+        content={activeTab.content}
+        onChange={handleContentChange}
+        onSave={handleSave}
+        editable={!activeTab.isReadOnly}
+        onEditorReady={handleEditorReady}
+        tabId={activeTab.id}
+      />
+    </div>
+  );
+})() : null}
+```
+
+**预览功能特性**：
+- 文本选中和复制
+- 打印功能
+- 缩放功能（50%-200%，步进 10%）
+- 搜索功能（高亮、滚动到结果）
+- 页码显示和页面跳转
+- Word 页面效果（模拟 Word 页面样式）
+- 暗色模式适配
+- 文本框支持（绝对定位渲染）
+- 分栏支持（CSS 多列布局，1-13 列）
+
+**详细实现方案**：见 [Word预览完整开发方案.md](./Word预览完整开发方案.md)
 
 **文件树显示**：
 - 用户看到的是 `.docx`、`.md`、`.html` 等熟悉的格式文件
@@ -1340,7 +1438,6 @@ impl MemoryService {
 - 集成 TipTap 编辑器
 - 实现基础编辑功能（文本、样式、列表等）
 - 实现编辑器工具栏（根据文件类型动态显示）
-- 实现文档大纲生成和导航
 - **实现图片处理功能**：
   - 图片插入（复制到 assets/ 文件夹）
   - 图片显示（file:// 路径）
@@ -1651,7 +1748,6 @@ impl PandocService {
    - 富文本编辑（标题、段落、列表、样式、图片、表格）
    - **图片处理**：图片插入、存储到 assets/ 文件夹、编辑器显示、保存时 Pandoc 自动打包进 DOCX
    - Markdown 支持
-   - 文档大纲导航
    - 工具栏根据文件类型动态显示
 
 2. **DOCX 文件支持**（Pandoc 集成）

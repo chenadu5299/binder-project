@@ -57,6 +57,12 @@ const NewFileButton: React.FC<NewFileButtonProps> = ({ fileTreeRef }) => {
         await fileService.createFolder(filePath);
       } else {
         await fileService.createFile(filePath, fileType);
+        
+        // 如果是 DOCX/MD/HTML 文件，创建后自动打开（标记为新建）
+        if (['docx', 'md', 'html', 'txt'].includes(fileType)) {
+          const { documentService } = await import('../../services/documentService');
+          await documentService.openFile(filePath, { source: 'new' });
+        }
       }
       
       setShowInputDialog(false);

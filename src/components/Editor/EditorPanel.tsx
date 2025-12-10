@@ -12,16 +12,52 @@ import { DiffView } from './DiffView';
 import { InlineAssistPosition } from './InlineAssistPosition';
 import ExternalModificationDialog from './ExternalModificationDialog';
 import DocumentAnalysisPanel from './DocumentAnalysisPanel';
+import DocxPdfPreview from './DocxPdfPreview';
 import { useInlineAssist } from '../../hooks/useInlineAssist';
 import { documentService } from '../../services/documentService';
 import { toast } from '../Common/Toast';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { XMarkIcon } from '@heroicons/react/24/outline';
+
+// 保存进度事件类型
+interface SaveProgressEvent {
+  file_path: string;
+  status: 'started' | 'converting' | 'saving' | 'completed' | 'failed';
+  progress: number;
+  error?: string;
+}
+
+// HTML 预览组件（使用 iframe 隔离样式，避免影响全局应用）
+const HTMLPreview: React.FC<{ content: string }> = ({ content }) => {
+  const htmlUrl = useMemo(() => {
+    const htmlBlob = new Blob([content], { type: 'text/html' });
+    return URL.createObjectURL(htmlBlob);
+  }, [content]);
+  
+  // 组件卸载时清理 URL，避免内存泄漏
+  useEffect(() => {
+    return () => {
+      URL.revokeObjectURL(htmlUrl);
+    };
+  }, [htmlUrl]);
+  
+  return (
+    <div className="h-full overflow-hidden">
+      <iframe
+        src={htmlUrl}
+        className="w-full h-full border-0"
+        title="HTML 预览"
+        sandbox="allow-same-origin"
+      />
+    </div>
+  );
+};
 
 const EditorPanel: React.FC = () => {
   const { currentWorkspace } = useFileStore();
   const { tabs, activeTabId, updateTabContent, markTabSaved, setTabEditor, setTabSaving, updateTabModifiedTime } = useEditorStore();
-  const { analysis, setAnalysisVisible } = useLayoutStore();
+  const { analysis, setAnalysisVisible, editor, setEditorVisible } = useLayoutStore();
   
   // ⚠️ Week 17.1.2：外部修改检测状态
   const [externalModificationTab, setExternalModificationTab] = useState<string | null>(null);
@@ -74,18 +110,29 @@ const EditorPanel: React.FC = () => {
   }, [tabs, updateTabContent]);
   
   // ⚠️ Week 17.1.2：定期检查外部修改（每 5 秒）
+  // ⚠️ 关键修复：添加防抖机制和有效性检查，避免重复弹出对话框
   useEffect(() => {
     if (tabs.length === 0) return;
     
     const checkInterval = setInterval(async () => {
+      // 如果已经有外部修改对话框显示，跳过检查
+      if (externalModificationTab) {
+        return;
+      }
+      
       for (const tab of tabs) {
         // 只检查非脏文件（未修改的文件）
         if (tab.isDirty || !tab.filePath || tab.isReadOnly) continue;
         
+        // ⚠️ 关键修复：如果 lastModifiedTime 为 0 或无效，跳过检查
+        if (!tab.lastModifiedTime || tab.lastModifiedTime === 0) {
+          continue;
+        }
+        
         try {
           const isModified = await invoke<boolean>('check_external_modification', {
             path: tab.filePath,
-            last_modified_ms: tab.lastModifiedTime || 0,
+            lastModifiedMs: tab.lastModifiedTime,
           });
           
           if (isModified && externalModificationTab !== tab.id) {
@@ -218,6 +265,13 @@ const EditorPanel: React.FC = () => {
       // 同步更新 store 中的内容
       updateTabContent(activeTab.id, currentContent);
       markTabSaved(activeTab.id);
+      // ⚠️ 关键修复：保存后更新文件修改时间，避免误判为外部修改
+      try {
+        const newModifiedTime = await invoke<number>('get_file_modified_time', { path: activeTab.filePath });
+        updateTabModifiedTime(activeTab.id, newModifiedTime);
+      } catch (error) {
+        console.error('更新文件修改时间失败:', error);
+      }
       console.log('✅ 文件保存成功');
     } catch (error) {
       console.error('❌ 保存失败:', error);
@@ -226,7 +280,7 @@ const EditorPanel: React.FC = () => {
     } finally {
       setTabSaving(activeTab.id, false);
     }
-  }, [activeTab, setTabSaving, markTabSaved, updateTabContent]);
+  }, [activeTab, setTabSaving, markTabSaved, updateTabContent, updateTabModifiedTime]);
   
   // 使用 useCallback 稳定函数引用
   const handleContentChange = useCallback((content: string) => {
@@ -296,6 +350,13 @@ const EditorPanel: React.FC = () => {
         // 同步更新 store 中的内容
         updateTabContent(activeTab.id, currentContent);
         markTabSaved(activeTab.id);
+        // ⚠️ 关键修复：自动保存后更新文件修改时间，避免误判为外部修改
+        try {
+          const newModifiedTime = await invoke<number>('get_file_modified_time', { path: activeTab.filePath });
+          updateTabModifiedTime(activeTab.id, newModifiedTime);
+        } catch (error) {
+          console.error('更新文件修改时间失败:', error);
+        }
         lastContentRef.current = currentContent;
         console.log('✅ 自动保存成功');
       } catch (error) {
@@ -313,6 +374,52 @@ const EditorPanel: React.FC = () => {
     };
   }, [activeTab?.content, activeTab?.id, activeTab?.isDirty, activeTab?.isReadOnly, activeTab?.editor, setTabSaving, markTabSaved, updateTabContent]);
 
+  // 保存进度监听
+  useEffect(() => {
+    const setupSaveProgressListener = async () => {
+      try {
+        const unlisten = await listen<SaveProgressEvent>('fs-save-progress', (event) => {
+          const { file_path, status, progress, error } = event.payload;
+          
+          // 只处理当前标签页的文件
+          if (activeTab && activeTab.filePath === file_path) {
+            if (status === 'started') {
+              setTabSaving(activeTab.id, true);
+              toast.info('开始保存文件...');
+            } else if (status === 'converting') {
+              toast.info(`正在转换格式... ${progress}%`);
+            } else if (status === 'saving') {
+              toast.info(`正在保存... ${progress}%`);
+            } else if (status === 'completed') {
+              setTabSaving(activeTab.id, false);
+              markTabSaved(activeTab.id);
+              toast.success('文件保存成功');
+            } else if (status === 'failed') {
+              setTabSaving(activeTab.id, false);
+              toast.error(`保存失败: ${error || '未知错误'}`);
+            }
+          }
+        });
+        
+        return unlisten;
+      } catch (error) {
+        console.error('初始化保存进度监听失败:', error);
+        return () => {};
+      }
+    };
+    
+    let unlistenFn: (() => void) | null = null;
+    setupSaveProgressListener().then(unlisten => {
+      unlistenFn = unlisten;
+    });
+    
+    return () => {
+      if (unlistenFn) {
+        unlistenFn();
+      }
+    };
+  }, [activeTab, setTabSaving, markTabSaved]);
+
   if (!currentWorkspace) {
     return (
       <div className="h-full bg-white dark:bg-gray-900 flex flex-col items-center justify-center">
@@ -328,12 +435,32 @@ const EditorPanel: React.FC = () => {
   return (
     <div className="h-full w-full bg-white dark:bg-gray-900 flex flex-col overflow-hidden" style={{ minWidth: 0 }}>
       {/* 标签页栏 */}
-      <div className="flex-shrink-0">
+      <div className="flex-shrink-0 relative">
         <EditorTabs />
+        {/* 关闭按钮 */}
+        <button
+          onClick={() => setEditorVisible(false)}
+          className="absolute top-2 right-2 p-1 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 rounded hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors z-10"
+          title="关闭编辑器"
+        >
+          <XMarkIcon className="w-4 h-4" />
+        </button>
       </div>
       
       {/* 只读模式提示栏 */}
-      {activeTab && <ReadOnlyBanner tabId={activeTab.id} />}
+      {/* ⚠️ 预览模式不显示 ReadOnlyBanner：
+          - DOCX 预览：DocxPdfPreview 组件内部已有工具栏
+          - PDF 预览：原生 PDF 文件不支持编辑
+          - HTML 预览：只读预览，不支持编辑 */}
+      {activeTab && (() => {
+        const fileType = getFileType(activeTab.filePath);
+        // 预览模式：不显示 ReadOnlyBanner
+        if (activeTab.isReadOnly && (fileType === 'docx' || fileType === 'pdf' || fileType === 'html')) {
+          return null;
+        }
+        // 其他只读模式（如 Markdown、TXT 等）：显示 ReadOnlyBanner
+        return <ReadOnlyBanner tabId={activeTab.id} />;
+      })()}
       
       {/* 工具栏 */}
       {activeTab && (
@@ -360,19 +487,69 @@ const EditorPanel: React.FC = () => {
               );
             }
             
-            // HTML 文件：直接显示 HTML 内容（保持格式）
-            if (fileType === 'html') {
+            // HTML 文件（只读模式）：使用 iframe 预览（隔离样式，避免影响全局）
+            if (fileType === 'html' && activeTab.isReadOnly) {
+              return <HTMLPreview content={activeTab.content} />;
+            }
+            
+            // DOCX 文件（只读模式）：使用 DocxPdfPreview 组件（新方案：LibreOffice + PDF.js）
+            if (fileType === 'docx' && activeTab.isReadOnly) {
+              // ✅ 使用 DocxPdfPreview 组件（组件内部调用 preview_docx_as_pdf 命令获取 PDF）
+              console.log('[EditorPanel] 渲染 DocxPdfPreview，文件路径:', activeTab.filePath);
+              if (!activeTab.filePath) {
+                console.error('[EditorPanel] activeTab.filePath 为空！');
+                return (
+                  <div className="h-full flex items-center justify-center bg-gray-50 dark:bg-gray-900">
+                    <div className="text-red-500">错误：文件路径为空</div>
+                  </div>
+                );
+              }
+              return <DocxPdfPreview filePath={activeTab.filePath} />;
+            }
+            
+            // DOCX 文件（编辑模式）：使用普通编辑器
+            if (fileType === 'docx' && !activeTab.isReadOnly) {
               return (
-                <div className="h-full overflow-y-auto p-4">
-                  <div 
-                    className="prose dark:prose-invert max-w-none"
-                    dangerouslySetInnerHTML={{ __html: activeTab.content }}
+                <div className="h-full overflow-hidden relative">
+                  <TipTapEditor
+                    content={activeTab.content}
+                    onChange={handleContentChange}
+                    onSave={handleSave}
+                    editable={!activeTab.isReadOnly}
+                    onEditorReady={handleEditorReady}
+                    tabId={activeTab.id}
                   />
+                  
+                  {/* Inline Assist 输入框 */}
+                  {inlineAssist.state.isVisible && !inlineAssist.state.diff && activeTab.editor && (
+                    <InlineAssistPosition editor={activeTab.editor}>
+                      <InlineAssistInput
+                        instruction={inlineAssist.state.instruction}
+                        selectedText={inlineAssist.state.selectedText}
+                        onInstructionChange={(instruction) => {
+                          inlineAssist.open(instruction, inlineAssist.state.selectedText);
+                        }}
+                        onExecute={inlineAssist.execute}
+                        onClose={inlineAssist.close}
+                        isLoading={inlineAssist.state.isLoading}
+                      />
+                    </InlineAssistPosition>
+                  )}
+                  
+                  {/* Diff 视图 */}
+                  {inlineAssist.state.diff && activeTab.editor && (
+                    <DiffView
+                      diff={inlineAssist.state.diff}
+                      onAccept={inlineAssist.accept}
+                      onReject={inlineAssist.reject}
+                      editor={activeTab.editor}
+                    />
+                  )}
                 </div>
               );
             }
             
-            // 其他文本文件使用编辑器
+            // 所有文件：使用编辑器
             return (
               <div className="h-full overflow-hidden relative">
                 <TipTapEditor

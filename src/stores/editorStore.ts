@@ -46,6 +46,8 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     }
     
     const tabId = `tab-${Date.now()}`;
+    // 判断是否为 DOCX 文件
+    const isDocx = filePath.toLowerCase().endsWith('.docx');
     const newTab: EditorTab = {
       id: tabId,
       filePath,
@@ -186,5 +188,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
       ),
     }));
   },
+
+  
 }));
 

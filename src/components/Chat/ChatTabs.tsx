@@ -40,13 +40,8 @@ export const ChatTabs: React.FC = () => {
                         </span>
                         <button
                             onClick={(e) => handleTabClose(e, tab.id)}
-                            className="p-0.5 rounded hover:bg-gray-200 dark:hover:bg-gray-600 opacity-0 group-hover:opacity-100 transition-opacity"
-                            onMouseEnter={(e) => {
-                                e.currentTarget.classList.remove('opacity-0');
-                            }}
-                            onMouseLeave={(e) => {
-                                e.currentTarget.classList.add('opacity-0');
-                            }}
+                            className="p-0.5 rounded hover:bg-gray-200 dark:hover:bg-gray-600 transition-opacity"
+                            title="关闭标签页"
                         >
                             <XMarkIcon className="w-4 h-4" />
                         </button>

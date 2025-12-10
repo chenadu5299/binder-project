@@ -2,11 +2,13 @@ import React, { useRef } from 'react';
 import FileTree, { FileTreeRef } from './FileTree';
 import NewFileButton from './NewFileButton';
 import { useFileStore } from '../../stores/fileStore';
-import { FolderIcon } from '@heroicons/react/24/outline';
+import { useLayoutStore } from '../../stores/layoutStore';
+import { FolderIcon, XMarkIcon } from '@heroicons/react/24/outline';
 
 const FileTreePanel: React.FC = () => {
   const fileTreeRef = useRef<FileTreeRef>(null);
   const { currentWorkspace } = useFileStore();
+  const { setFileTreeVisible } = useLayoutStore();
 
   // 获取工作区名称（从路径中提取）
   const getWorkspaceName = (path: string | null): string => {
@@ -23,7 +25,7 @@ const FileTreePanel: React.FC = () => {
     <div className="h-full flex flex-col">
       {/* 工作区信息显示 */}
       {currentWorkspace && (
-        <div className="px-3 py-2 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800">
+        <div className="px-3 py-2 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800 relative">
           <div className="flex items-center gap-2 text-sm">
             <FolderIcon className="w-4 h-4 text-gray-500 dark:text-gray-400" />
             <div className="flex-1 min-w-0">
@@ -35,6 +37,14 @@ const FileTreePanel: React.FC = () => {
               </div>
             </div>
           </div>
+          {/* 关闭按钮 */}
+          <button
+            onClick={() => setFileTreeVisible(false)}
+            className="absolute top-2 right-2 p-1 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 rounded hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors"
+            title="关闭文件树"
+          >
+            <XMarkIcon className="w-4 h-4" />
+          </button>
         </div>
       )}
       

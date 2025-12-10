@@ -108,10 +108,19 @@ const FileTree = forwardRef<FileTreeRef>((_props, ref) => {
     }
   };
 
-  // ⚠️ Week 18.1：处理文件拖拽
+  // ⚠️ Week 18.1：处理文件拖拽（仅外部文件）
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
+    
+    // 检查是否是从文件树内部拖拽的文件（如果是，不处理）
+    const hasFilePath = e.dataTransfer.types.includes('application/file-path');
+    if (hasFilePath) {
+      // 文件树内部拖拽，让子节点处理
+      return;
+    }
+    
+    // 只处理外部文件拖拽
     if (currentWorkspace) {
       setIsDragOver(true);
     }
@@ -128,6 +137,14 @@ const FileTree = forwardRef<FileTreeRef>((_props, ref) => {
     e.stopPropagation();
     setIsDragOver(false);
 
+    // 检查是否是从文件树内部拖拽的文件（如果是，让子节点处理）
+    const hasFilePath = e.dataTransfer.types.includes('application/file-path');
+    if (hasFilePath) {
+      // 这是文件树内部的拖拽，让 FileTreeNode 处理
+      console.log('📁 文件树内部拖拽，由子节点处理');
+      return;
+    }
+
     if (!currentWorkspace) {
       toast.warning('请先选择工作区');
       return;
@@ -136,7 +153,7 @@ const FileTree = forwardRef<FileTreeRef>((_props, ref) => {
     const items = Array.from(e.dataTransfer.items);
     const files: File[] = [];
 
-    // 处理拖拽的文件
+    // 处理拖拽的文件（外部文件）
     for (const item of items) {
       if (item.kind === 'file') {
         const file = item.getAsFile();
@@ -228,6 +245,24 @@ const FileTree = forwardRef<FileTreeRef>((_props, ref) => {
     setOrganizeFiles([filePath]);
   };
 
+  // 处理文件移动（拖拽）
+  const handleMoveFile = async (sourcePath: string, destinationPath: string) => {
+    if (!currentWorkspace) {
+      toast.warning('请先选择工作区');
+      return;
+    }
+    
+    try {
+      await fileService.moveFile(sourcePath, destinationPath, currentWorkspace);
+      toast.success(`文件已移动到: ${destinationPath.split('/').pop()}`);
+      // 刷新文件树（会通过 file-tree-changed 事件自动刷新，但这里也手动刷新确保同步）
+      await loadFileTree();
+    } catch (error) {
+      console.error('移动文件失败:', error);
+      toast.error(`移动文件失败: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
   if (!currentWorkspace) {
     return (
       <div className="p-4 text-gray-500 dark:text-gray-400">
@@ -238,35 +273,22 @@ const FileTree = forwardRef<FileTreeRef>((_props, ref) => {
 
   return (
     <div
-      className={`h-full overflow-y-auto flex flex-col ${
+      className={`h-full flex flex-col ${
         isDragOver ? 'border-2 border-blue-500 border-dashed bg-blue-50 dark:bg-blue-900/20' : ''
       }`}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
-      {/* 工作区根目录显示 ⚠️ 关键：必须显示当前工作区 */}
-      {currentWorkspace ? (
-        <div className="px-3 py-2 bg-blue-50 dark:bg-blue-900/20 border-b border-blue-200 dark:border-blue-800">
-          <div className="text-xs text-blue-600 dark:text-blue-400 mb-1 font-medium">📁 当前工作区</div>
-          <div className="text-sm font-semibold text-blue-800 dark:text-blue-200 truncate" title={currentWorkspace}>
-            {currentWorkspace.split('/').pop() || currentWorkspace}
-          </div>
-          <div className="text-xs text-blue-600 dark:text-blue-400 truncate" title={currentWorkspace}>
-            {currentWorkspace}
-          </div>
-        </div>
-      ) : (
-        <div className="px-3 py-3 bg-yellow-50 dark:bg-yellow-900/20 border-b border-yellow-200 dark:border-yellow-800">
-          <div className="text-xs text-yellow-700 dark:text-yellow-300 mb-1 font-medium">⚠️ 未选择工作区</div>
-          <div className="text-xs text-yellow-600 dark:text-yellow-400">
-            请先选择工作区才能创建文件
-          </div>
-        </div>
-      )}
-
-      {/* 文件树内容 */}
-      <div className="flex-1 overflow-y-auto">
+      {/* 文件树内容 - 可滚动区域 */}
+      <div 
+        className="flex-1 overflow-y-auto overflow-x-hidden"
+        style={{ 
+          minHeight: 0, // 关键：允许 flex 子元素缩小，使滚动生效
+          paddingLeft: '2px',
+          paddingRight: '2px'
+        }}
+      >
         {isLoading ? (
           <div className="p-4 text-center text-gray-500 dark:text-gray-400">
             <LoadingSpinner size="md" text="加载文件树中..." />
@@ -282,6 +304,7 @@ const FileTree = forwardRef<FileTreeRef>((_props, ref) => {
             onDelete={handleDelete}
             onDuplicate={handleDuplicate}
             onOrganize={handleOrganize}
+            onMoveFile={handleMoveFile}
           />
         ) : (
           <div className="p-4 text-gray-500 dark:text-gray-400">

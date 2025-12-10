@@ -103,24 +103,70 @@ impl ToolService {
             });
         }
 
-        // 读取文件内容
-        match std::fs::read_to_string(&full_path) {
-            Ok(content) => Ok(ToolResult {
-                success: true,
-                data: Some(serde_json::json!({
-                    "path": file_path,
-                    "content": content,
-                    "size": content.len(),
-                })),
-                error: None,
-                message: Some(format!("成功读取文件: {}", file_path)),
-            }),
-            Err(e) => Ok(ToolResult {
-                success: false,
-                data: None,
-                error: Some(format!("读取文件失败: {}", e)),
-                message: None,
-            }),
+        // 检查文件扩展名，如果是 DOCX，需要使用 Pandoc 转换
+        let ext = full_path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase());
+        
+        if ext.as_deref() == Some("docx") || file_path.ends_with(".draft.docx") {
+            // DOCX 文件：使用 Pandoc 转换为纯文本
+            use crate::services::pandoc_service::PandocService;
+            let pandoc_service = PandocService::new();
+            
+            if !pandoc_service.is_available() {
+                return Ok(ToolResult {
+                    success: false,
+                    data: None,
+                    error: Some("Pandoc 不可用，无法读取 DOCX 文件。请安装 Pandoc 或使用其他格式。".to_string()),
+                    message: None,
+                });
+            }
+            
+            // 使用 Pandoc 将 DOCX 转换为纯文本
+            match pandoc_service.convert_document_to_html(&full_path) {
+                Ok(html_content) => {
+                    // 从 HTML 中提取纯文本（简单处理）
+                    // 注意：这里返回的是 HTML，如果需要纯文本，可以进一步处理
+                    // 但为了保持兼容性，先返回 HTML
+                    Ok(ToolResult {
+                        success: true,
+                        data: Some(serde_json::json!({
+                            "path": file_path,
+                            "content": html_content,
+                            "size": html_content.len(),
+                            "format": "html",
+                        })),
+                        error: None,
+                        message: Some(format!("成功读取 DOCX 文件（已转换为 HTML）: {}", file_path)),
+                    })
+                },
+                Err(e) => Ok(ToolResult {
+                    success: false,
+                    data: None,
+                    error: Some(format!("读取 DOCX 文件失败: {}", e)),
+                    message: None,
+                }),
+            }
+        } else {
+            // 普通文本文件：直接读取
+            match std::fs::read_to_string(&full_path) {
+                Ok(content) => Ok(ToolResult {
+                    success: true,
+                    data: Some(serde_json::json!({
+                        "path": file_path,
+                        "content": content,
+                        "size": content.len(),
+                    })),
+                    error: None,
+                    message: Some(format!("成功读取文件: {}", file_path)),
+                }),
+                Err(e) => Ok(ToolResult {
+                    success: false,
+                    data: None,
+                    error: Some(format!("读取文件失败: {}", e)),
+                    message: None,
+                }),
+            }
         }
     }
 
@@ -199,23 +245,62 @@ impl ToolService {
             }
         }
 
-        // 原子写入文件
-        match self.atomic_write_file(&full_path, content.as_bytes()) {
-            Ok(_) => Ok(ToolResult {
-                success: true,
-                data: Some(serde_json::json!({
-                    "path": file_path,
-                    "size": content.len(),
-                })),
-                error: None,
-                message: Some(format!("成功创建文件: {}", file_path)),
-            }),
-            Err(e) => Ok(ToolResult {
-                success: false,
-                data: None,
-                error: Some(format!("写入文件失败: {}", e)),
-                message: None,
-            }),
+        // 检查文件扩展名，如果是 DOCX，需要特殊处理
+        let ext = full_path.extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_lowercase());
+        
+        if ext.as_deref() == Some("docx") {
+            // DOCX 文件：使用 Pandoc 将内容转换为 DOCX 格式
+            use crate::services::pandoc_service::PandocService;
+            let pandoc_service = PandocService::new();
+            
+            if !pandoc_service.is_available() {
+                return Ok(ToolResult {
+                    success: false,
+                    data: None,
+                    error: Some("Pandoc 不可用，无法创建 DOCX 文件。请安装 Pandoc 或使用其他格式。".to_string()),
+                    message: None,
+                });
+            }
+            
+            // 将内容（Markdown 或 HTML）转换为 DOCX
+            match pandoc_service.convert_html_to_docx(&content, &full_path) {
+                Ok(_) => Ok(ToolResult {
+                    success: true,
+                    data: Some(serde_json::json!({
+                        "path": file_path,
+                        "format": "docx",
+                    })),
+                    error: None,
+                    message: Some(format!("成功创建 DOCX 文件: {}", file_path)),
+                }),
+                Err(e) => Ok(ToolResult {
+                    success: false,
+                    data: None,
+                    error: Some(format!("转换 DOCX 失败: {}", e)),
+                    message: None,
+                }),
+            }
+        } else {
+            // 其他文件：直接写入文本内容
+            match self.atomic_write_file(&full_path, content.as_bytes()) {
+                Ok(_) => Ok(ToolResult {
+                    success: true,
+                    data: Some(serde_json::json!({
+                        "path": file_path,
+                        "size": content.len(),
+                    })),
+                    error: None,
+                    message: Some(format!("成功创建文件: {}", file_path)),
+                }),
+                Err(e) => Ok(ToolResult {
+                    success: false,
+                    data: None,
+                    error: Some(format!("写入文件失败: {}", e)),
+                    message: None,
+                }),
+            }
         }
     }
 

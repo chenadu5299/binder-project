@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
+import { useFileStore } from './fileStore';
 
 import { ToolCall } from '../types/tool';
 
@@ -12,13 +13,19 @@ export interface ChatMessage {
     toolCalls?: ToolCall[];  // 工具调用列表
 }
 
+export type ChatMode = 'agent' | 'chat'; // Agent 模式：可调用工具；Chat 模式：仅对话
+
 export interface ChatTab {
     id: string;
     title: string;
     messages: ChatMessage[];
     model: string;
+    mode: ChatMode; // 聊天模式：agent 或 chat
     createdAt: number;
     updatedAt: number;
+    // 新增字段：聊天记录绑定工作区
+    workspacePath: string | null; // 绑定的工作区路径，null 表示临时状态
+    isTemporary: boolean; // 是否为临时聊天（未绑定工作区）
 }
 
 interface ChatState {
@@ -26,7 +33,7 @@ interface ChatState {
     activeTabId: string | null;
     
     // Actions
-    createTab: (title?: string) => string;
+    createTab: (title?: string, mode?: ChatMode) => string;
     deleteTab: (tabId: string) => void;
     setActiveTab: (tabId: string) => void;
     addMessage: (tabId: string, message: Omit<ChatMessage, 'id' | 'timestamp'>) => void;
@@ -36,12 +43,18 @@ interface ChatState {
     addToolCall: (tabId: string, messageId: string, toolCall: ToolCall) => void;
     updateToolCall: (tabId: string, messageId: string, toolCallId: string, updates: Partial<ToolCall>) => void;
     setModel: (tabId: string, model: string) => void;
+    setMode: (tabId: string, mode: ChatMode) => void; // 设置聊天模式
     clearMessages: (tabId: string) => void;
     deleteMessage: (tabId: string, messageId: string) => void;
     
     // AI 交互
     sendMessage: (tabId: string, content: string) => Promise<void>;
     regenerate: (tabId: string) => Promise<void>;
+    
+    // 临时聊天管理（v1.4.0 新增）
+    getTemporaryTabs: () => ChatTab[];
+    bindToWorkspace: (tabId: string, workspacePath: string) => void;
+    clearTemporaryTabs: () => void;
 }
 
 export const useChatStore = create<ChatState>((set, get) => {
@@ -53,20 +66,41 @@ export const useChatStore = create<ChatState>((set, get) => {
         tabs: [],
         activeTabId: null,
         
-        createTab: (title?: string) => {
+        createTab: (title?: string, mode: ChatMode = 'agent') => {
             const tabId = `chat-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+            
+            // 检查是否有工作区
+            let currentWorkspace: string | null = null;
+            try {
+                currentWorkspace = useFileStore.getState().currentWorkspace || null;
+            } catch (e) {
+                // 如果无法获取，默认为 null（临时聊天）
+                console.warn('无法获取工作区状态，创建临时聊天:', e);
+                currentWorkspace = null;
+            }
+            
             const newTab: ChatTab = {
                 id: tabId,
                 title: title || `新对话 ${get().tabs.length + 1}`,
                 messages: [],
                 model: 'deepseek-chat', // 默认模型
+                mode: mode, // 默认 Agent 模式
                 createdAt: Date.now(),
                 updatedAt: Date.now(),
+                workspacePath: currentWorkspace, // 工作区路径
+                isTemporary: !currentWorkspace, // 没有工作区时为临时聊天
             };
             
             set({
                 tabs: [...get().tabs, newTab],
                 activeTabId: tabId,
+            });
+            
+            console.log('✅ 创建聊天标签页:', {
+                tabId,
+                isTemporary: newTab.isTemporary,
+                workspacePath: newTab.workspacePath,
+                mode: newTab.mode,
             });
             
             return tabId;
@@ -225,6 +259,25 @@ export const useChatStore = create<ChatState>((set, get) => {
             });
         },
         
+        setMode: (tabId: string, mode: ChatMode) => {
+            const { tabs } = get();
+            const tab = tabs.find(t => t.id === tabId);
+            
+            // 如果标签页已经有消息（开始聊天后），不允许切换模式
+            if (tab && tab.messages.length > 0) {
+                console.warn('⚠️ 聊天已开始，无法切换模式');
+                return;
+            }
+            
+            set({
+                tabs: tabs.map(t =>
+                    t.id === tabId
+                        ? { ...t, mode, updatedAt: Date.now() }
+                        : t
+                ),
+            });
+        },
+        
         clearMessages: (tabId: string) => {
             const { tabs } = get();
             set({
@@ -290,10 +343,6 @@ export const useChatStore = create<ChatState>((set, get) => {
                 content,
             });
             
-            // ⚠️ 关键修复：新消息开始时，清理之前消息的累积文本
-            // 这可以通过事件通知 ChatPanel 组件来清理
-            // 但更好的方式是直接在 ChatPanel 中监听消息变化
-            
             // 添加助手消息（占位符）
             const assistantMessageId = `msg-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
             addMessage(tabId, {
@@ -303,37 +352,55 @@ export const useChatStore = create<ChatState>((set, get) => {
             });
             
             try {
-                // 构建消息列表（排除刚添加的空的助手消息）
-                const messages = tab.messages
-                    .filter(m => m.role !== 'assistant' || m.content.length > 0 || m.id !== assistantMessageId)
+                // 重新获取最新的标签页状态（确保包含刚添加的消息）
+                const { tabs: currentTabs } = get();
+                const currentTab = currentTabs.find(t => t.id === tabId);
+                if (!currentTab) {
+                    throw new Error('标签页不存在');
+                }
+                
+                // 构建消息列表（包含刚添加的用户消息，排除空的助手消息）
+                const allMessages = currentTab.messages;
+                const messages = allMessages
+                    .filter(m => {
+                        // 排除空的助手消息占位符
+                        if (m.role === 'assistant' && m.id === assistantMessageId && !m.content) {
+                            return false;
+                        }
+                        return true;
+                    })
                     .map(m => ({
-                        role: m.role,
+                        role: m.role as 'user' | 'assistant' | 'system',
                         content: m.content,
                     }));
                 
-                // 获取当前工作区路径
+                // 获取当前工作区路径（用于判断是否启用工具）
                 const { currentWorkspace } = (await import('./fileStore')).useFileStore.getState();
-                if (!currentWorkspace) {
-                    throw new Error('未打开工作区');
-                }
                 
                 // ⚠️ 关键修复：确保 tabId 正确传递
-                console.log('📤 发送消息到后端:', { tabId, messageCount: messages.length });
+                console.log('📤 发送消息到后端:', { 
+                    tabId, 
+                    messageCount: messages.length,
+                    allMessagesCount: allMessages.length,
+                    hasWorkspace: !!currentWorkspace,
+                    mode: currentTab.mode,
+                    isTemporary: currentTab.isTemporary,
+                });
                 
-                // 调用后端流式聊天
+                // 调用后端流式聊天（根据模式决定是否启用工具）
+                // 注意：如果没有工作区，工具调用应该禁用（临时聊天模式，只能是 chat 模式）
+                const enableTools = currentTab.mode === 'agent' && !!currentWorkspace;
+                
                 await invoke('ai_chat_stream', {
                     tabId, // Tauri 会自动转换为 tab_id
-                    messages: [
-                        ...messages,
-                        { role: 'user', content },
-                    ],
+                    messages: messages, // 消息列表已包含刚添加的用户消息
                     modelConfig: {
                         model: tab.model,
                         temperature: 0.7,
                         top_p: 1.0,
                         max_tokens: 2000,
                     },
-                    workspacePath: currentWorkspace,
+                    enableTools: enableTools, // Agent 模式且有工作区时启用工具，否则禁用
                 });
             } catch (error) {
                 console.error('发送消息失败:', error);
@@ -362,6 +429,34 @@ export const useChatStore = create<ChatState>((set, get) => {
                     }
                 }
             }
+        },
+        
+        // 临时聊天管理方法（v1.4.0 新增）
+        getTemporaryTabs: () => {
+            const { tabs } = get();
+            return tabs.filter(tab => tab.isTemporary);
+        },
+        
+        bindToWorkspace: (tabId: string, workspacePath: string) => {
+            const { tabs } = get();
+            set({
+                tabs: tabs.map(t =>
+                    t.id === tabId
+                        ? { ...t, workspacePath, isTemporary: false, updatedAt: Date.now() }
+                        : t
+                ),
+            });
+        },
+        
+        clearTemporaryTabs: () => {
+            const { tabs, activeTabId } = get();
+            const nonTemporaryTabs = tabs.filter(tab => !tab.isTemporary);
+            set({
+                tabs: nonTemporaryTabs,
+                activeTabId: activeTabId && nonTemporaryTabs.find(t => t.id === activeTabId)
+                    ? activeTabId
+                    : (nonTemporaryTabs.length > 0 ? nonTemporaryTabs[0].id : null),
+            });
         },
         
         regenerate: async (tabId: string) => {

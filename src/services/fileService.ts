@@ -86,6 +86,15 @@ export const fileService = {
     return await invoke<string>('duplicate_file', { path });
   },
 
+  // 工作区内移动文件或文件夹
+  async moveFile(sourcePath: string, destinationPath: string, workspacePath?: string): Promise<void> {
+    await invoke('move_file', {
+      sourcePath,
+      destinationPath,
+      workspacePath: workspacePath || null,
+    });
+  },
+
   // ⚠️ Week 20：AI 智能分类整理
   async classifyFiles(filePaths: string[], workspacePath: string): Promise<FileClassification[]> {
     return await invoke<FileClassification[]>('classify_files', {

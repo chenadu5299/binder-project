@@ -4,21 +4,27 @@ import { useLayoutStore } from '../../stores/layoutStore';
 import { useChatStore } from '../../stores/chatStore';
 import { ChatTabs } from './ChatTabs';
 import { ChatMessages } from './ChatMessages';
-import { ChatInput } from './ChatInput';
+import { InlineChatInput } from './InlineChatInput';
 import { ModelSelector } from './ModelSelector';
 import MemoryTab from '../Memory/MemoryTab';
 import SearchPanel from '../Search/SearchPanel';
 import { PlusIcon, BookOpenIcon, MagnifyingGlassIcon } from '@heroicons/react/24/outline';
 import { parseToolCalls, removeToolCalls } from '../../utils/toolCallParser';
 import { ToolCall } from '../../types/tool';
-import { aggressiveJSONRepair, extractKeyParams } from '../../utils/jsonRepair';
+import { aggressiveJSONRepair } from '../../utils/jsonRepair';
 
 type TabType = 'chat' | 'memory' | 'search';
 
-const ChatPanel: React.FC = () => {
+interface ChatPanelProps {
+    isFullscreen?: boolean; // 是否为全屏模式（无工作区时）
+}
+
+const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
     const { chat, setChatVisible } = useLayoutStore();
     const { tabs, activeTabId, createTab, setActiveTab } = useChatStore();
     const [activeSubTab, setActiveSubTab] = useState<TabType>('chat');
+    // 待创建标签页的模式（用于没有标签页时的模式选择）
+    const [pendingMode, setPendingMode] = useState<'agent' | 'chat'>('agent');
     
     // ⚠️ 关键修复：前端重复内容检测（二次防护）
     // 用于跟踪每个 tab 的累积文本，防止重复追加
@@ -35,12 +41,7 @@ const ChatPanel: React.FC = () => {
         };
     }, []);
 
-    // 如果没有标签页，创建一个默认标签页
-    useEffect(() => {
-        if (tabs.length === 0 && chat.visible) {
-            createTab();
-        }
-    }, [tabs.length, chat.visible, createTab]);
+    // 移除自动创建标签页的逻辑，用户需要手动创建或通过输入触发创建
 
     // 如果没有活动标签页，设置第一个为活动标签页
     useEffect(() => {
@@ -383,7 +384,16 @@ const ChatPanel: React.FC = () => {
     const activeTab = activeTabId ? tabs.find(t => t.id === activeTabId) : null;
 
     return (
-        <div className="h-full flex flex-col bg-white dark:bg-gray-800 border-l border-gray-200 dark:border-gray-700 w-96 flex-shrink-0">
+        <div 
+            className={`h-full flex flex-col bg-white dark:bg-gray-800 relative ${
+                isFullscreen 
+                    ? 'w-full' // 全屏模式：占据整个宽度
+                    : 'w-96 border-l border-gray-200 dark:border-gray-700 flex-shrink-0' // 正常模式：固定宽度
+            }`}
+            style={{ 
+                paddingRight: '2px', // 确保右侧内容不被遮挡
+            }}
+        >
             {/* 标题栏和标签切换 */}
             <div className="border-b border-gray-200 dark:border-gray-700">
                 {/* 标签切换栏 */}
@@ -453,6 +463,71 @@ const ChatPanel: React.FC = () => {
                     {/* 聊天标签栏 */}
                     {tabs.length > 0 && <ChatTabs />}
                     
+                    {/* 模式切换按钮（始终显示，未创建标签页时使用 pendingMode） */}
+                    <div className="px-3 py-2 border-b border-gray-200 dark:border-gray-700 flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                            <span className="text-xs text-gray-500 dark:text-gray-400">模式:</span>
+                            <div className="flex items-center gap-1 bg-gray-100 dark:bg-gray-700 rounded-lg p-1">
+                                <button
+                                    onClick={() => {
+                                        if (activeTab) {
+                                            const { setMode } = useChatStore.getState();
+                                            setMode(activeTab.id, 'chat');
+                                        } else {
+                                            setPendingMode('chat');
+                                        }
+                                    }}
+                                    disabled={activeTab ? activeTab.messages.length > 0 : false}
+                                    className={`px-3 py-1 text-xs font-medium rounded transition-colors ${
+                                        (activeTab ? activeTab.mode : pendingMode) === 'chat'
+                                            ? 'bg-blue-500 text-white'
+                                            : 'text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-600'
+                                    } ${
+                                        (activeTab && activeTab.messages.length > 0)
+                                            ? 'opacity-50 cursor-not-allowed'
+                                            : 'cursor-pointer'
+                                    }`}
+                                    title={activeTab && activeTab.messages.length > 0 ? '聊天已开始，无法切换模式' : '切换为 Chat 模式（仅对话，不调用工具）'}
+                                >
+                                    Chat
+                                </button>
+                                <button
+                                    onClick={() => {
+                                        if (activeTab) {
+                                            const { setMode } = useChatStore.getState();
+                                            setMode(activeTab.id, 'agent');
+                                        } else {
+                                            setPendingMode('agent');
+                                        }
+                                    }}
+                                    disabled={activeTab ? activeTab.messages.length > 0 : false}
+                                    className={`px-3 py-1 text-xs font-medium rounded transition-colors ${
+                                        (activeTab ? activeTab.mode : pendingMode) === 'agent'
+                                            ? 'bg-blue-500 text-white'
+                                            : 'text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-600'
+                                    } ${
+                                        (activeTab && activeTab.messages.length > 0)
+                                            ? 'opacity-50 cursor-not-allowed'
+                                            : 'cursor-pointer'
+                                    }`}
+                                    title={activeTab && activeTab.messages.length > 0 ? '聊天已开始，无法切换模式' : '切换为 Agent 模式（可调用工具）'}
+                                >
+                                    Agent
+                                </button>
+                            </div>
+                        </div>
+                        {(activeTab ? activeTab.mode : pendingMode) === 'agent' && (
+                            <span className="text-xs text-gray-400 dark:text-gray-500">
+                                可以调用工具
+                            </span>
+                        )}
+                        {(activeTab ? activeTab.mode : pendingMode) === 'chat' && (
+                            <span className="text-xs text-gray-400 dark:text-gray-500">
+                                仅对话
+                            </span>
+                        )}
+                    </div>
+                    
                     {/* 消息区域 */}
                     {activeTab ? (
                         <>
@@ -470,12 +545,25 @@ const ChatPanel: React.FC = () => {
                                     deleteMessage(activeTab.id, messageId);
                                 }}
                             />
-                            <ChatInput tabId={activeTab.id} />
+                            {/* 使用内联引用输入框 */}
+                            <InlineChatInput tabId={activeTab.id} />
                         </>
                     ) : (
-                        <div className="flex-1 flex items-center justify-center">
-                            <p className="text-gray-500 dark:text-gray-400">创建新对话开始聊天</p>
-                        </div>
+                        <>
+                            {/* 空状态：显示空消息区域和输入框 */}
+                            <div className="flex-1 flex items-center justify-center">
+                                <p className="text-gray-500 dark:text-gray-400">开始新的对话</p>
+                            </div>
+                            {/* 使用内联引用输入框 */}
+                            <InlineChatInput 
+                                tabId={null} 
+                                pendingMode={pendingMode}
+                                onCreateTab={(mode) => {
+                                    const tabId = createTab(undefined, mode);
+                                    setActiveTab(tabId);
+                                }}
+                            />
+                        </>
                     )}
                 </>
             )}
