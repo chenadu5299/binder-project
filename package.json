@@ -13,6 +13,7 @@
   "dependencies": {
     "@headlessui/react": "^1.7.17",
     "@heroicons/react": "^2.1.1",
+    "@tanstack/react-virtual": "^3.13.13",
     "@tauri-apps/api": "^2.0.0",
     "@tauri-apps/plugin-dialog": "^2.4.2",
     "@tiptap/extension-character-count": "^3.11.0",
@@ -38,9 +39,11 @@
     "@types/diff": "^7.0.2",
     "diff": "^8.0.2",
     "fuse.js": "^7.1.0",
+    "papaparse": "^5.5.3",
     "pdfjs-dist": "^3.11.174",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
+    "xlsx": "^0.18.5",
     "zustand": "^4.4.7"
   },
   "devDependencies": {

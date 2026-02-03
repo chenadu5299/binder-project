@@ -1,11 +1,11 @@
-use crate::services::image_service::ImageService;
+use crate::services::image_service::{ImageService, InsertImageResult};
 use std::path::PathBuf;
 
 #[tauri::command]
 pub async fn insert_image(
     document_path: String,
     image_source: String,
-) -> Result<String, String> {
+) -> Result<InsertImageResult, String> {
     let service = ImageService::new();
     let doc_path = PathBuf::from(document_path);
     let img_path = PathBuf::from(image_source);

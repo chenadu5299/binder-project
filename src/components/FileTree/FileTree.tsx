@@ -89,13 +89,87 @@ const FileTree = forwardRef<FileTreeRef>((_props, ref) => {
     // 检查文件类型，决定如何打开
     const ext = path.split('.').pop()?.toLowerCase();
     
-    // 支持的文件类型：docx, md, html, txt, pdf, 图片
-    const supportedTypes = ['docx', 'md', 'html', 'txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'];
+    // 支持的文件类型：
+    // - 文档：docx, doc, odt, rtf, md, html, txt
+    // - Excel：xlsx, xls, csv, ods
+    // - 演示文稿：pptx, ppt, ppsx, pps, odp
+    // - 其他：pdf, 图片, 音频, 视频
+    const supportedTypes = [
+      // 文档格式
+      'docx', 'doc', 'odt', 'rtf',
+      // Markdown 和文本
+      'md', 'html', 'txt',
+      // Excel 格式
+      'xlsx', 'xls', 'csv', 'ods',
+      // 演示文稿格式
+      'pptx', 'ppt', 'ppsx', 'pps', 'odp',
+      // PDF 和图片
+      'pdf', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'svg',
+      // 音频格式
+      'mp3', 'wav', 'ogg', 'aac', 'm4a',
+      // 视频格式
+      'mp4', 'webm'
+    ];
     
     if (ext && supportedTypes.includes(ext)) {
       try {
         // 在编辑器中打开文件（如果已打开会自动切换）
-        await documentService.openFile(path);
+        // ⚠️ 关键：从文件树打开的文件，先查询元数据，如果有就传递 source
+        // 这样可以正确识别 Binder 创建的文件，直接进入编辑模式
+        
+        // 先查询元数据，如果文件是 Binder 创建的，传递正确的 source
+        // ⚠️ 关键：元数据查询应该是唯一可靠的方式
+        let source: 'new' | 'ai_generated' | undefined = undefined;
+        if (currentWorkspace) {
+          try {
+            const { getBinderFileSource } = await import('../../services/fileMetadataService');
+            const { normalizePath, normalizeWorkspacePath } = await import('../../utils/pathUtils');
+            
+            const normalizedPath = normalizePath(path);
+            const normalizedWorkspacePath = normalizeWorkspacePath(currentWorkspace);
+            
+            console.log('[FileTree] 查询元数据:', {
+              originalPath: path,
+              normalizedPath,
+              normalizedWorkspacePath,
+            });
+            
+            const metadataSource = await getBinderFileSource(normalizedPath, normalizedWorkspacePath);
+            console.log('[FileTree] 元数据查询结果:', {
+              metadataSource,
+              hasSource: !!metadataSource,
+            });
+            
+            if (metadataSource === 'new' || metadataSource === 'ai_generated') {
+              source = metadataSource;
+            }
+            // ⚠️ 关键：如果元数据查询返回 null，说明文件不在元数据中
+            // 不应该使用兜底策略，让 detectFileSource 默认返回 external（预览模式）
+            // 这样可以确保只有元数据中明确标记的文件才进入编辑模式
+          } catch (error) {
+            // 查询失败不影响主流程，让 detectFileSource 来处理
+            // 不在这里使用兜底策略，避免误判
+            console.warn('查询文件元数据失败:', error);
+          }
+        }
+        
+        // 如果有元数据来源，传递 source；否则让 detectFileSource 自动检测
+        const { normalizePath } = await import('../../utils/pathUtils');
+        const normalizedPath = normalizePath(path);
+        console.log('[FileTree] 从文件树打开文件:', {
+          path: normalizedPath,
+          source,
+          hasMetadata: !!source,
+        });
+        // DOCX 专用：从文件树打开时，若未查到元数据则 source 为 undefined → openFile 内 detectFileSource 会得到 external → 预览
+        if (ext === 'docx') {
+          console.log('[FileTree][DOCX]', {
+            metadataSource: source ?? '(未查到，将走 detectFileSource → 默认 external)',
+            passedToOpenFile: source ? { source } : undefined,
+            hint: source ? '会进入编辑' : '会进入预览，需在预览页点「编辑」创建草稿后编辑',
+          });
+        }
+        await documentService.openFile(normalizedPath, source ? { source } : undefined);
         // 添加到打开文件列表
         addOpenFile(path);
       } catch (error) {
@@ -273,7 +347,7 @@ const FileTree = forwardRef<FileTreeRef>((_props, ref) => {
 
   return (
     <div
-      className={`h-full flex flex-col ${
+      className={`flex-1 min-h-0 flex flex-col ${
         isDragOver ? 'border-2 border-blue-500 border-dashed bg-blue-50 dark:bg-blue-900/20' : ''
       }`}
       onDragOver={handleDragOver}
@@ -282,9 +356,8 @@ const FileTree = forwardRef<FileTreeRef>((_props, ref) => {
     >
       {/* 文件树内容 - 可滚动区域 */}
       <div 
-        className="flex-1 overflow-y-auto overflow-x-hidden"
+        className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden"
         style={{ 
-          minHeight: 0, // 关键：允许 flex 子元素缩小，使滚动生效
           paddingLeft: '2px',
           paddingRight: '2px'
         }}

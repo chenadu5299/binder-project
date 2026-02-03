@@ -3,6 +3,7 @@ use std::process::Command;
 use std::io::Read;
 use std::collections::HashMap;
 use which::which;
+use scraper::{Html, Selector};
 
 /// 运行格式信息（单个文本运行的格式）
 #[derive(Debug, Clone)]
@@ -383,9 +384,14 @@ impl PandocService {
         self.is_bundled
     }
     
-    /// 将文档文件转换为 HTML（用于预览）
+    /// 将文档文件转换为 HTML（供编辑或其它用途）
     /// 支持格式：.docx, .doc, .odt, .rtf
-    pub fn convert_document_to_html(&self, doc_path: &Path) -> Result<String, String> {
+    /// - work_dir_for_extract_media: 若为 Some，Pandoc 在该目录执行，--extract-media=. 解压到该目录（编辑模式传 doc_path.parent()，图片才能被找到）；若为 None 不设置工作目录，保持原行为。
+    pub fn convert_document_to_html(
+        &self,
+        doc_path: &Path,
+        work_dir_for_extract_media: Option<&Path>,
+    ) -> Result<String, String> {
         if !self.is_available() {
             return Err("Pandoc 不可用，请安装 Pandoc 或确保内置 Pandoc 可用。\n访问 https://pandoc.org/installing.html 获取安装指南。".to_string());
         }
@@ -439,6 +445,12 @@ impl PandocService {
         } else {
             eprintln!("⚠️ 未找到 Lua 过滤器，格式保留可能不完整");
         }
+
+        // 仅当调用方指定时设置工作目录（编辑模式传 doc_path.parent()，使图片解压到文档目录并被 process_images_for_edit 找到；预览/其它路径不传则不改动）
+        if let Some(work_dir) = work_dir_for_extract_media {
+            cmd.current_dir(work_dir);
+            eprintln!("📂 [convert_document_to_html] Pandoc 工作目录: {:?}", work_dir);
+        }
         
         let output = cmd.output()
             .map_err(|e| {
@@ -484,7 +496,22 @@ impl PandocService {
         eprintln!("🔍 转换后诊断:");
         eprintln!("   - 内联样式数: {} (增加: {})", after_inline_styles, after_inline_styles as i32 - has_inline_styles as i32);
         
-        // 3. 不再应用预设样式表
+        // 3. 处理图片（编辑模式：所有图片转换为 base64）
+        eprintln!("🖼️ [convert_document_to_html] 开始处理图片...");
+        let html = match Self::process_images_for_edit(&html, doc_path) {
+            Ok(processed) => {
+                eprintln!("🖼️ [convert_document_to_html] 图片处理成功");
+                processed
+            }
+            Err(e) => {
+                eprintln!("❌ [convert_document_to_html] 图片处理失败: {}", e);
+                // 即使图片处理失败，也返回 HTML（图片可能无法显示，但不应该导致崩溃）
+                eprintln!("⚠️ [convert_document_to_html] 继续返回 HTML，图片可能无法显示");
+                html
+            }
+        };
+        
+        // 4. 不再应用预设样式表
         // 编辑模式策略：只保留换行和结构，不强制应用字体和字号
         // 保留 Pandoc 输出的原始内联样式，让用户通过工具栏自行设置样式
         
@@ -3476,6 +3503,272 @@ impl PandocService {
         eprintln!("   - 分栏样式已应用到 {} 个 .word-page 元素", page_count);
         Ok(processed.to_string())
     }
+    
+    /// 处理编辑模式下的图片（所有图片转换为 base64）
+    /// 
+    /// 策略：
+    /// 1. 小图片（< 1MB）：直接转换为 base64
+    /// 2. 大图片（≥ 1MB）：压缩后转换为 base64
+    /// 3. 所有图片都转换为 base64，不使用 file:// 路径
+    /// 4. 内存限制：单个文档总图片 base64 不超过 15MB（与 open_docx_for_edit 返回上限一致，避免超大 HTML 导致 WebView 崩溃）
+    fn process_images_for_edit(html: &str, doc_path: &Path) -> Result<String, String> {
+        eprintln!("🖼️ [图片处理] 开始处理编辑模式图片...");
+        eprintln!("🖼️ [图片处理] 文档路径: {:?}", doc_path);
+        eprintln!("🖼️ [图片处理] HTML 长度: {} 字符", html.len());
+        
+        use crate::services::image_service::ImageService;
+        
+        // 使用 scraper 解析 HTML（比正则表达式更可靠）
+        eprintln!("🖼️ [图片处理] 步骤 1: 解析 HTML...");
+        let document = match std::panic::catch_unwind(|| {
+            Html::parse_document(html)
+        }) {
+            Ok(doc) => doc,
+            Err(e) => {
+                eprintln!("❌ [图片处理] HTML 解析 panic: {:?}", e);
+                return Err("HTML 解析失败（panic）".to_string());
+            }
+        };
+        
+        eprintln!("🖼️ [图片处理] 步骤 2: 创建图片选择器...");
+        let img_selector = match Selector::parse("img") {
+            Ok(sel) => sel,
+            Err(e) => {
+                eprintln!("❌ [图片处理] 选择器解析失败: {}", e);
+                return Err(format!("选择器解析失败: {}", e));
+            }
+        };
+        
+        let image_service = ImageService::new();
+        let media_dir = match doc_path.parent() {
+            Some(dir) => dir,
+            None => {
+                eprintln!("❌ [图片处理] 无法获取文件目录");
+                return Err("无法获取文件目录".to_string());
+            }
+        };
+        
+        eprintln!("🖼️ [图片处理] 媒体目录: {:?}", media_dir);
+        
+        let mut processed_html = html.to_string();
+        let mut replacements = Vec::new();
+        let mut total_base64_size = 0u64;
+        const MAX_TOTAL_SIZE: u64 = 15 * 1024 * 1024; // 15MB，与 open_docx_for_edit 返回上限一致
+        let mut processed_count = 0;
+        let mut base64_count = 0;
+        let mut compressed_count = 0;
+        let mut error_count = 0;
+        let mut skipped_count = 0;
+        
+        eprintln!("🖼️ [图片处理] 步骤 3: 查找所有图片标签...");
+        let img_elements: Vec<_> = document.select(&img_selector).collect();
+        eprintln!("🖼️ [图片处理] 找到 {} 个图片标签", img_elements.len());
+        
+        // 从后往前替换，避免索引偏移
+        for (index, element) in img_elements.iter().enumerate() {
+            eprintln!("🖼️ [图片处理] 处理第 {} 个图片标签...", index + 1);
+            
+            if let Some(src_attr) = element.value().attr("src") {
+                eprintln!("🖼️ [图片处理] 图片 {}: src = {}", index + 1, src_attr);
+                
+                // 跳过已经是 data URL 的图片
+                if src_attr.starts_with("data:") {
+                    eprintln!("🖼️ [图片处理] 图片 {}: 跳过（已是 data URL）", index + 1);
+                    skipped_count += 1;
+                    continue;
+                }
+                
+                // 跳过 HTTP/HTTPS 图片
+                if src_attr.starts_with("http://") || src_attr.starts_with("https://") {
+                    eprintln!("🖼️ [图片处理] 图片 {}: 跳过（HTTP/HTTPS）", index + 1);
+                    skipped_count += 1;
+                    continue;
+                }
+                
+                processed_count += 1;
+                
+                // 处理相对路径
+                let img_path = if src_attr.starts_with("/") {
+                    // 绝对路径
+                    eprintln!("🖼️ [图片处理] 图片 {}: 绝对路径", index + 1);
+                    PathBuf::from(src_attr)
+                } else {
+                    // 相对路径（Pandoc 提取的图片）
+                    eprintln!("🖼️ [图片处理] 图片 {}: 相对路径，拼接媒体目录", index + 1);
+                    media_dir.join(src_attr)
+                };
+                
+                eprintln!("🖼️ [图片处理] 图片 {}: 完整路径 = {:?}", index + 1, img_path);
+                
+                if !img_path.exists() {
+                    eprintln!("⚠️ [图片处理] 图片 {}: 文件不存在: {:?} (原始路径: {})", index + 1, img_path, src_attr);
+                    error_count += 1;
+                    continue;
+                }
+                
+                // 检查文件大小
+                let file_size = match std::fs::metadata(&img_path) {
+                    Ok(meta) => meta.len(),
+                    Err(e) => {
+                        eprintln!("❌ [图片处理] 图片 {}: 无法读取文件元数据: {}", index + 1, e);
+                        error_count += 1;
+                        continue;
+                    }
+                };
+                eprintln!("🖼️ [图片处理] 图片 {}: 文件大小 = {} 字节 ({} MB)", index + 1, file_size, file_size / 1024 / 1024);
+                
+                // 处理图片
+                eprintln!("🖼️ [图片处理] 图片 {}: 开始处理...", index + 1);
+                match std::panic::catch_unwind(|| {
+                    Self::process_single_image_for_edit(&img_path, &image_service)
+                }) {
+                    Ok(Ok((data_url, size))) => {
+                        eprintln!("🖼️ [图片处理] 图片 {}: 处理成功，大小 = {} 字节", index + 1, size);
+                        
+                        // 检查总大小限制
+                        if total_base64_size + size > MAX_TOTAL_SIZE {
+                            eprintln!("⚠️ [图片处理] 图片 {}: 总大小超过限制 ({}MB > 15MB)，跳过剩余图片", 
+                                     index + 1, (total_base64_size + size) / 1024 / 1024);
+                            error_count += 1;
+                            break; // 停止处理剩余图片
+                        }
+                        
+                        total_base64_size += size;
+                        replacements.push((src_attr.to_string(), data_url));
+                        
+                        if size < 1024 * 1024 {
+                            base64_count += 1;
+                            eprintln!("🖼️ [图片处理] 图片 {}: 直接 base64", index + 1);
+                        } else {
+                            compressed_count += 1;
+                            eprintln!("🖼️ [图片处理] 图片 {}: 压缩后 base64", index + 1);
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        eprintln!("❌ [图片处理] 图片 {}: 处理失败: {:?}, 错误: {}", index + 1, img_path, e);
+                        error_count += 1;
+                    }
+                    Err(panic_info) => {
+                        eprintln!("❌ [图片处理] 图片 {}: 处理 panic: {:?}", index + 1, panic_info);
+                        error_count += 1;
+                    }
+                }
+            } else {
+                eprintln!("⚠️ [图片处理] 图片 {}: 没有 src 属性", index + 1);
+            }
+        }
+        
+        eprintln!("🖼️ [图片处理] 步骤 4: 替换图片路径...");
+        eprintln!("🖼️ [图片处理] 需要替换 {} 个图片路径", replacements.len());
+        
+        // 替换所有找到的图片路径
+        for (i, (old_src, new_src)) in replacements.iter().enumerate() {
+            eprintln!("🖼️ [图片处理] 替换 {}: {} -> {}...", i + 1, old_src, &new_src[..50.min(new_src.len())]);
+            processed_html = processed_html.replace(old_src, new_src);
+        }
+        
+        eprintln!("🖼️ [图片处理] 完成: 总计 {} 个，base64 {} 个，压缩 {} 个，跳过 {} 个，错误 {} 个，总大小 {}MB",
+                 processed_count, base64_count, compressed_count, skipped_count, error_count,
+                 total_base64_size / 1024 / 1024);
+        eprintln!("🖼️ [图片处理] 处理后的 HTML 长度: {} 字符", processed_html.len());
+        
+        Ok(processed_html)
+    }
+    
+    /// 处理单个图片（编辑模式）
+    /// 返回：(data_url, size_in_bytes)
+    fn process_single_image_for_edit(
+        img_path: &Path,
+        image_service: &crate::services::image_service::ImageService,
+    ) -> Result<(String, u64), String> {
+        use base64::{Engine as _, engine::general_purpose};
+        
+        eprintln!("  📸 [单图处理] 开始处理: {:?}", img_path);
+        
+        let metadata = match std::fs::metadata(img_path) {
+            Ok(meta) => meta,
+            Err(e) => {
+                eprintln!("  ❌ [单图处理] 无法读取图片元数据: {}", e);
+                return Err(format!("无法读取图片元数据: {}", e));
+            }
+        };
+        let file_size = metadata.len();
+        eprintln!("  📸 [单图处理] 文件大小: {} 字节 ({} MB)", file_size, file_size / 1024 / 1024);
+        
+        let (image_data, mime_type) = if file_size < 1024 * 1024 {
+            // 小图片（< 1MB）：直接读取
+            eprintln!("  📸 [单图处理] 小图片，直接读取...");
+            let img_data = match std::fs::read(img_path) {
+                Ok(data) => {
+                    eprintln!("  📸 [单图处理] 读取成功，大小: {} 字节", data.len());
+                    data
+                }
+                Err(e) => {
+                    eprintln!("  ❌ [单图处理] 读取图片失败: {}", e);
+                    return Err(format!("读取图片失败: {}", e));
+                }
+            };
+            
+            let mime_type = match image_service.detect_image_mime_type(img_path) {
+                Ok(mt) => {
+                    eprintln!("  📸 [单图处理] MIME 类型: {}", mt);
+                    mt
+                }
+                Err(e) => {
+                    eprintln!("  ❌ [单图处理] 检测 MIME 类型失败: {}", e);
+                    return Err(format!("检测 MIME 类型失败: {}", e));
+                }
+            };
+            (img_data, mime_type)
+        } else {
+            // 大图片（≥ 1MB）：压缩后读取
+            eprintln!("  📸 [单图处理] 大图片，开始压缩...");
+            let compressed = match image_service.compress_image(img_path, 1024, 85) {
+                Ok(data) => {
+                    eprintln!("  📸 [单图处理] 压缩成功，原始大小: {} 字节，压缩后: {} 字节", 
+                             file_size, data.len());
+                    data
+                }
+                Err(e) => {
+                    eprintln!("  ❌ [单图处理] 压缩图片失败: {}", e);
+                    return Err(format!("压缩图片失败: {}", e));
+                }
+            };
+            
+            // 检测压缩后的格式（WebP）
+            let mime_type = if compressed.len() > 12 
+                && &compressed[0..4] == b"RIFF" 
+                && &compressed[8..12] == b"WEBP" {
+                eprintln!("  📸 [单图处理] 检测到 WebP 格式");
+                "image/webp"
+            } else {
+                match image_service.detect_image_mime_type(img_path) {
+                    Ok(mt) => {
+                        eprintln!("  📸 [单图处理] MIME 类型: {}", mt);
+                        mt
+                    }
+                    Err(e) => {
+                        eprintln!("  ❌ [单图处理] 检测 MIME 类型失败: {}", e);
+                        return Err(format!("检测 MIME 类型失败: {}", e));
+                    }
+                }
+            };
+            
+            (compressed, mime_type)
+        };
+        
+        eprintln!("  📸 [单图处理] 开始 base64 编码...");
+        // 转换为 base64 data URL
+        let base64_str = general_purpose::STANDARD.encode(&image_data);
+        eprintln!("  📸 [单图处理] base64 编码完成，长度: {} 字符", base64_str.len());
+        
+        let data_url = format!("data:{};base64,{}", mime_type, base64_str);
+        eprintln!("  📸 [单图处理] data URL 创建完成，总长度: {} 字符", data_url.len());
+        eprintln!("  ✅ [单图处理] 处理成功");
+        
+        Ok((data_url, image_data.len() as u64))
+    }
 }
+
 
 

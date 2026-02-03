@@ -1,6 +1,30 @@
 import { create } from 'zustand';
 import { Editor } from '@tiptap/react';
 
+// Diff 数据结构（与后端保持一致）
+export interface Diff {
+  diff_id: string;
+  diff_area_id: string;
+  diff_type: 'Edit' | 'Insertion' | 'Deletion';
+  original_code: string;
+  original_start_line: number;
+  original_end_line: number;
+  new_code: string;
+  start_line: number;
+  end_line: number;
+  // ⚠️ 上下文信息：用于精确匹配定位
+  context_before?: string | null; // 目标文本前面的上下文（50-100字符）
+  context_after?: string | null;  // 目标文本后面的上下文（50-100字符）
+  // ⚠️ 元素类型和标识符：用于表格、图片等复杂元素
+  element_type?: 'text' | 'table' | 'image' | 'code_block' | 'replace_whole';
+  element_identifier?: string; // 用于表格、图片等复杂元素
+  // ⚠️ 前端添加的定位信息
+  from?: number; // ProseMirror 位置
+  to?: number;
+  confidence?: number; // 匹配置信度
+  strategy?: string; // 使用的匹配策略
+}
+
 export interface EditorTab {
   id: string;
   filePath: string;
@@ -13,12 +37,17 @@ export interface EditorTab {
   isDraft: boolean; // ⚠️ 新增：是否为草稿文件
   lastModifiedTime: number; // ⚠️ Week 17.1.2：文件最后修改时间（毫秒时间戳）
   editor: Editor | null;
+  autoCompleteEnabled: boolean; // 自动续写功能启用状态
+  diffAreaId?: string; // ⚠️ 新增：当前 diff area ID
+  diffs?: Diff[]; // ⚠️ 新增：diff 数据
+  oldContent?: string; // ⚠️ 新增：旧内容（用于 diff 显示）
+  newContent?: string; // ⚠️ 新增：新内容（用于 diff 显示）
 }
 
 interface EditorState {
   tabs: EditorTab[];
   activeTabId: string | null;
-  addTab: (filePath: string, fileName: string, content: string, isReadOnly?: boolean, isDraft?: boolean, lastModifiedTime?: number) => string;
+  addTab: (filePath: string, fileName: string, content: string, isReadOnly?: boolean, isDraft?: boolean, lastModifiedTime?: number, autoCompleteEnabled?: boolean) => string;
   removeTab: (tabId: string) => void;
   setActiveTab: (tabId: string) => void;
   updateTabContent: (tabId: string, content: string) => void;
@@ -30,13 +59,17 @@ interface EditorState {
   updateTabPath: (tabId: string, newPath: string) => void; // ⚠️ 新增：更新标签页路径
   markTabConflict: (tabId: string) => void; // ⚠️ 新增：标记冲突
   updateTabModifiedTime: (tabId: string, modifiedTime: number) => void; // ⚠️ Week 17.1.2：更新文件修改时间
+  setAutoCompleteEnabled: (tabId: string, enabled: boolean) => void; // 设置自动续写启用状态
+  setTabDiff: (tabId: string, diffAreaId: string, diffs: Diff[], oldContent: string, newContent: string) => void; // ⚠️ 新增：设置 diff 数据
+  clearTabDiff: (tabId: string) => void; // ⚠️ 新增：清除 diff 数据
+  applyTabDiff: (tabId: string) => void; // ⚠️ 新增：触发应用 diff（通过编辑器的 onApplyDiff）
 }
 
 export const useEditorStore = create<EditorState>((set, get) => ({
   tabs: [],
   activeTabId: null,
 
-  addTab: (filePath, fileName, content, isReadOnly = false, isDraft = false, lastModifiedTime = Date.now()) => {
+  addTab: (filePath, fileName, content, isReadOnly = false, isDraft = false, lastModifiedTime = Date.now(), autoCompleteEnabled = true) => {
     // ⚠️ 关键：检查文件是否已打开，如果已打开则切换到该标签
     const state = get();
     const existingTab = state.tabs.find((tab) => tab.filePath === filePath);
@@ -60,6 +93,11 @@ export const useEditorStore = create<EditorState>((set, get) => ({
       isDraft, // ⚠️ 新增：草稿标记
       lastModifiedTime, // ⚠️ Week 17.1.2：文件最后修改时间
       editor: null,
+      autoCompleteEnabled, // 自动续写功能默认启用
+      diffAreaId: undefined, // ⚠️ 新增：diff area ID
+      diffs: undefined, // ⚠️ 新增：diff 数据
+      oldContent: undefined, // ⚠️ 新增：旧内容
+      newContent: undefined, // ⚠️ 新增：新内容
     };
     
     set((state) => ({
@@ -189,6 +227,69 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     }));
   },
 
-  
+  // 设置自动续写启用状态
+  setAutoCompleteEnabled: (tabId, enabled) => {
+    set((state) => ({
+      tabs: state.tabs.map((tab) =>
+        tab.id === tabId
+          ? { ...tab, autoCompleteEnabled: enabled }
+          : tab
+      ),
+    }));
+  },
+
+  // ⚠️ 新增：设置 diff 数据
+  setTabDiff: (tabId, diffAreaId, diffs, oldContent, newContent) => {
+    set((state) => ({
+      tabs: state.tabs.map((tab) =>
+        tab.id === tabId
+          ? {
+              ...tab,
+              diffAreaId,
+              diffs,
+              oldContent,
+              newContent,
+            }
+          : tab
+      ),
+    }));
+  },
+
+  // ⚠️ 新增：清除 diff 数据
+  clearTabDiff: (tabId) => {
+    set((state) => ({
+      tabs: state.tabs.map((tab) =>
+        tab.id === tabId
+          ? {
+              ...tab,
+              diffAreaId: undefined,
+              diffs: undefined,
+              oldContent: undefined,
+              newContent: undefined,
+            }
+          : tab
+      ),
+    }));
+  },
+
+  // ⚠️ 新增：触发应用 diff（通过编辑器的 onApplyDiff）
+  applyTabDiff: (tabId) => {
+    const state = get();
+    const tab = state.tabs.find(t => t.id === tabId);
+    if (tab && tab.editor) {
+      // 通过编辑器实例触发 onApplyDiff
+      // 但是，onApplyDiff 是在 TipTapEditor 中定义的，我们无法直接访问
+      // 所以，我们通过触发一个 transaction 来通知编辑器应用 diff
+      const { view } = tab.editor;
+      if (view) {
+        // 触发一个带有 applyDiff meta 的 transaction
+        const tr = view.state.tr.setMeta('applyDiff', true);
+        view.dispatch(tr);
+        console.log('✅ [EditorStore] 已触发编辑器应用 diff');
+      }
+    } else {
+      console.warn('⚠️ [EditorStore] 无法应用 diff：编辑器实例不存在');
+    }
+  },
 }));
 

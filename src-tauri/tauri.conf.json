@@ -21,7 +21,14 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "$APPDATA/*",
+          "$HOME/Library/Application Support/binder/cache/preview/*"
+        ]
+      }
     }
   },
   "bundle": {

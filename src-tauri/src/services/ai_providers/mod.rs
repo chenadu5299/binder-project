@@ -22,10 +22,56 @@ pub enum ChatChunk {
     },
 }
 
+// 编辑器状态（用于提示词构建）
+#[derive(Debug, Clone)]
+pub struct EditorState {
+    pub node_type: String,
+    pub heading_level: Option<u32>,
+    pub list_type: Option<String>,
+    pub list_level: Option<u32>,
+    pub block_type: Option<String>,
+}
+
+// 记忆库项（用于提示词构建）
+#[derive(Debug, Clone)]
+pub struct MemoryItem {
+    pub id: String,
+    pub entity_name: String,
+    pub content: String,
+    pub entity_type: String,
+}
+
+// 文档概览（用于全文视角）
+#[derive(Debug, Clone)]
+pub struct DocumentOverview {
+    pub document_start: String,
+    pub document_end: String,
+    pub document_structure: String,
+    pub document_length: usize,
+    pub current_section: String,
+    pub previous_paragraph: String,
+    pub next_paragraph: String,
+}
+
 #[async_trait]
 pub trait AIProvider: Send + Sync {
-    /// 自动补全（使用快速模型）
+    /// 自动补全（使用快速模型，旧版本，保持兼容）
     async fn autocomplete(&self, context: &str, max_length: usize) -> Result<String, AIError>;
+    
+    /// 自动补全（增强版本，支持下文、编辑器状态、记忆库、文档概览）
+    async fn autocomplete_enhanced(
+        &self,
+        context_before: &str,
+        context_after: Option<&str>,
+        editor_state: Option<&EditorState>,
+        memory_items: Option<&[MemoryItem]>,
+        document_format: &str,
+        document_overview: Option<&DocumentOverview>,
+        max_length: usize,
+    ) -> Result<String, AIError> {
+        // 默认实现：调用旧版本（向后兼容）
+        self.autocomplete(context_before, max_length).await
+    }
     
     /// Inline Assist（使用标准模型）
     async fn inline_assist(&self, instruction: &str, text: &str, context: &str) -> Result<String, AIError>;

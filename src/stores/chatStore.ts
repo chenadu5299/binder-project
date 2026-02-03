@@ -1,31 +1,37 @@
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
 import { useFileStore } from './fileStore';
+import { useEditorStore } from './editorStore';
 
-import { ToolCall } from '../types/tool';
+import { ToolCall, MessageContentBlock, AuthorizationRequest } from '../types/tool';
 
 export interface ChatMessage {
     id: string;
     role: 'user' | 'assistant' | 'system';
-    content: string;
+    content: string; // 保留用于兼容
     timestamp: number;
     isLoading?: boolean;
-    toolCalls?: ToolCall[];  // 工具调用列表
+    toolCalls?: ToolCall[];  // 工具调用列表（保留用于兼容）
+    // 新增：内容块列表（按时间顺序）
+    contentBlocks?: MessageContentBlock[];
 }
 
-export type ChatMode = 'agent' | 'chat'; // Agent 模式：可调用工具；Chat 模式：仅对话
+export type ChatMode = 'agent' | 'chat' | 'edit'; // Agent 模式：可调用工具；Chat 模式：仅对话；Edit 模式：编辑模式
 
 export interface ChatTab {
     id: string;
     title: string;
     messages: ChatMessage[];
     model: string;
-    mode: ChatMode; // 聊天模式：agent 或 chat
+    mode: ChatMode; // 聊天模式：agent、chat 或 edit
     createdAt: number;
     updatedAt: number;
     // 新增字段：聊天记录绑定工作区
     workspacePath: string | null; // 绑定的工作区路径，null 表示临时状态
     isTemporary: boolean; // 是否为临时聊天（未绑定工作区）
+    // 编辑模式字段（可选）
+    editModeFile?: string; // 编辑模式下的文件路径
+    editModeContent?: string; // 编辑模式下的文件内容
 }
 
 interface ChatState {
@@ -42,6 +48,9 @@ interface ChatState {
     setMessageLoading: (tabId: string, messageId: string, isLoading: boolean) => void;
     addToolCall: (tabId: string, messageId: string, toolCall: ToolCall) => void;
     updateToolCall: (tabId: string, messageId: string, toolCallId: string, updates: Partial<ToolCall>) => void;
+    // 内容块管理
+    addContentBlock: (tabId: string, messageId: string, block: MessageContentBlock) => void;
+    updateContentBlock: (tabId: string, messageId: string, blockId: string, updates: Partial<MessageContentBlock>) => void;
     setModel: (tabId: string, model: string) => void;
     setMode: (tabId: string, mode: ChatMode) => void; // 设置聊天模式
     clearMessages: (tabId: string) => void;
@@ -233,10 +242,69 @@ export const useChatStore = create<ChatState>((set, get) => {
                                 m.id === messageId
                                     ? {
                                         ...m,
+                                        // 更新 toolCalls 数组
                                         toolCalls: m.toolCalls?.map(tc =>
                                             tc.id === toolCallId
                                                 ? { ...tc, ...updates }
                                                 : tc
+                                        ),
+                                        // ⚠️ 关键修复：同时更新 contentBlocks 中的 toolCall
+                                        contentBlocks: m.contentBlocks?.map(block =>
+                                            (block.type === 'tool' || block.type === 'authorization') && block.toolCall?.id === toolCallId
+                                                ? {
+                                                    ...block,
+                                                    toolCall: block.toolCall ? { ...block.toolCall, ...updates } : undefined,
+                                                  }
+                                                : block
+                                        ),
+                                    }
+                                    : m
+                            ),
+                            updatedAt: Date.now(),
+                        }
+                        : t
+                ),
+            });
+        },
+        
+        // 内容块管理
+        addContentBlock: (tabId: string, messageId: string, block: MessageContentBlock) => {
+            const { tabs } = get();
+            set({
+                tabs: tabs.map(t =>
+                    t.id === tabId
+                        ? {
+                            ...t,
+                            messages: t.messages.map(m =>
+                                m.id === messageId
+                                    ? {
+                                        ...m,
+                                        contentBlocks: [...(m.contentBlocks || []), block].sort((a, b) => a.timestamp - b.timestamp),
+                                    }
+                                    : m
+                            ),
+                            updatedAt: Date.now(),
+                        }
+                        : t
+                ),
+            });
+        },
+        
+        updateContentBlock: (tabId: string, messageId: string, blockId: string, updates: Partial<MessageContentBlock>) => {
+            const { tabs } = get();
+            set({
+                tabs: tabs.map(t =>
+                    t.id === tabId
+                        ? {
+                            ...t,
+                            messages: t.messages.map(m =>
+                                m.id === messageId
+                                    ? {
+                                        ...m,
+                                        contentBlocks: m.contentBlocks?.map(block =>
+                                            block.id === blockId
+                                                ? { ...block, ...updates }
+                                                : block
                                         ),
                                     }
                                     : m
@@ -377,6 +445,23 @@ export const useChatStore = create<ChatState>((set, get) => {
                 // 获取当前工作区路径（用于判断是否启用工具）
                 const { currentWorkspace } = (await import('./fileStore')).useFileStore.getState();
                 
+                // ⚠️ 关键修复：获取当前编辑器打开的文件和选中的文本
+                const { getActiveTab } = useEditorStore.getState();
+                const activeEditorTab = getActiveTab();
+                const currentFile = activeEditorTab?.filePath || null;
+                
+                // 获取选中的文本（如果有编辑器实例）
+                let selectedText: string | null = null;
+                if (activeEditorTab?.editor) {
+                    const { from, to } = activeEditorTab.editor.state.selection;
+                    if (from !== to) {
+                        selectedText = activeEditorTab.editor.state.doc.textBetween(from, to);
+                    }
+                }
+                
+                // 获取当前编辑器内容（用于文档编辑功能）
+                const currentEditorContent = activeEditorTab?.content || null;
+                
                 // ⚠️ 关键修复：确保 tabId 正确传递
                 console.log('📤 发送消息到后端:', { 
                     tabId, 
@@ -385,6 +470,8 @@ export const useChatStore = create<ChatState>((set, get) => {
                     hasWorkspace: !!currentWorkspace,
                     mode: currentTab.mode,
                     isTemporary: currentTab.isTemporary,
+                    currentFile: currentFile,
+                    hasSelectedText: !!selectedText,
                 });
                 
                 // 调用后端流式聊天（根据模式决定是否启用工具）
@@ -401,6 +488,9 @@ export const useChatStore = create<ChatState>((set, get) => {
                         max_tokens: 2000,
                     },
                     enableTools: enableTools, // Agent 模式且有工作区时启用工具，否则禁用
+                    currentFile: currentFile, // ⚠️ 关键修复：传递当前编辑器打开的文件路径
+                    selectedText: selectedText, // ⚠️ 关键修复：传递当前选中的文本
+                    currentEditorContent: currentEditorContent, // ⚠️ 文档编辑功能：传递当前编辑器内容
                 });
             } catch (error) {
                 console.error('发送消息失败:', error);
@@ -415,8 +505,11 @@ export const useChatStore = create<ChatState>((set, get) => {
                         let errorText = '发送消息失败';
                         if (error instanceof Error) {
                             const errorMsg = error.message;
-                            if (errorMsg.includes('网络错误') || errorMsg.includes('connection') || errorMsg.includes('网络')) {
-                                errorText = '网络连接失败，请检查网络连接后重试';
+                            // 检测 API key 未配置错误
+                            if (errorMsg.includes('未配置') && (errorMsg.includes('提供商') || errorMsg.includes('API key'))) {
+                                errorText = '❌ AI 功能未配置\n\n请先配置 API Key 才能使用 AI 功能。\n\n配置方法：\n1. 点击右上角设置图标\n2. 选择"配置 API Key"\n3. 输入 DeepSeek 或 OpenAI 的 API Key\n\n或者：\n- 在欢迎页面点击"配置 API Key"按钮';
+                            } else if (errorMsg.includes('网络错误') || errorMsg.includes('connection') || errorMsg.includes('网络') || errorMsg.includes('Connection refused') || errorMsg.includes('tcp connect')) {
+                                errorText = '❌ 网络连接失败\n\n无法连接到 AI 服务器，可能的原因：\n1. 网络连接问题（请检查网络连接）\n2. 防火墙或代理设置阻止了连接\n3. 需要配置代理（如果使用代理）\n4. DNS 解析问题\n5. AI 服务器暂时不可用\n\n建议：\n- 检查网络连接\n- 检查防火墙设置\n- 如果使用代理，请配置代理\n- 稍后重试';
                             } else if (errorMsg.includes('timeout') || errorMsg.includes('超时')) {
                                 errorText = '请求超时，请稍后重试';
                             } else if (errorMsg.includes('API') || errorMsg.includes('api')) {

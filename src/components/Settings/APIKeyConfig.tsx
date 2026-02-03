@@ -81,6 +81,7 @@ const APIKeyConfig: React.FC<APIKeyConfigProps> = ({ onClose }) => {
         }
     };
 
+
     const toggleShowKey = (provider: 'openai' | 'deepseek') => {
         setShowKeys(prev => ({
             ...prev,

@@ -15,6 +15,7 @@ import {
 import { useLayoutStore } from '../../stores/layoutStore';
 import { useEditorStore } from '../../stores/editorStore';
 import { toast } from '../Common/Toast';
+import ToolbarDropdown from './ToolbarDropdown';
 
 interface EditorToolbarProps {
   editor: Editor | null;
@@ -25,12 +26,74 @@ interface EditorToolbarProps {
 const EditorToolbar: React.FC<EditorToolbarProps> = ({ editor, fileType, documentPath }) => {
   const { analysis, setAnalysisVisible } = useLayoutStore();
   const { tabs, activeTabId } = useEditorStore();
-  
-  if (!editor) return null;
+  const [headingLevel, setHeadingLevel] = React.useState<string | number>('paragraph');
+  const [textAlign, setTextAlign] = React.useState<string>('left');
   
   // 获取当前标签页
   const activeTab = tabs.find(t => t.id === activeTabId);
   
+  // 监听编辑器状态变化，更新标题等级
+  React.useEffect(() => {
+    if (!editor) return;
+    
+    const updateHeadingLevel = () => {
+      if (editor.isActive('heading', { level: 1 })) {
+        setHeadingLevel(1);
+      } else if (editor.isActive('heading', { level: 2 })) {
+        setHeadingLevel(2);
+      } else if (editor.isActive('heading', { level: 3 })) {
+        setHeadingLevel(3);
+      } else if (editor.isActive('heading', { level: 4 })) {
+        setHeadingLevel(4);
+      } else if (editor.isActive('heading', { level: 5 })) {
+        setHeadingLevel(5);
+      } else if (editor.isActive('heading', { level: 6 })) {
+        setHeadingLevel(6);
+      } else {
+        setHeadingLevel('paragraph');
+      }
+    };
+
+    updateHeadingLevel();
+    editor.on('update', updateHeadingLevel);
+    editor.on('selectionUpdate', updateHeadingLevel);
+
+    return () => {
+      editor.off('update', updateHeadingLevel);
+      editor.off('selectionUpdate', updateHeadingLevel);
+    };
+  }, [editor]);
+
+  // 监听文本对齐状态变化
+  React.useEffect(() => {
+    if (!editor) return;
+    
+    const updateTextAlign = () => {
+      if (editor.isActive({ textAlign: 'left' })) {
+        setTextAlign('left');
+      } else if (editor.isActive({ textAlign: 'center' })) {
+        setTextAlign('center');
+      } else if (editor.isActive({ textAlign: 'right' })) {
+        setTextAlign('right');
+      } else if (editor.isActive({ textAlign: 'justify' })) {
+        setTextAlign('justify');
+      } else {
+        setTextAlign('left');
+      }
+    };
+
+    updateTextAlign();
+    editor.on('update', updateTextAlign);
+    editor.on('selectionUpdate', updateTextAlign);
+
+    return () => {
+      editor.off('update', updateTextAlign);
+      editor.off('selectionUpdate', updateTextAlign);
+    };
+  }, [editor]);
+  
+  // 早期返回：如果没有编辑器，不显示工具栏
+  if (!editor) return null;
   
   // PDF 和图片文件不显示工具栏
   if (fileType === 'pdf' || fileType === 'image') {
@@ -41,7 +104,25 @@ const EditorToolbar: React.FC<EditorToolbarProps> = ({ editor, fileType, documen
   const showFullToolbar = fileType === 'docx' || fileType === 'html';
 
   return (
-    <div className="flex items-center gap-0.5 p-1.5 border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 overflow-x-auto overflow-y-hidden flex-nowrap min-w-0" style={{ scrollbarWidth: 'thin', scrollbarColor: '#9ca3af transparent' }}>
+    <div className="flex items-center gap-0.5 p-1.5 border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 min-w-0 flex-wrap">
+      {/* 自动续写开关 */}
+      <label className="flex items-center gap-1.5 px-2 py-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 cursor-pointer shrink-0">
+        <input
+          type="checkbox"
+          checked={activeTab?.autoCompleteEnabled ?? true}
+          onChange={(e) => {
+            if (activeTab) {
+              const { setAutoCompleteEnabled } = useEditorStore.getState();
+              setAutoCompleteEnabled(activeTab.id, e.target.checked);
+            }
+          }}
+          className="w-4 h-4 rounded border-gray-300 dark:border-gray-600 text-blue-600 focus:ring-blue-500 dark:focus:ring-blue-400"
+          title="自动续写"
+        />
+        <span className="text-xs text-gray-700 dark:text-gray-300 whitespace-nowrap">自动续写</span>
+      </label>
+      <div className="w-px h-5 bg-gray-300 dark:bg-gray-600 mx-0.5 shrink-0" />
+      
       {/* 基础格式 */}
       <button
         onClick={(e) => {
@@ -103,94 +184,33 @@ const EditorToolbar: React.FC<EditorToolbarProps> = ({ editor, fileType, documen
         </>
       )}
 
-      {/* 标题 */}
+      {/* 标题下拉菜单 */}
       {showFullToolbar && (
         <>
           <div className="w-px h-5 bg-gray-300 dark:bg-gray-600 mx-0.5 shrink-0" />
-          <button
-            onClick={(e) => {
-              e.preventDefault();
-              e.stopPropagation();
-              editor.chain().focus().toggleHeading({ level: 1 }).run();
+          <ToolbarDropdown
+            options={[
+              { label: '正文', value: 'paragraph' },
+              { label: '标题 1', value: 1, icon: <DocumentTextIcon className="w-3 h-3" /> },
+              { label: '标题 2', value: 2, icon: <DocumentTextIcon className="w-3 h-3" /> },
+              { label: '标题 3', value: 3, icon: <DocumentTextIcon className="w-3 h-3" /> },
+              { label: '标题 4', value: 4, icon: <DocumentTextIcon className="w-3 h-3" /> },
+              { label: '标题 5', value: 5, icon: <DocumentTextIcon className="w-3 h-3" /> },
+              { label: '标题 6', value: 6, icon: <DocumentTextIcon className="w-3 h-3" /> },
+            ]}
+            value={headingLevel}
+            onChange={(value) => {
+              if (value === 'paragraph') {
+                editor.chain().focus().setParagraph().run();
+              } else if (typeof value === 'number') {
+                editor.chain().focus().toggleHeading({ level: value as 1 | 2 | 3 | 4 | 5 | 6 }).run();
+              }
             }}
-            className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center shrink-0 ${
-              editor.isActive('heading', { level: 1 }) ? 'bg-blue-100 dark:bg-blue-900' : ''
-            }`}
-            title="标题 1"
-          >
-            <DocumentTextIcon className="w-4 h-4" />
-            <span className="ml-0.5 text-xs">H1</span>
-          </button>
-          <button
-            onClick={(e) => {
-              e.preventDefault();
-              e.stopPropagation();
-              editor.chain().focus().toggleHeading({ level: 2 }).run();
-            }}
-            className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center shrink-0 ${
-              editor.isActive('heading', { level: 2 }) ? 'bg-blue-100 dark:bg-blue-900' : ''
-            }`}
-            title="标题 2"
-          >
-            <DocumentTextIcon className="w-4 h-4" />
-            <span className="ml-0.5 text-xs">H2</span>
-          </button>
-          <button
-            onClick={(e) => {
-              e.preventDefault();
-              e.stopPropagation();
-              editor.chain().focus().toggleHeading({ level: 3 }).run();
-            }}
-            className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center shrink-0 ${
-              editor.isActive('heading', { level: 3 }) ? 'bg-blue-100 dark:bg-blue-900' : ''
-            }`}
-            title="标题 3"
-          >
-            <DocumentTextIcon className="w-4 h-4" />
-            <span className="ml-0.5 text-xs">H3</span>
-          </button>
-          <button
-            onClick={(e) => {
-              e.preventDefault();
-              e.stopPropagation();
-              editor.chain().focus().toggleHeading({ level: 4 }).run();
-            }}
-            className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center shrink-0 ${
-              editor.isActive('heading', { level: 4 }) ? 'bg-blue-100 dark:bg-blue-900' : ''
-            }`}
-            title="标题 4"
-          >
-            <DocumentTextIcon className="w-4 h-4" />
-            <span className="ml-0.5 text-xs">H4</span>
-          </button>
-          <button
-            onClick={(e) => {
-              e.preventDefault();
-              e.stopPropagation();
-              editor.chain().focus().toggleHeading({ level: 5 }).run();
-            }}
-            className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center shrink-0 ${
-              editor.isActive('heading', { level: 5 }) ? 'bg-blue-100 dark:bg-blue-900' : ''
-            }`}
-            title="标题 5"
-          >
-            <DocumentTextIcon className="w-4 h-4" />
-            <span className="ml-0.5 text-xs">H5</span>
-          </button>
-          <button
-            onClick={(e) => {
-              e.preventDefault();
-              e.stopPropagation();
-              editor.chain().focus().toggleHeading({ level: 6 }).run();
-            }}
-            className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center shrink-0 ${
-              editor.isActive('heading', { level: 6 }) ? 'bg-blue-100 dark:bg-blue-900' : ''
-            }`}
-            title="标题 6"
-          >
-            <DocumentTextIcon className="w-4 h-4" />
-            <span className="ml-0.5 text-xs">H6</span>
-          </button>
+            buttonLabel={headingLevel === 'paragraph' ? '正文' : `标题 ${headingLevel}`}
+            buttonIcon={<DocumentTextIcon className="w-4 h-4" />}
+            title="标题"
+            isActive={editor.isActive('heading')}
+          />
         </>
       )}
 
@@ -225,62 +245,28 @@ const EditorToolbar: React.FC<EditorToolbarProps> = ({ editor, fileType, documen
         </button>
       )}
 
-      {/* 文本对齐 */}
+      {/* 文本对齐下拉菜单 */}
       {showFullToolbar && (
         <>
           <div className="w-px h-5 bg-gray-300 dark:bg-gray-600 mx-0.5 shrink-0" />
-          <button
-            onClick={(e) => {
-              e.preventDefault();
-              e.stopPropagation();
-              editor.chain().focus().setTextAlign('left').run();
+          <ToolbarDropdown
+            options={[
+              { label: '左对齐', value: 'left', icon: <Bars3BottomLeftIcon className="w-3 h-3" /> },
+              { label: '居中', value: 'center', icon: <Bars3Icon className="w-3 h-3" /> },
+              { label: '右对齐', value: 'right', icon: <Bars3BottomRightIcon className="w-3 h-3" /> },
+              { label: '两端对齐', value: 'justify', icon: <Bars3Icon className="w-3 h-3" /> },
+            ]}
+            value={textAlign}
+            onChange={(value) => {
+              if (typeof value === 'string') {
+                editor.chain().focus().setTextAlign(value as 'left' | 'center' | 'right' | 'justify').run();
+              }
             }}
-            className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 shrink-0 ${
-              editor.isActive({ textAlign: 'left' }) ? 'bg-blue-100 dark:bg-blue-900' : ''
-            }`}
-            title="左对齐"
-          >
-            <Bars3BottomLeftIcon className="w-4 h-4" />
-          </button>
-          <button
-            onClick={(e) => {
-              e.preventDefault();
-              e.stopPropagation();
-              editor.chain().focus().setTextAlign('center').run();
-            }}
-            className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 shrink-0 ${
-              editor.isActive({ textAlign: 'center' }) ? 'bg-blue-100 dark:bg-blue-900' : ''
-            }`}
-            title="居中"
-          >
-            <Bars3Icon className="w-4 h-4" />
-          </button>
-          <button
-            onClick={(e) => {
-              e.preventDefault();
-              e.stopPropagation();
-              editor.chain().focus().setTextAlign('right').run();
-            }}
-            className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 shrink-0 ${
-              editor.isActive({ textAlign: 'right' }) ? 'bg-blue-100 dark:bg-blue-900' : ''
-            }`}
-            title="右对齐"
-          >
-            <Bars3BottomRightIcon className="w-4 h-4" />
-          </button>
-          <button
-            onClick={(e) => {
-              e.preventDefault();
-              e.stopPropagation();
-              editor.chain().focus().setTextAlign('justify').run();
-            }}
-            className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 shrink-0 ${
-              editor.isActive({ textAlign: 'justify' }) ? 'bg-blue-100 dark:bg-blue-900' : ''
-            }`}
-            title="两端对齐"
-          >
-            <Bars3Icon className="w-4 h-4" />
-          </button>
+            buttonLabel={textAlign === 'left' ? '左对齐' : textAlign === 'center' ? '居中' : textAlign === 'right' ? '右对齐' : '两端对齐'}
+            buttonIcon={<Bars3BottomLeftIcon className="w-4 h-4" />}
+            title="文本对齐"
+            isActive={editor.isActive({ textAlign: 'left' }) || editor.isActive({ textAlign: 'center' }) || editor.isActive({ textAlign: 'right' }) || editor.isActive({ textAlign: 'justify' })}
+          />
         </>
       )}
 
@@ -445,14 +431,14 @@ const EditorToolbar: React.FC<EditorToolbarProps> = ({ editor, fileType, documen
                   return;
                 }
                 
-                // 调用后端插入图片
-                const relativePath = await invoke<string>('insert_image', {
+                // 调用后端插入图片（返回 { dataUrl, relativePath }）
+                const result = await invoke<{ dataUrl: string; relativePath: string }>('insert_image', {
                   documentPath,
                   imageSource: selected,
                 });
                 
-                // 在编辑器中插入图片（使用相对路径）
-                editor.chain().focus().setImage({ src: relativePath }).run();
+                // 在编辑器中插入图片（使用 base64 data URL）
+                editor.chain().focus().setImage({ src: result.dataUrl }).run();
               } catch (error) {
                 console.error('插入图片失败:', error);
                 toast.error(`插入图片失败: ${error instanceof Error ? error.message : String(error)}`);

@@ -55,3 +55,22 @@ export interface ToolCallResponse {
     result: ToolResult;
 }
 
+// 消息内容块（用于按时间顺序排列文本和工具调用）
+export interface MessageContentBlock {
+    id: string;
+    type: 'text' | 'tool' | 'authorization';
+    timestamp: number;
+    content?: string; // 文本内容
+    toolCall?: ToolCall; // 工具调用
+    authorization?: AuthorizationRequest; // 授权请求
+    expanded?: boolean; // 是否展开（用于工具缩览）
+}
+
+// 授权请求
+export interface AuthorizationRequest {
+    id: string;
+    type: 'file_system' | 'network' | 'system';
+    operation: string;
+    details: Record<string, any>;
+}
+

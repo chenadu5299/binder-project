@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { PaperAirplaneIcon, ArrowPathIcon } from '@heroicons/react/24/outline';
+import { PaperAirplaneIcon, ArrowPathIcon, StopIcon } from '@heroicons/react/24/outline';
 import { useChatStore } from '../../stores/chatStore';
 import { useReferenceStore } from '../../stores/referenceStore';
 import { useFileStore } from '../../stores/fileStore';
@@ -36,7 +36,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId, pendingMode = 'agen
     const compositionEndTimeRef = useRef<number>(0); // 记录输入法结束的时间，用于判断回车是否用于确认输入
     const tab = tabId ? tabs.find(t => t.id === tabId) : null;
     const hasMessages = tab && tab.messages.length > 0;
-    const isStreaming = tab && tab.messages.some(m => m.isLoading);
+    const isStreaming = tab ? tab.messages.some(m => m.isLoading) : false;
     const references = tabId ? getReferences(tabId) : [];
     
     // 自动调整高度
@@ -394,48 +394,123 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId, pendingMode = 'agen
             }
         }
         
-        // 如果有文本和来源信息，创建文本引用
+        // 方法 4：检查是否是引用格式字符串（备用方案）
+        if (!sourceData && text) {
+            const { parseReferenceFormatString } = await import('../../utils/referenceHelpers');
+            const parsed = parseReferenceFormatString(text.trim());
+            if (parsed) {
+                console.log('🔍 检测到引用格式字符串，尝试解析:', parsed);
+                
+                // 尝试从文件树中查找文件路径
+                const { currentWorkspace, fileTree } = useFileStore.getState();
+                const { flattenFileTree } = await import('../../utils/fileTreeUtils');
+                const allFiles = flattenFileTree(fileTree);
+                const matchedFile = allFiles.find(f => f.name === parsed.fileName);
+                
+                if (matchedFile && currentWorkspace) {
+                    const filePath = matchedFile.path || `${currentWorkspace}/${parsed.fileName}`;
+                    if (parsed.type === 'table') {
+                        // 表格引用
+                        sourceData = JSON.stringify({
+                            filePath,
+                            fileName: parsed.fileName,
+                            type: 'table',
+                            sheetName: parsed.sheetName,
+                            cellRef: parsed.cellRef,
+                        });
+                    } else {
+                        // 文本引用
+                        sourceData = JSON.stringify({
+                            filePath,
+                            fileName: parsed.fileName,
+                            lineRange: { start: 1, end: 1 },
+                            charRange: { start: 0, end: 0 },
+                        });
+                    }
+                    console.log('✅ 从引用格式字符串解析出引用元数据');
+                } else {
+                    console.warn('⚠️ 无法找到文件:', parsed.fileName);
+                }
+            }
+        }
+        
+        // 如果有文本和来源信息，创建引用
         if (text && sourceData) {
             try {
                 e.preventDefault(); // 阻止默认粘贴行为，改为创建引用
                 
                 const source = JSON.parse(sourceData);
                 
-                // 使用辅助函数创建完整的 TextReference
-                const { createTextReferenceFromClipboard } = await import('../../utils/referenceHelpers');
-                const textRefBase = createTextReferenceFromClipboard(
-                    {
-                        filePath: source.filePath,
-                        fileName: source.fileName,
-                        lineRange: source.lineRange,
-                        charRange: source.charRange,
-                    },
-                    text
-                );
-                
-                const textRef: TextReference = {
-                    ...textRefBase,
-                    id: `ref-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-                    createdAt: Date.now(),
-                };
-                
-                console.log('✅ 创建文本引用:', {
-                    contentLength: text.length,
-                    sourceFile: source.filePath,
-                    lineRange: source.lineRange,
-                });
-                
-                if (tabId) {
-                    addReference(tabId, textRef);
+                // 判断是表格引用还是文本引用
+                if (source.type === 'table') {
+                    // 创建表格引用
+                    const { ReferenceType } = await import('../../types/reference');
+                    const tableRef: import('../../types/reference').TableReference = {
+                        id: `ref-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+                        type: ReferenceType.TABLE,
+                        createdAt: Date.now(),
+                        sourceFile: source.filePath,
+                        fileName: source.fileName || source.filePath.split('/').pop() || source.filePath.split('\\').pop() || '未命名文件',
+                        rowRange: source.rowIndex !== undefined ? { start: source.rowIndex + 1, end: source.rowIndex + 1 } : undefined,
+                        columnRange: source.colIndex !== undefined ? { start: source.colIndex + 1, end: source.colIndex + 1 } : undefined,
+                    };
+                    
+                    console.log('✅ 创建表格引用:', {
+                        sourceFile: source.filePath,
+                        cellRef: source.cellRef,
+                        sheetName: source.sheetName,
+                    });
+                    
+                    if (tabId) {
+                        addReference(tabId, tableRef);
+                    } else {
+                        // 如果没有标签页，先创建标签页再添加引用
+                        const newTabId = onCreateTab ? (() => {
+                            onCreateTab(pendingMode);
+                            return tabs[tabs.length - 1]?.id;
+                        })() : createTab(undefined, pendingMode);
+                        if (newTabId) {
+                            addReference(newTabId, tableRef);
+                            setActiveTab(newTabId);
+                        }
+                    }
                 } else {
-                    // 如果没有标签页，先创建标签页再添加引用
-                    const newTabId = onCreateTab ? (() => {
-                        onCreateTab(pendingMode);
-                        return tabs[tabs.length - 1]?.id;
-                    })() : createTab(undefined, pendingMode);
-                    if (newTabId) {
-                        addReference(newTabId, textRef);
-                        setActiveTab(newTabId);
+                    // 创建文本引用
+                    const { createTextReferenceFromClipboard } = await import('../../utils/referenceHelpers');
+                    const textRefBase = createTextReferenceFromClipboard(
+                        {
+                            filePath: source.filePath,
+                            fileName: source.fileName,
+                            lineRange: source.lineRange || { start: 1, end: 1 },
+                            charRange: source.charRange || { start: 0, end: text.length },
+                        },
+                        text
+                    );
+                    
+                    const textRef: TextReference = {
+                        ...textRefBase,
+                        id: `ref-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+                        createdAt: Date.now(),
+                    };
+                    
+                    console.log('✅ 创建文本引用:', {
+                        contentLength: text.length,
+                        sourceFile: source.filePath,
+                        lineRange: source.lineRange,
+                    });
+                    
+                    if (tabId) {
+                        addReference(tabId, textRef);
+                    } else {
+                        // 如果没有标签页，先创建标签页再添加引用
+                        const newTabId = onCreateTab ? (() => {
+                            onCreateTab(pendingMode);
+                            return tabs[tabs.length - 1]?.id;
+                        })() : createTab(undefined, pendingMode);
+                        if (newTabId) {
+                            addReference(newTabId, textRef);
+                            setActiveTab(newTabId);
+                        }
                     }
                 }
                 
@@ -683,6 +758,41 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId, pendingMode = 'agen
         await regenerate(tabId);
     };
     
+    // 处理停止AI回复
+    const handleStop = async () => {
+        if (!tabId || !isStreaming) return;
+        
+        try {
+            // ⚠️ 关键修复：立即更新消息的 isLoading 状态，让停止按钮立即消失
+            const { tabs, setMessageLoading } = useChatStore.getState();
+            const currentTab = tabs.find(t => t.id === tabId);
+            if (currentTab) {
+                // 找到所有正在加载的消息，立即设置为 false
+                currentTab.messages.forEach(msg => {
+                    if (msg.isLoading) {
+                        setMessageLoading(tabId, msg.id, false);
+                    }
+                });
+            }
+            
+            // 发送取消请求到后端
+            await invoke('ai_cancel_chat_stream', { tabId });
+            console.log('✅ 已发送停止请求并更新消息状态');
+        } catch (error) {
+            console.error('❌ 停止AI回复失败:', error);
+            // 即使后端调用失败，也要确保前端状态更新
+            const { tabs, setMessageLoading } = useChatStore.getState();
+            const currentTab = tabs.find(t => t.id === tabId);
+            if (currentTab) {
+                currentTab.messages.forEach(msg => {
+                    if (msg.isLoading) {
+                        setMessageLoading(tabId, msg.id, false);
+                    }
+                });
+            }
+        }
+    };
+    
     return (
         <div 
             ref={containerRef}
@@ -754,26 +864,48 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId, pendingMode = 'agen
                         max-h-32 overflow-y-auto
                     "
                 />
-                <button
-                    onClick={handleSend}
-                    disabled={!input.trim() || isStreaming}
-                    className="
-                        px-4 py-2 bg-blue-600 text-white rounded-lg
-                        hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed
-                        flex items-center gap-2 transition-colors
-                    "
-                >
-                    <PaperAirplaneIcon className="w-5 h-5" />
-                    <span>发送</span>
-                </button>
+                {isStreaming ? (
+                    // AI正在回复时，显示停止按钮
+                    <>
+                        <style>{`
+                            @keyframes stopIconFlicker {
+                                0%, 100% { opacity: 1; }
+                                50% { opacity: 0.6; }
+                            }
+                            .stop-icon-flicker {
+                                animation: stopIconFlicker 1.5s ease-in-out infinite;
+                            }
+                        `}</style>
+                        <button
+                            onClick={handleStop}
+                            className="
+                                relative px-4 py-2 bg-blue-600/70 text-white rounded-lg
+                                hover:bg-blue-600/80 active:bg-blue-600/90
+                                flex items-center gap-2 transition-all duration-200
+                                cursor-pointer backdrop-blur-sm
+                                active:scale-95
+                            "
+                        >
+                            <StopIcon className="w-5 h-5 stop-icon-flicker" />
+                            <span>停止</span>
+                        </button>
+                    </>
+                ) : (
+                    // AI未回复时，显示发送按钮
+                    <button
+                        onClick={handleSend}
+                        disabled={!input.trim()}
+                        className="
+                            relative px-4 py-2 bg-blue-600 text-white rounded-lg
+                            hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed
+                            flex items-center gap-2 transition-colors
+                        "
+                    >
+                        <PaperAirplaneIcon className="w-5 h-5" />
+                        <span>发送</span>
+                    </button>
+                )}
             </div>
-            
-            {isStreaming && (
-                <div className="mt-2 text-xs text-gray-500 dark:text-gray-400 flex items-center gap-1">
-                    <div className="w-2 h-2 bg-blue-500 rounded-full animate-pulse"></div>
-                    <span>AI 正在思考...</span>
-                </div>
-            )}
         </div>
     );
 };

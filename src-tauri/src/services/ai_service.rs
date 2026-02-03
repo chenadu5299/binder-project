@@ -28,23 +28,43 @@ impl AIService {
         let providers = Arc::new(Mutex::new(providers));
         
         // 尝试加载 OpenAI API 密钥并注册提供商
-        if let Ok(api_key) = key_manager.get_key("openai") {
-            let openai_provider = Arc::new(
-                crate::services::ai_providers::OpenAIProvider::new(api_key)
-            );
-            if let Ok(mut providers) = providers.lock() {
-                providers.insert("openai".to_string(), openai_provider);
+        match key_manager.get_key("openai") {
+            Ok(api_key) => {
+                eprintln!("✅ 成功加载 OpenAI API key");
+                let openai_provider = Arc::new(
+                    crate::services::ai_providers::OpenAIProvider::new(api_key)
+                );
+                if let Ok(mut providers) = providers.lock() {
+                    providers.insert("openai".to_string(), openai_provider);
+                    eprintln!("✅ OpenAI 提供商已注册");
+                }
+            }
+            Err(e) => {
+                eprintln!("⚠️ 未找到 OpenAI API key: {}", e);
             }
         }
         
         // 尝试加载 DeepSeek API 密钥并注册提供商
-        if let Ok(api_key) = key_manager.get_key("deepseek") {
-            let deepseek_provider = Arc::new(
-                crate::services::ai_providers::DeepSeekProvider::new(api_key)
-            );
-            if let Ok(mut providers) = providers.lock() {
-                providers.insert("deepseek".to_string(), deepseek_provider);
+        match key_manager.get_key("deepseek") {
+            Ok(api_key) => {
+                eprintln!("✅ 成功加载 DeepSeek API key");
+                let deepseek_provider = Arc::new(
+                    crate::services::ai_providers::DeepSeekProvider::new(api_key)
+                );
+                if let Ok(mut providers) = providers.lock() {
+                    providers.insert("deepseek".to_string(), deepseek_provider);
+                    eprintln!("✅ DeepSeek 提供商已注册");
+                }
             }
+            Err(e) => {
+                eprintln!("⚠️ 未找到 DeepSeek API key: {}", e);
+            }
+        }
+        
+        // 检查已注册的提供商
+        if let Ok(providers_guard) = providers.lock() {
+            let provider_names: Vec<String> = providers_guard.keys().cloned().collect();
+            eprintln!("📋 已注册的 AI 提供商: {:?}", provider_names);
         }
         
         Ok(Self {

@@ -166,12 +166,27 @@
 .inline-chat-input-editor {
     position: relative;
     line-height: 1.5;
+    white-space: pre-wrap; /* 允许内容换行 */
+    word-wrap: break-word; /* 长单词自动换行 */
+    overflow-wrap: break-word; /* 兼容性 */
+    overflow-y: auto; /* 内容超出时显示滚动条 */
+    overflow-x: hidden; /* 隐藏横向滚动 */
 }
 
+/* Placeholder 样式：不换行，超出部分隐藏 */
 .inline-chat-input-editor:empty::before {
     content: attr(data-placeholder);
     color: #9ca3af;
     pointer-events: none;
+    white-space: nowrap; /* placeholder 不换行 */
+    overflow: hidden; /* 超出部分隐藏 */
+    text-overflow: ellipsis; /* 超出部分显示省略号 */
+    display: block;
+    width: 100%;
+    position: absolute;
+    top: 50%;
+    transform: translateY(-50%);
+    padding: 0 16px; /* 与输入框内边距一致 */
 }
 
 .inline-reference-tag {

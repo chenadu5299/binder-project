@@ -6,14 +6,23 @@ import { ChatTabs } from './ChatTabs';
 import { ChatMessages } from './ChatMessages';
 import { InlineChatInput } from './InlineChatInput';
 import { ModelSelector } from './ModelSelector';
-import MemoryTab from '../Memory/MemoryTab';
-import SearchPanel from '../Search/SearchPanel';
-import { PlusIcon, BookOpenIcon, MagnifyingGlassIcon } from '@heroicons/react/24/outline';
+import { PlusIcon } from '@heroicons/react/24/outline';
 import { parseToolCalls, removeToolCalls } from '../../utils/toolCallParser';
-import { ToolCall } from '../../types/tool';
+import { ToolCall, MessageContentBlock } from '../../types/tool';
 import { aggressiveJSONRepair } from '../../utils/jsonRepair';
+import { buildContentBlocks } from '../../utils/contentBlockBuilder';
+import { useFileStore } from '../../stores/fileStore';
+import { useEditorStore } from '../../stores/editorStore';
+import { needsAuthorization } from '../../utils/toolDescription';
 
-type TabType = 'chat' | 'memory' | 'search';
+/** 计算累积文本末尾与 chunk 开头的最大重叠长度，用于流式去重（避免「我我理解理解」式重复） */
+function getOverlapLength(accumulated: string, chunk: string): number {
+    const maxLen = Math.min(accumulated.length, chunk.length);
+    for (let len = maxLen; len > 0; len--) {
+        if (accumulated.slice(-len) === chunk.slice(0, len)) return len;
+    }
+    return 0;
+}
 
 interface ChatPanelProps {
     isFullscreen?: boolean; // 是否为全屏模式（无工作区时）
@@ -22,7 +31,7 @@ interface ChatPanelProps {
 const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
     const { chat, setChatVisible } = useLayoutStore();
     const { tabs, activeTabId, createTab, setActiveTab } = useChatStore();
-    const [activeSubTab, setActiveSubTab] = useState<TabType>('chat');
+    const { currentWorkspace } = useFileStore();
     // 待创建标签页的模式（用于没有标签页时的模式选择）
     const [pendingMode, setPendingMode] = useState<'agent' | 'chat'>('agent');
     
@@ -30,16 +39,10 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
     // 用于跟踪每个 tab 的累积文本，防止重复追加
     // 按照文档实现：前端累积文本用于二次去重防护
     const accumulatedTextRef = useRef<Map<string, string>>(new Map());
-
-    // 暴露切换标签页的方法给外部使用（用于跳转功能）
-    useEffect(() => {
-        (window as any).switchToMemoryTab = () => {
-            setActiveSubTab('memory');
-        };
-        return () => {
-            delete (window as any).switchToMemoryTab;
-        };
-    }, []);
+    
+    // 内容块构建：跟踪每个消息的文本块和工具调用
+    const textChunksRef = useRef<Map<string, Array<{ content: string; timestamp: number }>>>(new Map());
+    const toolCallsRef = useRef<Map<string, ToolCall[]>>(new Map());
 
     // 移除自动创建标签页的逻辑，用户需要手动创建或通过输入触发创建
 
@@ -95,7 +98,7 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                         has_tool_call: !!payload.tool_call
                     });
                     
-                    const { tabs, appendToMessage, updateMessage, setMessageLoading, addToolCall, updateToolCall } = useChatStore.getState();
+                    const { tabs, appendToMessage, updateMessage, setMessageLoading, addToolCall, updateToolCall, addContentBlock, updateContentBlock } = useChatStore.getState();
                     const tab = tabs.find(t => t.id === payload.tab_id);
                     if (!tab) {
                         // ⚠️ 关键修复：如果找不到 tab，可能是 tab 被删除了，或者 tab_id 不匹配
@@ -126,22 +129,36 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                         return;
                     }
                     
-                    if (payload.error) {
-                        // 错误处理
-                        console.error('❌ 聊天流式响应错误:', payload.error);
-                        if (lastMessage) {
-                            updateMessage(payload.tab_id, lastMessage.id, 
-                                lastMessage.content + '\n\n[错误: ' + payload.error + ']');
-                            setMessageLoading(payload.tab_id, lastMessage.id, false);
-                        }
-                        return;
-                    }
-                    
+                    // ⚠️ 关键修复：先检查 done，再检查 error
+                    // 因为取消时会同时有 done: true 和 error
                     if (payload.done) {
-                        // 完成
-                        console.log('✅ 聊天流式响应完成');
+                        // 完成（包括正常完成和取消）
+                        const isCancelled = payload.error && payload.error.includes('取消');
+                        console.log('✅ 聊天流式响应完成', isCancelled ? '(已取消)' : '');
                         if (lastMessage) {
-                            setMessageLoading(payload.tab_id, lastMessage.id, false);
+                            // ⚠️ 关键修复：无论是否取消，都要更新 isLoading 状态
+                            // 同时更新所有正在加载的消息（防止遗漏）
+                            const { tabs: tabsForUpdate } = useChatStore.getState();
+                            const tabForUpdate = tabsForUpdate.find(t => t.id === payload.tab_id);
+                            if (tabForUpdate) {
+                                // 更新所有正在加载的消息状态
+                                tabForUpdate.messages.forEach(msg => {
+                                    if (msg.isLoading) {
+                                        setMessageLoading(payload.tab_id, msg.id, false);
+                                    }
+                                });
+                            } else {
+                                // 如果找不到 tab，至少更新最后一条消息
+                                setMessageLoading(payload.tab_id, lastMessage.id, false);
+                            }
+                            
+                            // 如果是取消，更新消息内容
+                            if (isCancelled) {
+                                if (lastMessage.content && !lastMessage.content.includes('[已取消]')) {
+                                    updateMessage(payload.tab_id, lastMessage.id, 
+                                        lastMessage.content + '\n\n[已取消]');
+                                }
+                            }
                             
                             // 按照文档：流式响应完成，同步累积文本
                             const tabId = payload.tab_id;
@@ -151,7 +168,94 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                             if (accumulated && lastMessage.content !== accumulated) {
                                 updateMessage(payload.tab_id, lastMessage.id, accumulated);
                             }
+                            
+                            // ⚠️ 关键修复：如果消息包含工具调用，AI可能会继续对话
+                            // 在继续对话时，应该保留累积文本用于去重，但不要清理
+                            // 因为继续对话时，AI可能会重复输出之前的内容
+                            // 累积文本应该保留，直到消息真正完成（不再有工具调用）
+                            
+                            // 检查并补充缺失的内容块
+                            // 如果已经有 contentBlocks，说明已经实时构建了，只需要确保完整性
+                            const { tabs: currentTabs } = useChatStore.getState();
+                            const currentTab = currentTabs.find(t => t.id === tabId);
+                            const currentMessage = currentTab?.messages.find(m => m.id === messageId);
+                            
+                            if (currentMessage) {
+                                // 如果已经有内容块，确保所有文本和工具调用都已包含
+                                if (currentMessage.contentBlocks && currentMessage.contentBlocks.length > 0) {
+                                    // 已经有内容块，检查是否有遗漏的文本
+                                    const hasTextBlock = currentMessage.contentBlocks.some(b => b.type === 'text');
+                                    if (!hasTextBlock && accumulated) {
+                                        // 有累积文本但没有文本块，添加它
+                                        const textBlock: MessageContentBlock = {
+                                            id: `text-${currentMessage.timestamp}`,
+                                            type: 'text',
+                                            timestamp: currentMessage.timestamp,
+                                            content: accumulated,
+                                        };
+                                        addContentBlock(tabId, messageId, textBlock);
+                                    }
+                                } else {
+                                    // 没有内容块，需要构建
+                                    const textChunks = textChunksRef.current.get(cacheKey) || [];
+                                    const toolCalls = toolCallsRef.current.get(cacheKey) || [];
+                                    
+                                    if (textChunks.length > 0 || toolCalls.length > 0 || accumulated) {
+                                        // 如果有累积文本但不在 textChunks 中，添加它
+                                        const finalTextChunks = [...textChunks];
+                                        if (accumulated && textChunks.length === 0) {
+                                            finalTextChunks.push({
+                                                content: accumulated,
+                                                timestamp: currentMessage.timestamp,
+                                            });
+                                        }
+                                        
+                                        const contentBlocks = buildContentBlocks(
+                                            finalTextChunks,
+                                            toolCalls,
+                                            currentWorkspace || undefined
+                                        );
+                                        
+                                        // 添加所有内容块
+                                        contentBlocks.forEach(block => {
+                                            addContentBlock(tabId, messageId, block);
+                                        });
+                                    }
+                                }
+                            }
+                            
+                            // 清理临时数据（延迟清理，确保内容块已构建）
+                            setTimeout(() => {
+                                textChunksRef.current.delete(cacheKey);
+                                toolCallsRef.current.delete(cacheKey);
+                            }, 1000);
                         }
+                        return;
+                    }
+
+                    // ⚠️ 关键修复：处理仅有 error 但没有 done 的情况（例如后端连接中断/超时）
+                    if (payload.error && !payload.done) {
+                        console.warn('⚠️ 聊天流式响应出现错误（未收到 done）:', payload.error);
+
+                        // 将当前标签页下所有正在加载的消息置为非加载状态，避免按钮卡在“停止”
+                        const { tabs: tabsForError } = useChatStore.getState();
+                        const tabForError = tabsForError.find(t => t.id === payload.tab_id);
+                        if (tabForError) {
+                            tabForError.messages.forEach(msg => {
+                                if (msg.isLoading) {
+                                    setMessageLoading(payload.tab_id, msg.id, false);
+                                }
+                            });
+                        } else {
+                            // 找不到 tab 时，至少更新最后一条消息
+                            setMessageLoading(payload.tab_id, lastMessage.id, false);
+                        }
+
+                        // 附加错误提示（避免重复追加）
+                        if (lastMessage.content && !lastMessage.content.includes('[已取消]') && !lastMessage.content.includes('[错误]')) {
+                            updateMessage(payload.tab_id, lastMessage.id, `${lastMessage.content}\n\n[错误] ${payload.error}`);
+                        }
+
                         return;
                     }
                     
@@ -237,19 +341,72 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                             
                             // 添加工具调用到消息
                             if (lastMessage) {
+                                const tabId = payload.tab_id;
+                                const messageId = lastMessage.id;
+                                const cacheKey = `${tabId}:${messageId}`;
+                                
                                 // 检查是否已存在该工具调用
                                 const existingToolCall = lastMessage.toolCalls?.find(tc => tc.id === toolCallObj.id);
                                 if (existingToolCall) {
                                     // 更新现有工具调用
-                                    updateToolCall(payload.tab_id, lastMessage.id, toolCallObj.id, {
+                                    updateToolCall(tabId, messageId, toolCallObj.id, {
                                         arguments: parsedArguments,
                                         status: toolCallStatus,
                                         result: toolCall.result,
                                         error: toolCall.error,
                                     });
+                                    
+                                    // 更新工具调用引用
+                                    const toolCalls = toolCallsRef.current.get(cacheKey) || [];
+                                    const index = toolCalls.findIndex(tc => tc.id === toolCallObj.id);
+                                    if (index >= 0) {
+                                        toolCalls[index] = { ...toolCalls[index], ...toolCallObj };
+                                    } else {
+                                        toolCalls.push(toolCallObj);
+                                    }
+                                    toolCallsRef.current.set(cacheKey, toolCalls);
+                                    
+                                    // 更新内容块中的工具调用
+                                    const { tabs: currentTabs } = useChatStore.getState();
+                                    const currentTab = currentTabs.find(t => t.id === tabId);
+                                    const currentMessage = currentTab?.messages.find(m => m.id === messageId);
+                                    if (currentMessage?.contentBlocks) {
+                                        const blockIndex = currentMessage.contentBlocks.findIndex(b => 
+                                            (b.type === 'tool' || b.type === 'authorization') && b.toolCall?.id === toolCallObj.id
+                                        );
+                                        if (blockIndex >= 0) {
+                                            updateContentBlock(tabId, messageId, currentMessage.contentBlocks[blockIndex].id, {
+                                                toolCall: toolCallObj,
+                                            });
+                                        }
+                                    }
                                 } else {
                                     // 添加新工具调用
-                                    addToolCall(payload.tab_id, lastMessage.id, toolCallObj);
+                                    addToolCall(tabId, messageId, toolCallObj);
+                                    
+                                    // 添加到工具调用引用
+                                    const toolCalls = toolCallsRef.current.get(cacheKey) || [];
+                                    toolCalls.push(toolCallObj);
+                                    toolCallsRef.current.set(cacheKey, toolCalls);
+                                    
+                                    // 实时添加工具调用内容块
+                                    const needsAuth = needsAuthorization(toolCallObj.name, toolCallObj.arguments, currentWorkspace || undefined);
+                                    
+                                    const contentBlock: MessageContentBlock = {
+                                        id: toolCallObj.id,
+                                        type: needsAuth ? 'authorization' : 'tool',
+                                        timestamp: toolCallObj.timestamp,
+                                        toolCall: toolCallObj,
+                                        ...(needsAuth && {
+                                            authorization: {
+                                                id: toolCallObj.id,
+                                                type: 'file_system', // 可以根据工具类型判断
+                                                operation: toolCallObj.name,
+                                                details: toolCallObj.arguments,
+                                            },
+                                        }),
+                                    };
+                                    addContentBlock(tabId, messageId, contentBlock);
                                 }
                                 
                                 // 差异化确认逻辑：只有 edit_current_editor_document 需要确认
@@ -263,13 +420,75 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                                     // 实际执行由后端完成，前端只需要等待结果
                                 }
                                 
-                                // 如果有结果或错误，更新工具调用状态
+                                // ⚠️ 关键修复：如果有结果或错误，更新工具调用状态
+                                // 注意：updateToolCall 现在会同时更新 toolCalls 和 contentBlocks
                                 if (toolCall.result) {
+                                    console.log('✅ [前端] 更新工具调用结果:', {
+                                        toolCallId: toolCallObj.id,
+                                        hasResult: !!toolCall.result,
+                                        result: toolCall.result,
+                                    });
                                     updateToolCall(payload.tab_id, lastMessage.id, toolCallObj.id, {
                                         status: 'completed',
                                         result: toolCall.result,
                                     });
+                                    // AI 通过 create_file/update_file 创建或更新文件时，立即记录元数据（便于从文件树打开时进入编辑模式）
+                                    if (
+                                        (toolCallObj.name === 'create_file' || toolCallObj.name === 'update_file') &&
+                                        toolCall.result?.success &&
+                                        currentWorkspace
+                                    ) {
+                                        const rawData = toolCall.result.data;
+                                        let pathForRecord: string | undefined;
+                                        if (typeof rawData === 'object' && rawData !== null && typeof rawData.path === 'string') {
+                                            pathForRecord = rawData.path;
+                                        } else if (typeof rawData === 'string') {
+                                            try {
+                                                pathForRecord = JSON.parse(rawData)?.path;
+                                            } catch {
+                                                pathForRecord = undefined;
+                                            }
+                                        }
+                                        if (pathForRecord) {
+                                            (async () => {
+                                                try {
+                                                    const { recordBinderFile } = await import('../../services/fileMetadataService');
+                                                    const { normalizePath, normalizeWorkspacePath, getAbsolutePath } = await import('../../utils/pathUtils');
+                                                    const normalizedPath = normalizePath(pathForRecord!);
+                                                    const normalizedWorkspacePath = normalizeWorkspacePath(currentWorkspace);
+                                                    const filePath = getAbsolutePath(normalizedPath, normalizedWorkspacePath);
+                                                    await recordBinderFile(filePath, 'ai_generated', normalizedWorkspacePath, 3);
+                                                    console.log('[ChatPanel] AI 创建/更新文件已记录元数据，从文件树打开将进入编辑:', pathForRecord);
+                                                } catch (e) {
+                                                    console.warn('[ChatPanel] 记录 AI 文件元数据失败:', e);
+                                                }
+                                            })();
+                                        }
+                                    }
+                                    // 文档编辑工具：收到结果时同步到编辑器 store，使编辑器内也能显示 diff 高亮
+                                    if (toolCallObj.name === 'edit_current_editor_document' && toolCall.result?.success) {
+                                        const resultData = typeof toolCall.result?.data === 'object' && toolCall.result?.data != null
+                                            ? toolCall.result.data
+                                            : typeof toolCall.result?.data === 'string'
+                                                ? (() => { try { return JSON.parse(toolCall.result.data); } catch { return {}; } })()
+                                                : toolCall.result;
+                                        const diffAreaId = resultData.diff_area_id || '';
+                                        const diffs = resultData.diffs || [];
+                                        const oldContent = resultData.old_content ?? resultData.oldContent ?? '';
+                                        const newContent = resultData.new_content ?? resultData.newContent ?? '';
+                                        if (diffAreaId && Array.isArray(diffs) && diffs.length > 0 && oldContent !== undefined && newContent !== undefined) {
+                                            const { getActiveTab, setTabDiff } = useEditorStore.getState();
+                                            const activeTab = getActiveTab();
+                                            if (activeTab) {
+                                                setTabDiff(activeTab.id, diffAreaId, diffs, oldContent, newContent);
+                                            }
+                                        }
+                                    }
                                 } else if (toolCall.error) {
+                                    console.log('❌ [前端] 更新工具调用错误:', {
+                                        toolCallId: toolCallObj.id,
+                                        error: toolCall.error,
+                                    });
                                     updateToolCall(payload.tab_id, lastMessage.id, toolCallObj.id, {
                                         status: 'failed',
                                         error: toolCall.error,
@@ -282,7 +501,18 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                     }
                     
                     // 追加内容（只有在没有工具调用事件时才处理 chunk）
-                    if (!payload.tool_call && lastMessage && lastMessage.role === 'assistant' && lastMessage.isLoading !== false) {
+                    // ⚠️ 关键修复：检查消息是否仍在加载中，如果已经停止加载（用户点击了停止），不再追加内容
+                    if (!payload.tool_call && lastMessage && lastMessage.role === 'assistant') {
+                        // 重新获取最新状态，检查消息是否仍在加载
+                        const { tabs: latestTabs } = useChatStore.getState();
+                        const latestTab = latestTabs.find(t => t.id === payload.tab_id);
+                        const latestMessage = latestTab?.messages.find(m => m.id === lastMessage.id);
+                        
+                        // 如果消息已经停止加载（用户点击了停止），不再追加内容
+                        if (latestMessage && latestMessage.isLoading === false) {
+                            console.log('⚠️ 消息已停止加载，跳过 chunk 处理');
+                            return;
+                        }
                         // 关键修复：确保 chunk 不为空
                         if (!chunk || chunk.length === 0) {
                             return;
@@ -294,29 +524,158 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                         const cacheKey = `${tabId}:${messageId}`;
                         const accumulated = accumulatedTextRef.current.get(cacheKey) || '';
                         
-                        // 检查是否重复
-                        if (accumulated.endsWith(chunk)) {
-                            console.warn('⚠️ [前端] 检测到重复 chunk，跳过:', 
-                                chunk.length > 50 ? chunk.substring(0, 50) + '...' : chunk);
-                            return;
+                        // 检查是否重复（优化：只检查真正的重复，避免误判正常文本）
+                        const chunkLength = chunk.length;
+                        if (chunkLength > 0) {
+                            // 检查1：chunk是否完全等于累积文本的末尾（这是真正的重复）
+                            if (accumulated.endsWith(chunk)) {
+                                // 只在开发环境显示警告，避免日志过多
+                                if (process.env.NODE_ENV === 'development') {
+                                    console.warn('⚠️ [前端] 检测到重复 chunk（完全重复），跳过:', 
+                                        chunk.length > 50 ? chunk.substring(0, 50) + '...' : chunk);
+                                }
+                                return;
+                            }
+                            
+                            // 检查2：对于短文本（<=3个字符），只检查是否在最后10个字符内重复出现
+                            // 这样可以避免误判正常的标点符号或短词重复
+                            if (chunkLength <= 3) {
+                                const lastPart = accumulated.slice(-Math.min(10, accumulated.length));
+                                // 如果短文本在最后部分出现了3次或更多，才认为是重复
+                                const occurrences = (lastPart.match(new RegExp(chunk.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length;
+                                if (occurrences >= 3) {
+                                    if (process.env.NODE_ENV === 'development') {
+                                        console.warn('⚠️ [前端] 检测到重复 chunk（短文本重复），跳过:', 
+                                            chunk.length > 50 ? chunk.substring(0, 50) + '...' : chunk);
+                                    }
+                                    return;
+                                }
+                            } else {
+                                // ⚠️ 关键修复：对于长文本，检查是否在最后部分重复出现（防止部分重复）
+                                // 只检查最后 chunkLength * 3 的范围（从5改为3，更严格），避免误判
+                                const checkLength = Math.min(chunkLength * 3, Math.max(20, accumulated.length * 0.1));
+                                if (checkLength > 0) {
+                                    const lastPart = accumulated.slice(-checkLength);
+                                    // ⚠️ 关键修复：如果chunk在最后部分出现了2次或更多（从3改为2，更严格），才认为是重复
+                                    const occurrences = (lastPart.match(new RegExp(chunk.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length;
+                                    if (occurrences >= 2) {
+                                        if (process.env.NODE_ENV === 'development') {
+                                            console.warn('⚠️ [前端] 检测到重复 chunk（部分重复），跳过:', 
+                                                chunk.length > 50 ? chunk.substring(0, 50) + '...' : chunk);
+                                        }
+                                        return;
+                                    }
+                                }
+                            }
+                            
+                            // 移除检查3（历史重复检查），因为正常文本中词或短语重复出现是正常的
+                            // 只保留完全重复和频繁重复的检查
                         }
                         
-                        // 更新累积文本
-                        accumulatedTextRef.current.set(cacheKey, accumulated + chunk);
+                        // 检查是否包含工具调用（XML 格式），确定「展示用文本」
+                        const parsedToolCalls = parseToolCalls(chunk);
+                        const displayText = parsedToolCalls.length > 0 ? removeToolCalls(chunk) : chunk;
+                        // 重叠去重：若展示用文本开头与累积文本末尾重叠，只追加非重叠部分（解决「我我理解理解」式重复）
+                        const overlapLen = getOverlapLength(accumulated, displayText);
+                        const toAppend = overlapLen > 0 ? displayText.slice(overlapLen) : displayText;
+                        const newAccumulated = accumulated + toAppend;
                         
-                        // 检查是否包含工具调用（XML 格式）
-                        const toolCalls = parseToolCalls(chunk);
-                        if (toolCalls.length > 0) {
-                            toolCalls.forEach(toolCall => {
+                        accumulatedTextRef.current.set(cacheKey, newAccumulated);
+                        if (toAppend.length === 0) return;
+                        
+                        if (parsedToolCalls.length > 0) {
+                            parsedToolCalls.forEach(toolCall => {
                                 addToolCall(payload.tab_id, lastMessage.id, toolCall);
                             });
-                            const cleanChunk = removeToolCalls(chunk);
-                            if (cleanChunk && cleanChunk.length > 0) {
-                                appendToMessage(payload.tab_id, lastMessage.id, cleanChunk);
+                            appendToMessage(payload.tab_id, lastMessage.id, toAppend);
+                            const textChunks = textChunksRef.current.get(cacheKey) || [];
+                            const chunkTimestamp = Date.now();
+                            textChunks.push({ content: toAppend, timestamp: chunkTimestamp });
+                            textChunksRef.current.set(cacheKey, textChunks);
+                            const { tabs: currentTabs } = useChatStore.getState();
+                            const currentTab = currentTabs.find(t => t.id === payload.tab_id);
+                            const currentMessage = currentTab?.messages.find(m => m.id === lastMessage.id);
+                            if (currentMessage?.contentBlocks) {
+                                const sortedBlocks = [...currentMessage.contentBlocks].sort((a, b) => a.timestamp - b.timestamp);
+                                const lastTextBlock = [...sortedBlocks].reverse().find(b => b.type === 'text');
+                                if (lastTextBlock) {
+                                    const timeDiff = chunkTimestamp - lastTextBlock.timestamp;
+                                    if (timeDiff < 1000) {
+                                        updateContentBlock(payload.tab_id, lastMessage.id, lastTextBlock.id, {
+                                            content: (lastTextBlock.content || '') + toAppend,
+                                        });
+                                    } else {
+                                        const textBlock: MessageContentBlock = {
+                                            id: `text-${chunkTimestamp}`,
+                                            type: 'text',
+                                            timestamp: chunkTimestamp,
+                                            content: toAppend,
+                                        };
+                                        addContentBlock(payload.tab_id, lastMessage.id, textBlock);
+                                    }
+                                } else {
+                                    const textBlock: MessageContentBlock = {
+                                        id: `text-${chunkTimestamp}`,
+                                        type: 'text',
+                                        timestamp: chunkTimestamp,
+                                        content: toAppend,
+                                    };
+                                    addContentBlock(payload.tab_id, lastMessage.id, textBlock);
+                                }
+                            } else {
+                                const textBlock: MessageContentBlock = {
+                                    id: `text-${chunkTimestamp}`,
+                                    type: 'text',
+                                    timestamp: chunkTimestamp,
+                                    content: toAppend,
+                                };
+                                addContentBlock(payload.tab_id, lastMessage.id, textBlock);
                             }
                         } else {
-                            // 追加文本
-                            appendToMessage(payload.tab_id, lastMessage.id, chunk);
+                            appendToMessage(payload.tab_id, lastMessage.id, toAppend);
+                            const textChunks = textChunksRef.current.get(cacheKey) || [];
+                            const chunkTimestamp = Date.now();
+                            textChunks.push({ content: toAppend, timestamp: chunkTimestamp });
+                            textChunksRef.current.set(cacheKey, textChunks);
+                            const { tabs: currentTabs } = useChatStore.getState();
+                            const currentTab = currentTabs.find(t => t.id === payload.tab_id);
+                            const currentMessage = currentTab?.messages.find(m => m.id === lastMessage.id);
+                            if (currentMessage?.contentBlocks) {
+                                const sortedBlocks = [...currentMessage.contentBlocks].sort((a, b) => a.timestamp - b.timestamp);
+                                const lastTextBlock = [...sortedBlocks].reverse().find(b => b.type === 'text');
+                                if (lastTextBlock) {
+                                    const timeDiff = chunkTimestamp - lastTextBlock.timestamp;
+                                    if (timeDiff < 1000) {
+                                        updateContentBlock(payload.tab_id, lastMessage.id, lastTextBlock.id, {
+                                            content: (lastTextBlock.content || '') + toAppend,
+                                        });
+                                    } else {
+                                        const textBlock: MessageContentBlock = {
+                                            id: `text-${chunkTimestamp}`,
+                                            type: 'text',
+                                            timestamp: chunkTimestamp,
+                                            content: toAppend,
+                                        };
+                                        addContentBlock(payload.tab_id, lastMessage.id, textBlock);
+                                    }
+                                } else {
+                                    const textBlock: MessageContentBlock = {
+                                        id: `text-${chunkTimestamp}`,
+                                        type: 'text',
+                                        timestamp: chunkTimestamp,
+                                        content: toAppend,
+                                    };
+                                    addContentBlock(payload.tab_id, lastMessage.id, textBlock);
+                                }
+                            } else {
+                                const textBlock: MessageContentBlock = {
+                                    id: `text-${chunkTimestamp}`,
+                                    type: 'text',
+                                    timestamp: chunkTimestamp,
+                                    content: toAppend,
+                                };
+                                addContentBlock(payload.tab_id, lastMessage.id, textBlock);
+                            }
                         }
                     }
                 });
@@ -388,80 +747,48 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
             className={`h-full flex flex-col bg-white dark:bg-gray-800 relative ${
                 isFullscreen 
                     ? 'w-full' // 全屏模式：占据整个宽度
-                    : 'w-96 border-l border-gray-200 dark:border-gray-700 flex-shrink-0' // 正常模式：固定宽度
+                    : 'w-full border-l border-gray-200 dark:border-gray-700 flex-shrink-0' // 正常模式：使用父容器宽度（由 MainLayout 控制）
             }`}
             style={{ 
                 paddingRight: '2px', // 确保右侧内容不被遮挡
             }}
         >
-            {/* 标题栏和标签切换 */}
-            <div className="border-b border-gray-200 dark:border-gray-700">
-                {/* 标签切换栏 */}
-                <div className="flex border-b border-gray-200 dark:border-gray-700">
-                    <button
-                        onClick={() => setActiveSubTab('chat')}
-                        className={`flex-1 px-4 py-2 text-sm font-medium transition-colors ${
-                            activeSubTab === 'chat'
-                                ? 'bg-blue-50 dark:bg-blue-900/20 text-blue-600 dark:text-blue-400 border-b-2 border-blue-500'
-                                : 'text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-700'
-                        }`}
-                    >
-                        AI 聊天
-                    </button>
-                    <button
-                        onClick={() => setActiveSubTab('memory')}
-                        className={`flex-1 px-4 py-2 text-sm font-medium transition-colors ${
-                            activeSubTab === 'memory'
-                                ? 'bg-blue-50 dark:bg-blue-900/20 text-blue-600 dark:text-blue-400 border-b-2 border-blue-500'
-                                : 'text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-700'
-                        }`}
-                    >
-                        <BookOpenIcon className="w-4 h-4 inline-block mr-1" />
-                        记忆库
-                    </button>
-                    <button
-                        onClick={() => setActiveSubTab('search')}
-                        className={`flex-1 px-4 py-2 text-sm font-medium transition-colors ${
-                            activeSubTab === 'search'
-                                ? 'bg-blue-50 dark:bg-blue-900/20 text-blue-600 dark:text-blue-400 border-b-2 border-blue-500'
-                                : 'text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-700'
-                        }`}
-                    >
-                        <MagnifyingGlassIcon className="w-4 h-4 inline-block mr-1" />
-                        搜索
-                    </button>
-                </div>
-
-                {/* 聊天标签栏（仅聊天模式显示） */}
-                {activeSubTab === 'chat' && (
-                    <div className="flex justify-between items-center p-3">
-                        <h2 className="text-lg font-semibold">AI 聊天</h2>
-                        <div className="flex items-center gap-2">
-                            {activeTab && <ModelSelector tabId={activeTab.id} />}
-                            <button
-                                onClick={handleNewChat}
-                                className="p-1.5 text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 rounded hover:bg-gray-100 dark:hover:bg-gray-700"
-                                title="新建对话"
-                            >
-                                <PlusIcon className="w-5 h-5" />
-                            </button>
-                            <button
-                                onClick={handleToggle}
-                                className="p-1.5 text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 rounded hover:bg-gray-100 dark:hover:bg-gray-700"
-                                title="关闭面板"
-                            >
-                                ✕
-                            </button>
-                        </div>
+            {/* 标签栏和功能按钮（合并到标题栏位置） */}
+            <div className="border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800 flex-shrink-0">
+                <div className="flex items-center">
+                    {/* 左侧：聊天标签区域（可滚动） */}
+                    <div className="flex-1 min-w-0 overflow-hidden">
+                        {tabs.length > 0 ? (
+                            <ChatTabs />
+                        ) : (
+                            <div className="px-3 py-2 text-sm text-gray-500 dark:text-gray-400">
+                                暂无对话
+                            </div>
+                        )}
                     </div>
-                )}
+                    
+                    {/* 右侧：功能按钮区域（固定宽度，不受标签影响） */}
+                    <div className="flex items-center gap-2 px-3 py-2 flex-shrink-0 border-l border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800">
+                        <button
+                            onClick={handleNewChat}
+                            className="p-1.5 text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+                            title="新建对话"
+                        >
+                            <PlusIcon className="w-4 h-4" />
+                        </button>
+                        <button
+                            onClick={handleToggle}
+                            className="p-1.5 text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+                            title="关闭面板"
+                        >
+                            ✕
+                        </button>
+                    </div>
+                </div>
             </div>
             
             {/* 内容区域 */}
-            {activeSubTab === 'chat' && (
-                <>
-                    {/* 聊天标签栏 */}
-                    {tabs.length > 0 && <ChatTabs />}
+            <>
                     
                     {/* 模式切换按钮（始终显示，未创建标签页时使用 pendingMode） */}
                     <div className="px-3 py-2 border-b border-gray-200 dark:border-gray-700 flex items-center justify-between">
@@ -521,6 +848,14 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                                 可以调用工具
                             </span>
                         )}
+                        {/* 隐晦的工作状态提示：在标题栏显示小图标 */}
+                        {activeTab && activeTab.messages.some(m => m.isLoading) && (
+                            <div className="flex items-center gap-1.5 ml-auto">
+                                <div className="relative w-1.5 h-1.5">
+                                    <div className="absolute inset-0 bg-blue-500 rounded-full animate-pulse"></div>
+                                </div>
+                            </div>
+                        )}
                         {(activeTab ? activeTab.mode : pendingMode) === 'chat' && (
                             <span className="text-xs text-gray-400 dark:text-gray-500">
                                 仅对话
@@ -536,6 +871,7 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                                 messages={activeTab.messages}
                                 onCopy={handleCopy}
                                 tabId={activeTab.id}
+                                mode={activeTab.mode}
                                 onRegenerate={() => {
                                     const { regenerate } = useChatStore.getState();
                                     regenerate(activeTab.id);
@@ -561,20 +897,12 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                                 onCreateTab={(mode) => {
                                     const tabId = createTab(undefined, mode);
                                     setActiveTab(tabId);
+                                    return tabId; // 返回 tabId，让 InlineChatInput 可以立即使用
                                 }}
                             />
                         </>
                     )}
-                </>
-            )}
-            
-            {activeSubTab === 'memory' && (
-                <MemoryTab />
-            )}
-            
-            {activeSubTab === 'search' && (
-                <SearchPanel />
-            )}
+            </>
         </div>
     );
 };

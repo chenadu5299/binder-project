@@ -3,16 +3,19 @@ import { useFileStore } from '../../stores/fileStore';
 import { useEditorStore } from '../../stores/editorStore';
 import { useLayoutStore } from '../../stores/layoutStore';
 import EditorTabs from './EditorTabs';
-import ReadOnlyBanner from './ReadOnlyBanner';
 import EditorToolbar from './EditorToolbar';
 import TipTapEditor from './TipTapEditor';
+import EditorStatusBar from './EditorStatusBar';
 import FilePreview from './FilePreview';
-import { InlineAssistInput } from './InlineAssistInput';
-import { DiffView } from './DiffView';
+import { InlineAssistPanel } from './InlineAssistPanel';
 import { InlineAssistPosition } from './InlineAssistPosition';
 import ExternalModificationDialog from './ExternalModificationDialog';
 import DocumentAnalysisPanel from './DocumentAnalysisPanel';
 import DocxPdfPreview from './DocxPdfPreview';
+import ExcelPreview from './ExcelPreview';
+import PresentationPreview from './PresentationPreview';
+import CsvPreview from './CsvPreview';
+import MediaPreview from './MediaPreview';
 import { useInlineAssist } from '../../hooks/useInlineAssist';
 import { documentService } from '../../services/documentService';
 import { toast } from '../Common/Toast';
@@ -69,6 +72,7 @@ const EditorPanel: React.FC = () => {
   
   // Inline Assist 功能
   const inlineAssist = useInlineAssist(activeTab?.editor || null);
+
 
   // Agent 模式：监听编辑器内容更新事件（来自 AI 工具调用）
   useEffect(() => {
@@ -297,13 +301,17 @@ const EditorPanel: React.FC = () => {
   }, [activeTab, setTabEditor]);
 
   // 获取文件类型
-  const getFileType = (filePath: string): 'docx' | 'md' | 'html' | 'txt' | 'pdf' | 'image' => {
+  const getFileType = (filePath: string): 'docx' | 'excel' | 'presentation' | 'md' | 'html' | 'txt' | 'pdf' | 'image' | 'audio' | 'video' => {
     const ext = filePath.split('.').pop()?.toLowerCase();
-    if (ext === 'docx') return 'docx';
+    if (ext === 'docx' || ext === 'doc' || ext === 'odt' || ext === 'rtf') return 'docx';
+    if (ext === 'xlsx' || ext === 'xls' || ext === 'ods' || ext === 'csv') return 'excel';
+    if (ext === 'pptx' || ext === 'ppt' || ext === 'ppsx' || ext === 'pps' || ext === 'odp') return 'presentation';
     if (ext === 'md') return 'md';
     if (ext === 'html') return 'html';
     if (ext === 'pdf') return 'pdf';
     if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'].includes(ext || '')) return 'image';
+    if (['mp3', 'wav', 'ogg', 'aac', 'm4a'].includes(ext || '')) return 'audio';
+    if (['mp4', 'webm'].includes(ext || '')) return 'video';
     return 'txt';
   };
 
@@ -447,20 +455,6 @@ const EditorPanel: React.FC = () => {
         </button>
       </div>
       
-      {/* 只读模式提示栏 */}
-      {/* ⚠️ 预览模式不显示 ReadOnlyBanner：
-          - DOCX 预览：DocxPdfPreview 组件内部已有工具栏
-          - PDF 预览：原生 PDF 文件不支持编辑
-          - HTML 预览：只读预览，不支持编辑 */}
-      {activeTab && (() => {
-        const fileType = getFileType(activeTab.filePath);
-        // 预览模式：不显示 ReadOnlyBanner
-        if (activeTab.isReadOnly && (fileType === 'docx' || fileType === 'pdf' || fileType === 'html')) {
-          return null;
-        }
-        // 其他只读模式（如 Markdown、TXT 等）：显示 ReadOnlyBanner
-        return <ReadOnlyBanner tabId={activeTab.id} />;
-      })()}
       
       {/* 工具栏 */}
       {activeTab && (
@@ -487,6 +481,15 @@ const EditorPanel: React.FC = () => {
               );
             }
             
+            // 音频和视频文件使用 MediaPreview 组件
+            if (fileType === 'audio' || fileType === 'video') {
+              return (
+                <div className="h-full overflow-hidden">
+                  <MediaPreview filePath={activeTab.filePath} fileType={fileType} />
+                </div>
+              );
+            }
+            
             // HTML 文件（只读模式）：使用 iframe 预览（隔离样式，避免影响全局）
             if (fileType === 'html' && activeTab.isReadOnly) {
               return <HTMLPreview content={activeTab.content} />;
@@ -507,6 +510,56 @@ const EditorPanel: React.FC = () => {
               return <DocxPdfPreview filePath={activeTab.filePath} />;
             }
             
+            // Excel 文件（只读模式）：使用表格预览组件（直接解析为 HTML 表格）
+            // 注意：CSV 文件也使用 excel 类型，但会通过文件扩展名判断使用 CsvPreview
+            if (fileType === 'excel' && activeTab.isReadOnly) {
+              console.log('[EditorPanel] 渲染 Excel 表格预览，文件路径:', activeTab.filePath);
+              if (!activeTab.filePath) {
+                console.error('[EditorPanel] activeTab.filePath 为空！');
+                return (
+                  <div className="h-full flex items-center justify-center bg-gray-50 dark:bg-gray-900">
+                    <div className="text-red-500">错误：文件路径为空</div>
+                  </div>
+                );
+              }
+              
+              // 检查是否为 CSV 文件（CSV 使用独立方案）
+              const fileExt = activeTab.filePath.split('.').pop()?.toLowerCase();
+              if (fileExt === 'csv') {
+                // ✅ 使用 CsvPreview 组件
+                return <CsvPreview filePath={activeTab.filePath} />;
+              }
+              
+              // XLSX/XLS/ODS 使用表格预览方案（直接解析为 HTML 表格）
+              // 第一阶段：基础解析和渲染
+              const ExcelTablePreview = React.lazy(() => import('./ExcelTablePreview'));
+              return (
+                <React.Suspense
+                  fallback={
+                    <div className="h-full flex items-center justify-center bg-gray-50 dark:bg-gray-900">
+                      <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-500"></div>
+                    </div>
+                  }
+                >
+                  <ExcelTablePreview filePath={activeTab.filePath} />
+                </React.Suspense>
+              );
+            }
+            
+            // 演示文稿文件（只读模式）：使用 PresentationPreview 组件（LibreOffice + PDF）
+            if (fileType === 'presentation' && activeTab.isReadOnly) {
+              console.log('[EditorPanel] 渲染 PresentationPreview，文件路径:', activeTab.filePath);
+              if (!activeTab.filePath) {
+                console.error('[EditorPanel] activeTab.filePath 为空！');
+                return (
+                  <div className="h-full flex items-center justify-center bg-gray-50 dark:bg-gray-900">
+                    <div className="text-red-500">错误：文件路径为空</div>
+                  </div>
+                );
+              }
+              return <PresentationPreview filePath={activeTab.filePath} />;
+            }
+            
             // DOCX 文件（编辑模式）：使用普通编辑器
             if (fileType === 'docx' && !activeTab.isReadOnly) {
               return (
@@ -517,33 +570,25 @@ const EditorPanel: React.FC = () => {
                     onSave={handleSave}
                     editable={!activeTab.isReadOnly}
                     onEditorReady={handleEditorReady}
+                    documentPath={activeTab.filePath}
+                    workspacePath={currentWorkspace || undefined}
                     tabId={activeTab.id}
+                    autoCompleteEnabled={activeTab.autoCompleteEnabled ?? true}
                   />
                   
-                  {/* Inline Assist 输入框 */}
-                  {inlineAssist.state.isVisible && !inlineAssist.state.diff && activeTab.editor && (
+                  {/* Inline Assist 面板 */}
+                  {inlineAssist.state.isVisible && activeTab.editor && (
                     <InlineAssistPosition editor={activeTab.editor}>
-                      <InlineAssistInput
-                        instruction={inlineAssist.state.instruction}
-                        selectedText={inlineAssist.state.selectedText}
+                      <InlineAssistPanel
+                        state={inlineAssist.state}
                         onInstructionChange={(instruction) => {
                           inlineAssist.open(instruction, inlineAssist.state.selectedText);
                         }}
                         onExecute={inlineAssist.execute}
                         onClose={inlineAssist.close}
-                        isLoading={inlineAssist.state.isLoading}
+                        onApplyEdit={inlineAssist.applyEdit}
                       />
                     </InlineAssistPosition>
-                  )}
-                  
-                  {/* Diff 视图 */}
-                  {inlineAssist.state.diff && activeTab.editor && (
-                    <DiffView
-                      diff={inlineAssist.state.diff}
-                      onAccept={inlineAssist.accept}
-                      onReject={inlineAssist.reject}
-                      editor={activeTab.editor}
-                    />
                   )}
                 </div>
               );
@@ -558,42 +603,27 @@ const EditorPanel: React.FC = () => {
                   onSave={handleSave}
                   editable={!activeTab.isReadOnly}
                   onEditorReady={handleEditorReady}
+                  documentPath={activeTab.filePath}
+                  workspacePath={currentWorkspace || undefined}
                   tabId={activeTab.id}
+                  autoCompleteEnabled={activeTab.autoCompleteEnabled ?? true}
                 />
                 
-                {/* Inline Assist 输入框 */}
-                {inlineAssist.state.isVisible && !inlineAssist.state.diff && activeTab.editor && (
+                {/* Inline Assist 面板 */}
+                {inlineAssist.state.isVisible && activeTab.editor && (
                   <InlineAssistPosition editor={activeTab.editor}>
-                    <InlineAssistInput
-                      instruction={inlineAssist.state.instruction}
-                      selectedText={inlineAssist.state.selectedText}
+                    <InlineAssistPanel
+                      state={inlineAssist.state}
                       onInstructionChange={(instruction) => {
                         inlineAssist.open(instruction, inlineAssist.state.selectedText);
                       }}
                       onExecute={inlineAssist.execute}
                       onClose={inlineAssist.close}
-                      isLoading={inlineAssist.state.isLoading}
+                      onApplyEdit={inlineAssist.applyEdit}
                     />
                   </InlineAssistPosition>
                 )}
-                
-                {/* Diff 视图 */}
-                {inlineAssist.state.diff && activeTab.editor && (
-                  <InlineAssistPosition editor={activeTab.editor}>
-                    <DiffView
-                      diff={inlineAssist.state.diff}
-                      onAccept={inlineAssist.accept}
-                      onReject={inlineAssist.reject}
-                    />
-                  </InlineAssistPosition>
-                )}
-                
-                {/* 错误提示 */}
-                {inlineAssist.state.error && (
-                  <div className="absolute top-4 left-1/2 transform -translate-x-1/2 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg p-3 text-sm text-red-600 dark:text-red-400">
-                    {inlineAssist.state.error}
-                  </div>
-                )}
+
               </div>
             );
           })() : (
@@ -618,6 +648,29 @@ const EditorPanel: React.FC = () => {
           </div>
         )}
       </div>
+      
+      {/* 状态栏 */}
+      {activeTab && (() => {
+        const fileType = getFileType(activeTab.filePath);
+        // 只在可编辑的文件类型或编辑器模式下显示状态栏
+        // 排除预览模式（PDF、图片、HTML只读、DOCX只读、Excel只读、演示文稿只读、音频、视频）
+        const isPreviewMode = activeTab.isReadOnly && (
+          fileType === 'pdf' || 
+          fileType === 'image' || 
+          fileType === 'html' ||
+          fileType === 'docx' ||
+          fileType === 'excel' ||
+          fileType === 'presentation' ||
+          fileType === 'audio' ||
+          fileType === 'video'
+        );
+        
+        // 如果有编辑器实例，显示状态栏
+        if (!isPreviewMode && activeTab.editor) {
+          return <EditorStatusBar editor={activeTab.editor} />;
+        }
+        return null;
+      })()}
       
       {/* ⚠️ Week 17.1.2：外部修改对话框 */}
       {externalModificationTab && (() => {

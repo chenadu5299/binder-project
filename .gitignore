@@ -33,4 +33,3 @@ src-tauri/resources/libreoffice/
 *.so
 *.dll
 *.app/
-

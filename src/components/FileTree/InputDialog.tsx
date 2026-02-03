@@ -28,8 +28,25 @@ const InputDialog: React.FC<InputDialogProps> = ({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    console.log('[InputDialog] handleSubmit 被调用:', { value, trimmed: value.trim(), onConfirm: typeof onConfirm });
     if (value.trim()) {
-      onConfirm(value.trim());
+      console.log('[InputDialog] 调用 onConfirm:', value.trim(), 'onConfirm 类型:', typeof onConfirm, 'onConfirm:', onConfirm);
+      try {
+        const result = onConfirm(value.trim());
+        console.log('[InputDialog] ✅ onConfirm 调用完成，返回值:', result);
+        // 如果返回 Promise，等待完成
+        if (result && typeof result.then === 'function') {
+          result.then(() => {
+            console.log('[InputDialog] ✅ onConfirm Promise 完成');
+          }).catch((error: any) => {
+            console.error('[InputDialog] ❌ onConfirm Promise 失败:', error);
+          });
+        }
+      } catch (error) {
+        console.error('[InputDialog] ❌ onConfirm 调用失败:', error);
+      }
+    } else {
+      console.warn('[InputDialog] 值为空，不调用 onConfirm');
     }
   };
 

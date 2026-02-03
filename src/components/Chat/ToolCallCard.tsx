@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { ToolCall, ToolResult } from '../../types/tool';
 import { 
     DocumentIcon, 
@@ -13,7 +13,7 @@ import {
     ArrowPathIcon
 } from '@heroicons/react/24/outline';
 import { invoke } from '@tauri-apps/api/core';
-import { emit } from '@tauri-apps/api/event';
+// import { emit } from '@tauri-apps/api/event'; // ⚠️ 已废弃：不再使用事件系统，统一使用 EditorStore
 import { useFileStore } from '../../stores/fileStore';
 import { useEditorStore } from '../../stores/editorStore';
 import { documentService } from '../../services/documentService';
@@ -31,6 +31,62 @@ export const ToolCallCard: React.FC<ToolCallCardProps> = ({ toolCall, onResult }
     const [showPreview, setShowPreview] = useState(false);
     const [showDiff, setShowDiff] = useState(false);
     const [oldContent, setOldContent] = useState<string | null>(null);
+    
+    // 当 AI 通过 create_file 或 update_file 成功创建/更新文件时，自动记录元数据（便于后续从文件树打开时进入编辑模式）
+    useEffect(() => {
+        const isCreateOrUpdate = toolCall.name === 'create_file' || toolCall.name === 'update_file';
+        if (!isCreateOrUpdate || !toolCall.result?.success || !currentWorkspace) return;
+
+        // 防御性解析：后端可能返回 data 为对象或 JSON 字符串
+        let dataPath: string | undefined;
+        const rawData = toolCall.result.data;
+        if (typeof rawData === 'object' && rawData !== null && typeof rawData.path === 'string') {
+            dataPath = rawData.path;
+        } else if (typeof rawData === 'string') {
+            try {
+                const parsed = JSON.parse(rawData);
+                dataPath = parsed?.path;
+            } catch {
+                dataPath = undefined;
+            }
+        }
+
+        if (!dataPath) {
+            console.log('[ToolCallCard] AI 文件操作成功但无 path，跳过元数据记录:', {
+                name: toolCall.name,
+                hasData: !!rawData,
+                dataType: typeof rawData,
+            });
+            return;
+        }
+
+        (async () => {
+            try {
+                const { recordBinderFile } = await import('../../services/fileMetadataService');
+                const { normalizePath, normalizeWorkspacePath, getAbsolutePath } = await import('../../utils/pathUtils');
+
+                const normalizedPath = normalizePath(dataPath);
+                const normalizedWorkspacePath = normalizeWorkspacePath(currentWorkspace);
+                const filePath = getAbsolutePath(normalizedPath, normalizedWorkspacePath);
+
+                console.log('[ToolCallCard] AI 创建/更新文件成功，记录元数据:', {
+                    name: toolCall.name,
+                    path: dataPath,
+                    filePath,
+                    workspace: normalizedWorkspacePath,
+                });
+                await recordBinderFile(filePath, 'ai_generated', normalizedWorkspacePath, 3);
+                console.log('[ToolCallCard] 元数据记录成功，该文件从文件树打开时将进入编辑模式');
+            } catch (error) {
+                console.warn('[ToolCallCard] 自动记录文件元数据失败:', error);
+            }
+        })();
+    }, [
+        toolCall.name,
+        toolCall.result?.success,
+        toolCall.result?.data,
+        currentWorkspace,
+    ]);
 
     const getToolIcon = () => {
         switch (toolCall.name) {
@@ -182,17 +238,15 @@ export const ToolCallCard: React.FC<ToolCallCardProps> = ({ toolCall, onResult }
     
     const handleConfirmDiff = async (_level: 'paragraph' | 'document' | 'all', _paragraphId?: string) => {
         if (toolCall.name === 'edit_current_editor_document') {
-            // 应用到编辑器
+            // ⚠️ 已更新：统一使用 EditorStore 更新编辑器（与 ChatMessages.tsx 保持一致）
             const activeTab = getActiveTab();
             if (activeTab) {
                 const newContent = toolCall.arguments.content as string;
                 
-                // 通过事件通知编辑器更新
                 try {
-                    await emit('editor-update-content', {
-                        tabId: activeTab.id,
-                        content: newContent,
-                    });
+                    // 统一使用 EditorStore 更新（不再使用事件系统）
+                    const { updateTabContent } = useEditorStore.getState();
+                    updateTabContent(activeTab.id, newContent);
 
                     if (onResult) {
                         onResult({
@@ -202,7 +256,7 @@ export const ToolCallCard: React.FC<ToolCallCardProps> = ({ toolCall, onResult }
                     }
                     setShowDiff(false);
                 } catch (error) {
-                    console.error('发送编辑器更新事件失败:', error);
+                    console.error('更新编辑器失败:', error);
                     if (onResult) {
                         onResult({
                             success: false,
@@ -354,42 +408,104 @@ export const ToolCallCard: React.FC<ToolCallCardProps> = ({ toolCall, onResult }
                             )}
                             {toolCall.result.data && (
                                 <div className="mt-2">
-                                    {toolCall.result.data.path && (
-                                        <div className="text-sm mb-1">
-                                            <span className="font-medium">路径:</span> {toolCall.result.data.path}
+                                    {/* list_files 工具的特殊显示 */}
+                                    {toolCall.name === 'list_files' && toolCall.result.data.files && Array.isArray(toolCall.result.data.files) ? (
+                                        <div>
+                                            {toolCall.result.data.path && (
+                                                <div className="text-sm mb-2">
+                                                    <span className="font-medium">目录:</span> {toolCall.result.data.path}
+                                                </div>
+                                            )}
+                                            <div className="mt-2">
+                                                <div className="text-xs font-medium mb-2 text-gray-700 dark:text-gray-300">
+                                                    文件列表 ({toolCall.result.data.files.length} 项):
+                                                </div>
+                                                <div className="max-h-60 overflow-y-auto bg-white dark:bg-gray-700 rounded p-2 border border-gray-200 dark:border-gray-600">
+                                                    <div className="space-y-1">
+                                                        {toolCall.result.data.files.map((file: any, index: number) => (
+                                                            <div
+                                                                key={index}
+                                                                className="flex items-center gap-2 py-1 px-2 hover:bg-gray-100 dark:hover:bg-gray-600 rounded text-xs"
+                                                            >
+                                                                {file.is_directory ? (
+                                                                    <FolderIcon className="w-4 h-4 text-blue-500 flex-shrink-0" />
+                                                                ) : (
+                                                                    <DocumentIcon className="w-4 h-4 text-gray-500 flex-shrink-0" />
+                                                                )}
+                                                                <span className="font-medium text-gray-900 dark:text-gray-100 flex-1 truncate">
+                                                                    {file.name}
+                                                                </span>
+                                                                {file.path && file.path !== file.name && (
+                                                                    <span className="text-gray-500 dark:text-gray-400 text-xs truncate max-w-xs">
+                                                                        {file.path}
+                                                                    </span>
+                                                                )}
+                                                            </div>
+                                                        ))}
+                                                    </div>
+                                                </div>
+                                            </div>
                                         </div>
+                                    ) : (
+                                        <>
+                                            {toolCall.result.data.path && (
+                                                <div className="text-sm mb-1">
+                                                    <span className="font-medium">路径:</span> {toolCall.result.data.path}
+                                                </div>
+                                            )}
+                                            {toolCall.result.data.full_path && (
+                                                <div className="text-xs text-gray-500 dark:text-gray-400 mb-2">
+                                                    完整路径: {toolCall.result.data.full_path}
+                                                </div>
+                                            )}
+                                            {/* AI 创建文件后自动打开 */}
+                                            {toolCall.name === 'create_file' && toolCall.result.data.path && currentWorkspace && (
+                                                <div className="mt-2">
+                                                    <button
+                                                        onClick={async () => {
+                                                            try {
+                                                                const { normalizePath, normalizeWorkspacePath, getAbsolutePath } = await import('../../utils/pathUtils');
+                                                                
+                                                                // 规范化路径格式（确保与后端一致）
+                                                                const normalizedPath = normalizePath(toolCall.result.data.path);
+                                                                const normalizedWorkspacePath = normalizeWorkspacePath(currentWorkspace);
+                                                                const filePath = getAbsolutePath(normalizedPath, normalizedWorkspacePath);
+                                                                
+                                                                // 记录文件为 AI 生成的文件（必须在打开文件之前完成）
+                                                                try {
+                                                                  const { recordBinderFile } = await import('../../services/fileMetadataService');
+                                                                  // 同步等待元数据记录完成（带重试机制）
+                                                                  await recordBinderFile(filePath, 'ai_generated', normalizedWorkspacePath, 3);
+                                                                } catch (error) {
+                                                                  console.warn('记录文件元数据失败（将使用显式 source 标记）:', error);
+                                                                  // 即使元数据记录失败，仍然传递 source: 'ai_generated'，确保能进入编辑模式
+                                                                }
+                                                                // 显式传递 source: 'ai_generated'，确保进入编辑模式
+                                                                console.log('[ToolCallCard] 打开AI创建的文件:', {
+                                                                  filePath,
+                                                                  source: 'ai_generated',
+                                                                });
+                                                                await documentService.openFile(filePath, { source: 'ai_generated' });
+                                                            } catch (error) {
+                                                                console.error('打开文件失败:', error);
+                                                            }
+                                                        }}
+                                                        className="text-xs px-2 py-1 bg-blue-500 text-white rounded hover:bg-blue-600 transition-colors"
+                                                    >
+                                                        📂 在编辑器中打开
+                                                    </button>
+                                                </div>
+                                            )}
+                                            <details className="mt-1">
+                                                <summary className="text-xs cursor-pointer text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200">
+                                                    查看详细信息
+                                                </summary>
+                                                <div className="mt-1 p-2 bg-white dark:bg-gray-700 rounded font-mono text-xs max-h-40 overflow-y-auto">
+                                                    {JSON.stringify(toolCall.result.data, null, 2)}
+                                                </div>
+                                            </details>
+                                        </>
                                     )}
-                                    {toolCall.result.data.full_path && (
-                                        <div className="text-xs text-gray-500 dark:text-gray-400 mb-2">
-                                            完整路径: {toolCall.result.data.full_path}
-                                        </div>
-                                    )}
-                                    {/* AI 创建文件后自动打开 */}
-                                    {toolCall.name === 'create_file' && toolCall.result.data.path && currentWorkspace && (
-                                        <div className="mt-2">
-                                            <button
-                                                onClick={async () => {
-                                                    try {
-                                                        const filePath = currentWorkspace + '/' + toolCall.result.data.path;
-                                                        await documentService.openFile(filePath, { source: 'ai_generated' });
-                                                    } catch (error) {
-                                                        console.error('打开文件失败:', error);
-                                                    }
-                                                }}
-                                                className="text-xs px-2 py-1 bg-blue-500 text-white rounded hover:bg-blue-600 transition-colors"
-                                            >
-                                                📂 在编辑器中打开
-                                            </button>
-                                        </div>
-                                    )}
-                                    <details className="mt-1">
-                                        <summary className="text-xs cursor-pointer text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200">
-                                            查看详细信息
-                                        </summary>
-                                        <div className="mt-1 p-2 bg-white dark:bg-gray-700 rounded font-mono text-xs max-h-40 overflow-y-auto">
-                                            {JSON.stringify(toolCall.result.data, null, 2)}
-                                        </div>
-                                    </details>
                                 </div>
                             )}
                         </div>

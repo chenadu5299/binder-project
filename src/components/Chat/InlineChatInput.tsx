@@ -1,9 +1,10 @@
 // 内联引用输入框组件（使用 contentEditable 支持内联引用标签）
 
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { PaperAirplaneIcon, ArrowPathIcon } from '@heroicons/react/24/outline';
+import { PaperAirplaneIcon, ArrowPathIcon, StopIcon } from '@heroicons/react/24/outline';
 import { useChatStore } from '../../stores/chatStore';
 import { useReferenceStore } from '../../stores/referenceStore';
+import { ModelSelector } from './ModelSelector';
 import { Reference, ReferenceType, FileReference, ImageReference, FolderReference } from '../../types/reference';
 import { ReferenceManagerButton } from './ReferenceManagerButton';
 import { parseEditorContent, formatNodesForAI, InlineInputNode, getReferenceDisplayText, getReferenceIcon } from '../../utils/inlineContentParser';
@@ -174,9 +175,18 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
         editor.dispatchEvent(new Event('input', { bubbles: true }));
     }, [refMap, tabId, getReferences]);
     
+    // 跟踪编辑器内容状态，用于按钮禁用判断
+    const [hasContent, setHasContent] = useState(false);
+    
     // 处理输入变化
-    const handleInput = useCallback((e: React.FormEvent<HTMLDivElement>) => {
-        // 输入变化时不需要做任何处理，发送时直接解析即可
+    const handleInput = useCallback(() => {
+        // 检查是否有内容（文本或引用）
+        if (editorRef.current) {
+            const inputNodes = parseEditorContent(editorRef.current);
+            const hasText = inputNodes.some(node => node.type === 'text' && node.content?.trim());
+            const hasReferences = inputNodes.some(node => node.type === 'reference');
+            setHasContent(hasText || hasReferences);
+        }
     }, []);
     
     // 发送消息（先定义，因为 handleKeyDown 需要它）
@@ -192,9 +202,9 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
                     // 如果 onCreateTab 返回了 tabId，直接使用
                     currentTabId = createdTabId;
                 } else {
-                    // 如果 onCreateTab 没有返回值，等待并查找最新标签页
-                    await new Promise(resolve => setTimeout(resolve, 50));
-                    const latestTab = tabs[tabs.length - 1];
+                    // 如果 onCreateTab 没有返回值，从 store 获取最新标签页
+                    const { tabs: currentTabs } = useChatStore.getState();
+                    const latestTab = currentTabs[currentTabs.length - 1];
                     if (latestTab) {
                         currentTabId = latestTab.id;
                         setActiveTab(currentTabId);
@@ -252,6 +262,7 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
         if (editorRef.current) {
             editorRef.current.innerHTML = '';
             editorRef.current.focus();
+            setHasContent(false); // 重置内容状态
         }
         
         // 发送消息
@@ -419,6 +430,49 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
             }
         }
         
+        // 方法 4：检查是否是引用格式字符串（备用方案）
+        if (!sourceData) {
+            const text = e.clipboardData.getData('text/plain');
+            if (text) {
+                const { parseReferenceFormatString } = await import('../../utils/referenceHelpers');
+                const parsed = parseReferenceFormatString(text.trim());
+                if (parsed) {
+                    console.log('🔍 检测到引用格式字符串，尝试解析:', parsed);
+                    
+                    // 尝试从文件树中查找文件路径
+                    const { currentWorkspace, fileTree } = useFileStore.getState();
+                    const { flattenFileTree } = await import('../../utils/fileTreeUtils');
+                    const allFiles = flattenFileTree(fileTree);
+                    const matchedFile = allFiles.find(f => f.name === parsed.fileName);
+                    
+                    if (matchedFile && currentWorkspace) {
+                        const filePath = matchedFile.path || `${currentWorkspace}/${parsed.fileName}`;
+                        if (parsed.type === 'table') {
+                            // 表格引用
+                            sourceData = JSON.stringify({
+                                filePath,
+                                fileName: parsed.fileName,
+                                type: 'table',
+                                sheetName: parsed.sheetName,
+                                cellRef: parsed.cellRef,
+                            });
+                        } else {
+                            // 文本引用
+                            sourceData = JSON.stringify({
+                                filePath,
+                                fileName: parsed.fileName,
+                                lineRange: { start: 1, end: 1 },
+                                charRange: { start: 0, end: 0 },
+                            });
+                        }
+                        console.log('✅ 从引用格式字符串解析出引用元数据');
+                    } else {
+                        console.warn('⚠️ 无法找到文件:', parsed.fileName);
+                    }
+                }
+            }
+        }
+        
         // 如果找到引用元数据，创建引用
         if (sourceData) {
             try {
@@ -429,25 +483,79 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
                 console.log('📋 解析引用元数据:', {
                     filePath: source.filePath,
                     fileName: source.fileName,
+                    type: source.type,
                     text: text?.substring(0, 50) + (text?.length > 50 ? '...' : ''),
                     textLength: text?.length,
                     hasText: !!text,
                     hasFilePath: !!source.filePath,
                 });
                 
-                if (!text) {
-                    console.error('❌ 粘贴的文本为空，无法创建引用');
-                    return;
-                }
-                
                 if (!source.filePath) {
                     console.error('❌ 引用元数据中没有文件路径，无法创建引用');
                     return;
                 }
                 
-                console.log('✅ 条件满足，开始创建文本引用...');
+                // 判断是表格引用还是文本引用
+                if (source.type === 'table') {
+                    // 创建表格引用
+                    const { ReferenceType } = await import('../../types/reference');
+                    const tableRef: import('../../types/reference').TableReference = {
+                        id: `ref-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+                        type: ReferenceType.TABLE,
+                        createdAt: Date.now(),
+                        sourceFile: source.filePath,
+                        fileName: source.fileName || source.filePath.split('/').pop() || source.filePath.split('\\').pop() || '未命名文件',
+                        rowRange: source.rowIndex !== undefined ? { start: source.rowIndex + 1, end: source.rowIndex + 1 } : undefined,
+                        columnRange: source.colIndex !== undefined ? { start: source.colIndex + 1, end: source.colIndex + 1 } : undefined,
+                    };
+                    
+                    console.log('✅ 创建表格引用:', {
+                        sourceFile: source.filePath,
+                        cellRef: source.cellRef,
+                        sheetName: source.sheetName,
+                    });
+                    
+                    let currentTabId = tabId;
+                    if (!currentTabId) {
+                        console.log('📝 当前没有标签页，创建新标签页...');
+                        if (onCreateTab) {
+                            const createdTabId = onCreateTab(pendingMode);
+                            if (createdTabId) {
+                                currentTabId = createdTabId;
+                                console.log('✅ 通过 onCreateTab 创建标签页:', currentTabId);
+                            } else {
+                                const { tabs: currentTabs } = useChatStore.getState();
+                                const latestTab = currentTabs[currentTabs.length - 1];
+                                if (latestTab) {
+                                    currentTabId = latestTab.id;
+                                    setActiveTab(currentTabId);
+                                    console.log('✅ 查找最新标签页:', currentTabId);
+                                } else {
+                                    console.error('❌ 创建标签页失败');
+                                }
+                            }
+                        } else {
+                            currentTabId = createTab(undefined, pendingMode);
+                            setActiveTab(currentTabId);
+                            console.log('✅ 通过 createTab 创建标签页:', currentTabId);
+                        }
+                    }
+                    
+                    if (currentTabId) {
+                        addReference(currentTabId, tableRef);
+                        handleInsertReference(tableRef.id);
+                    }
+                    return;
+                }
                 
                 // 创建文本引用
+                if (!text) {
+                    console.error('❌ 粘贴的文本为空，无法创建引用');
+                    return;
+                }
+                
+                console.log('✅ 条件满足，开始创建文本引用...');
+                
                 const { createTextReferenceFromClipboard } = await import('../../utils/referenceHelpers');
                 const textRefBase = createTextReferenceFromClipboard(
                     {
@@ -465,17 +573,20 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
                 if (!currentTabId) {
                     console.log('📝 当前没有标签页，创建新标签页...');
                     if (onCreateTab) {
-                        onCreateTab(pendingMode);
-                    await new Promise(resolve => setTimeout(resolve, 100));
-                    // 使用 useChatStore.getState() 获取最新状态，避免依赖 tabs 数组
-                    const { tabs: currentTabs } = useChatStore.getState();
-                    const latestTab = currentTabs[currentTabs.length - 1];
-                    if (latestTab) {
-                            currentTabId = latestTab.id;
-                            setActiveTab(currentTabId);
+                        const createdTabId = onCreateTab(pendingMode);
+                        if (createdTabId) {
+                            currentTabId = createdTabId;
                             console.log('✅ 通过 onCreateTab 创建标签页:', currentTabId);
                         } else {
-                            console.error('❌ onCreateTab 执行后未找到新标签页');
+                            const { tabs: currentTabs } = useChatStore.getState();
+                            const latestTab = currentTabs[currentTabs.length - 1];
+                            if (latestTab) {
+                                currentTabId = latestTab.id;
+                                setActiveTab(currentTabId);
+                                console.log('✅ 查找最新标签页:', currentTabId);
+                            } else {
+                                console.error('❌ 创建标签页失败');
+                            }
                         }
                     } else {
                         currentTabId = createTab(undefined, pendingMode);
@@ -550,7 +661,6 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
                             if (createdTabId) {
                                 currentTabId = createdTabId;
                             } else {
-                                await new Promise(resolve => setTimeout(resolve, 100));
                                 const latestTab = useChatStore.getState().tabs[useChatStore.getState().tabs.length - 1];
                                 if (latestTab) {
                                     currentTabId = latestTab.id;
@@ -692,12 +802,6 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
             return;
         }
         
-        console.log('📥 收到拖拽事件 (drop):', {
-            target: 'container',
-            types: Array.from(dataTransfer.types),
-            files: dataTransfer.files.length,
-            allTypes: Array.from(dataTransfer.types),
-        });
         
         // 如果没有标签页，先创建标签页
         let currentTabId = tabId;
@@ -710,9 +814,7 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
                     currentTabId = createdTabId;
                     console.log('✅ 通过 onCreateTab 创建标签页:', currentTabId);
                 } else {
-                    // 如果 onCreateTab 没有返回值，等待并查找最新标签页
-                    await new Promise(resolve => setTimeout(resolve, 100));
-                    // 使用 useChatStore.getState() 获取最新状态，避免依赖 tabs
+                    // 如果 onCreateTab 没有返回值，从 store 获取最新标签页
                     const latestTab = useChatStore.getState().tabs[useChatStore.getState().tabs.length - 1];
                     if (latestTab) {
                         currentTabId = latestTab.id;
@@ -743,18 +845,16 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
         // 方法 1：尝试获取 application/file-path（文件树拖拽的主要类型）
         try {
             filePath = dataTransfer.getData('application/file-path');
-            console.log('📥 方法1 - application/file-path:', filePath);
         } catch (error) {
-            console.warn('⚠️ 获取 application/file-path 失败:', error);
+            // 忽略错误，继续尝试其他方法
         }
         
         // 方法 2：如果方法1失败，尝试 text/plain（备用方案）
         if (!filePath) {
             try {
                 filePath = dataTransfer.getData('text/plain');
-                console.log('📥 方法2 - text/plain:', filePath);
             } catch (error) {
-                console.warn('⚠️ 获取 text/plain 失败:', error);
+                // 忽略错误
             }
         }
         
@@ -762,17 +862,9 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
         try {
             const dirFlag = dataTransfer.getData('application/is-directory');
             isDirectory = dirFlag === 'true';
-            console.log('📥 目录标识:', isDirectory);
         } catch (error) {
-            console.warn('⚠️ 获取目录标识失败:', error);
+            // 忽略错误
         }
-        
-        console.log('📥 拖拽数据解析结果:', { 
-            filePath, 
-            isDirectory, 
-            types: Array.from(dataTransfer.types),
-            filesCount: dataTransfer.files.length,
-        });
         
         // 处理文件树拖拽的文件
         if (filePath && !isDirectory) {
@@ -946,112 +1038,6 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
         }
     }, [tabId, pendingMode, onCreateTab, createTab, setActiveTab, handleFileTreeReference, handleInsertReference, addReference, currentWorkspace]);
     
-    // 🔍 终极调试：在 window 和 document 级别捕获所有拖拽事件
-    // 如果这些监听器都没有日志，说明事件在 OS/Tauri 层被拦截
-    // 🔴 关键修复：在全局监听器中，如果目标是容器区域，则阻止默认行为并处理 drop
-    useEffect(() => {
-        const container = containerRef.current;
-        
-        const isContainerArea = (target: EventTarget | null): boolean => {
-            if (!container || !target) return false;
-            const element = target as HTMLElement;
-            
-            // 方法1：检查元素是否在容器内
-            const isInContainer = container.contains(element) || container === element;
-            
-            // 方法2：通过类名检查（备用方案）
-            const isContainerByClass = element.closest('.inline-chat-input-container') !== null;
-            
-            const result = isInContainer || isContainerByClass;
-            
-            // 调试日志
-            if (result) {
-                console.log('✅ 识别为容器区域:', {
-                    elementClassName: element.className,
-                    elementTagName: element.tagName,
-                    containerClassName: container.className,
-                    isInContainer,
-                    isContainerByClass,
-                });
-            }
-            
-            return result;
-        };
-        
-        const debugDragWindow = (e: DragEvent) => {
-            const isContainer = isContainerArea(e.target);
-            console.log(`[DEBUG-WINDOW] 🎯 捕获到事件: ${e.type}`, {
-                target: {
-                    className: (e.target as HTMLElement)?.className,
-                    tagName: (e.target as HTMLElement)?.tagName,
-                },
-                types: Array.from(e.dataTransfer?.types || []),
-                isContainerArea: isContainer,
-            });
-            
-            // 🔴 关键修复：如果目标是容器区域，在 dragover 中阻止默认行为，这样 drop 才能触发
-            if (e.type === 'dragover' && isContainer) {
-                e.preventDefault();
-                e.stopPropagation();
-                if (e.dataTransfer) {
-                    e.dataTransfer.dropEffect = 'copy';
-                }
-            }
-            
-            // 🔴 关键修复：如果目标是容器区域，在 drop 中直接处理
-            if (e.type === 'drop' && isContainer) {
-                e.preventDefault();
-                e.stopPropagation();
-                console.log('📥 [DEBUG-WINDOW] 容器区域的 drop 事件，调用 handleDropLogic');
-                // 直接调用 handleDropLogic（在运行时访问）
-                if (handleDropLogic) {
-                    handleDropLogic(e);
-                }
-            }
-        };
-        
-        const debugDragDocument = (e: DragEvent) => {
-            const isContainer = isContainerArea(e.target);
-            console.log(`[DEBUG-DOCUMENT] 🎯 捕获到事件: ${e.type}`, {
-                target: {
-                    className: (e.target as HTMLElement)?.className,
-                    tagName: (e.target as HTMLElement)?.tagName,
-                },
-                types: Array.from(e.dataTransfer?.types || []),
-                isContainerArea: isContainer,
-            });
-            
-            // 🔴 关键修复：如果目标是容器区域，在 dragover 中阻止默认行为
-            if (e.type === 'dragover' && isContainer) {
-                e.preventDefault();
-                e.stopPropagation();
-                if (e.dataTransfer) {
-                    e.dataTransfer.dropEffect = 'copy';
-                }
-            }
-        };
-        
-        // 在 window 级别添加监听器（最高级别）
-        window.addEventListener('dragenter', debugDragWindow, true);
-        window.addEventListener('dragover', debugDragWindow, true);
-        window.addEventListener('drop', debugDragWindow, true);
-        
-        // 在 document 级别添加监听器（捕获阶段）
-        document.addEventListener('dragenter', debugDragDocument, true);
-        document.addEventListener('dragover', debugDragDocument, true);
-        document.addEventListener('drop', debugDragDocument, true);
-        
-        console.log('✅ [DEBUG] Window 和 Document 级别拖拽事件监听器已绑定（捕获阶段）');
-        
-        return () => {
-            window.removeEventListener('dragenter', debugDragWindow, true);
-            window.removeEventListener('dragover', debugDragWindow, true);
-            window.removeEventListener('drop', debugDragWindow, true);
-            document.removeEventListener('dragenter', debugDragDocument, true);
-            document.removeEventListener('dragover', debugDragDocument, true);
-            document.removeEventListener('drop', debugDragDocument, true);
-        };
-    }, [handleDropLogic]); // 添加 handleDropLogic 依赖
     
     // 拖拽处理：允许拖拽文件
     // 在容器级别处理，避免contentEditable的默认行为干扰
@@ -1063,110 +1049,51 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
             return;
         }
         
-        // 🔍 检查容器样式，确保没有阻止事件
+        // 确保容器可以接收指针事件
         const computedStyle = window.getComputedStyle(container);
-        const pointerEvents = computedStyle.pointerEvents;
-        const display = computedStyle.display;
-        const visibility = computedStyle.visibility;
-        const opacity = computedStyle.opacity;
-        
-        console.log('✅ 容器已找到，准备绑定拖拽事件监听器', {
-            containerClass: container.className,
-            containerId: container.id,
-            containerRect: container.getBoundingClientRect(),
-            zIndex: computedStyle.zIndex,
-            position: computedStyle.position,
-            pointerEvents,
-            display,
-            visibility,
-            opacity,
-            isVisible: display !== 'none' && visibility !== 'hidden' && opacity !== '0',
-        });
-        
-        // 🔴 关键修复：确保容器可以接收指针事件
-        if (pointerEvents === 'none') {
-            console.warn('⚠️ 容器 pointer-events 为 none，强制设置为 auto');
+        if (computedStyle.pointerEvents === 'none') {
             container.style.pointerEvents = 'auto';
         }
         
-        // 🔍 调试：给容器添加可视化边框和高 z-index
-        container.style.outline = '4px solid red';
-        container.style.zIndex = '9999';
-        container.style.position = 'relative';
-        console.log('🎨 容器样式已更新用于调试：红色边框 + z-index: 9999');
-        
-        setTimeout(() => {
-            container.style.outline = '';
-            // 保留 z-index，确保容器在最上层
-        }, 10000);
         
         const handleDragEnterNative = (e: DragEvent) => {
-            console.log('📥 [原生-容器] ✅✅✅ dragEnter 被触发！', {
-                types: Array.from(e.dataTransfer?.types || []),
-                effectAllowed: e.dataTransfer?.effectAllowed,
-                target: (e.target as HTMLElement)?.className || (e.target as HTMLElement)?.tagName,
-                currentTarget: (e.currentTarget as HTMLElement)?.className,
-            });
             e.preventDefault();
             e.stopPropagation();
         };
         
         const handleDragOverNative = (e: DragEvent) => {
-            // 每次都要 preventDefault，否则 drop 不会触发
             e.preventDefault();
             e.stopPropagation();
             if (e.dataTransfer) {
                 e.dataTransfer.dropEffect = 'copy';
-            }
-            // 减少日志频率
-            if (!(handleDragOverNative as any).__logged) {
-                console.log('📥 [原生-容器] ✅✅✅ dragOver 被触发！', {
-                    types: Array.from(e.dataTransfer?.types || []),
-                    target: (e.target as HTMLElement)?.className || (e.target as HTMLElement)?.tagName,
-                    currentTarget: (e.currentTarget as HTMLElement)?.className,
-                });
-                (handleDragOverNative as any).__logged = true;
-                setTimeout(() => { (handleDragOverNative as any).__logged = false; }, 1000);
             }
         };
         
         const handleDragLeaveNative = (e: DragEvent) => {
             const relatedTarget = e.relatedTarget as HTMLElement;
             if (relatedTarget && container.contains(relatedTarget)) {
-                return; // 还在容器内部，不处理
+                return;
             }
-            console.log('📥 [原生-容器] dragLeave 被触发');
             e.preventDefault();
             e.stopPropagation();
         };
         
         const handleDropNative = async (e: DragEvent) => {
-            console.log('📥 [原生-容器] drop 被触发！', {
-                types: Array.from(e.dataTransfer?.types || []),
-                files: e.dataTransfer?.files.length || 0,
-            });
-            
             e.preventDefault();
             e.stopPropagation();
-            
-            // 直接调用处理逻辑（原生事件）
             handleDropLogic(e);
         };
         
-        // 使用捕获阶段，确保能捕获事件
         container.addEventListener('dragenter', handleDragEnterNative, true);
         container.addEventListener('dragover', handleDragOverNative, true);
         container.addEventListener('dragleave', handleDragLeaveNative, true);
         container.addEventListener('drop', handleDropNative, true);
-        
-        console.log('✅ 拖拽事件监听器已绑定到容器');
         
         return () => {
             container.removeEventListener('dragenter', handleDragEnterNative, true);
             container.removeEventListener('dragover', handleDragOverNative, true);
             container.removeEventListener('dragleave', handleDragLeaveNative, true);
             container.removeEventListener('drop', handleDropNative, true);
-            console.log('🧹 拖拽事件监听器已移除');
         };
     }, [handleDropLogic]);
     
@@ -1175,7 +1102,6 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
         if (e.currentTarget !== containerRef.current) return;
         e.preventDefault();
         e.stopPropagation();
-        console.log('📥 [React] 拖拽进入容器 (dragEnter)');
     }, []);
     
     const handleDragOver = useCallback((e: React.DragEvent) => {
@@ -1193,7 +1119,6 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
         }
         e.preventDefault();
         e.stopPropagation();
-        console.log('📥 [React] 拖拽离开容器 (dragLeave)');
     }, []);
     
     // React 版本的 handleDrop（调用 handleDropLogic）
@@ -1208,32 +1133,6 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
     
     // 始终显示输入框（即使没有标签页，也可以通过 onCreateTab 创建）
     
-    // 调试：验证组件渲染和容器引用
-    useEffect(() => {
-        console.log('🔍 InlineChatInput 组件已渲染', {
-            tabId,
-            hasMessages,
-            isStreaming,
-            referencesCount: references.length,
-            editorRefExists: !!editorRef.current,
-            containerRefExists: !!containerRef.current,
-            containerElement: containerRef.current ? containerRef.current.className : 'null',
-        });
-        
-        // 验证容器是否真的在 DOM 中
-        if (containerRef.current) {
-            const rect = containerRef.current.getBoundingClientRect();
-            console.log('📐 容器位置和大小:', {
-                width: rect.width,
-                height: rect.height,
-                top: rect.top,
-                left: rect.left,
-                visible: rect.width > 0 && rect.height > 0,
-            });
-        }
-    }, [tabId, hasMessages, isStreaming, references.length]);
-    
-    // 移除重复的全局监听器（已在上面添加了 window + document 级别的 DEBUG 监听器）
     
     return (
         <div
@@ -1274,20 +1173,82 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
                     onCompositionStart={handleCompositionStart}
                     onCompositionEnd={handleCompositionEnd}
                     // 拖拽事件只在容器级别处理，避免contentEditable的干扰
-                    className="inline-chat-input-editor flex-1 min-h-[40px] max-h-[200px] px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 overflow-y-auto"
+                    className="inline-chat-input-editor flex-1 min-h-[40px] max-h-[200px] px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 overflow-y-auto resize-none"
+                    style={{
+                        height: 'auto',
+                        maxHeight: '200px',
+                    }}
                     suppressContentEditableWarning
                     data-placeholder="输入消息... (Shift+Enter 换行)"
                 />
                 
-                {/* 发送按钮 */}
-                <button
-                    onClick={handleSend}
-                    disabled={isStreaming}
-                    className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2 transition-colors"
-                >
-                    <PaperAirplaneIcon className="w-5 h-5" />
-                    <span>发送</span>
-                </button>
+                {/* 发送/停止按钮 */}
+                {isStreaming ? (
+                    // AI正在回复时，显示停止按钮
+                    <button
+                        onClick={async () => {
+                            if (!tabId || !isStreaming) return;
+                            
+                            try {
+                                // ⚠️ 关键修复：立即更新消息的 isLoading 状态，让停止按钮立即消失
+                                const { tabs, setMessageLoading } = useChatStore.getState();
+                                const currentTab = tabs.find(t => t.id === tabId);
+                                if (currentTab) {
+                                    // 找到所有正在加载的消息，立即设置为 false
+                                    currentTab.messages.forEach(msg => {
+                                        if (msg.isLoading) {
+                                            setMessageLoading(tabId, msg.id, false);
+                                        }
+                                    });
+                                }
+                                
+                                // 发送取消请求到后端
+                                await invoke('ai_cancel_chat_stream', { tabId });
+                                console.log('✅ 已发送停止请求并更新消息状态');
+                            } catch (error) {
+                                console.error('❌ 停止AI回复失败:', error);
+                                // 即使后端调用失败，也要确保前端状态更新
+                                const { tabs, setMessageLoading } = useChatStore.getState();
+                                const currentTab = tabs.find(t => t.id === tabId);
+                                if (currentTab) {
+                                    currentTab.messages.forEach(msg => {
+                                        if (msg.isLoading) {
+                                            setMessageLoading(tabId, msg.id, false);
+                                        }
+                                    });
+                                }
+                            }
+                        }}
+                        className="
+                            relative px-4 py-2 bg-blue-600 text-white rounded-lg
+                            hover:bg-blue-700 active:bg-blue-800
+                            flex items-center gap-2 transition-colors
+                            cursor-pointer
+                        "
+                    >
+                        <StopIcon className="w-5 h-5" />
+                        <span>停止</span>
+                    </button>
+                ) : (
+                    // AI未回复时，显示发送按钮
+                    <button
+                        onClick={handleSend}
+                        disabled={!hasContent}
+                        className="
+                            relative px-4 py-2 bg-blue-600 text-white rounded-lg
+                            hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed
+                            flex items-center gap-2 transition-colors
+                        "
+                    >
+                        <PaperAirplaneIcon className="w-5 h-5" />
+                        <span>发送</span>
+                    </button>
+                )}
+            </div>
+            
+            {/* 模型选择器（在输入框下方靠左，常显） */}
+            <div className="mt-2 flex items-center">
+                <ModelSelector tabId={tabId} />
             </div>
         </div>
     );

@@ -7,12 +7,22 @@ use crate::services::libreoffice_service::LibreOfficeService;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
+use std::collections::HashMap;
 use tauri::{State, Emitter, AppHandle};
 use uuid::Uuid;
 use serde::{Serialize, Deserialize};
+use dirs;
+use tokio::sync::oneshot;
+use once_cell::sync::Lazy;
 
 // 全局文件监听器（单例）
 type FileWatcherState = Mutex<FileWatcherService>;
+
+// 全局预览请求去重机制：防止同一文件的并发预览请求
+// Key: 文件路径（规范化），Value: (发送器, 接收器) - 用于等待第一个请求完成
+type PreviewRequestMap = Arc<Mutex<HashMap<String, oneshot::Sender<Result<String, String>>>>>;
+static PREVIEW_REQUESTS: Lazy<PreviewRequestMap> = 
+    Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
 
 #[tauri::command]
 pub async fn build_file_tree(root_path: String, max_depth: usize) -> Result<FileTreeNode, String> {
@@ -317,6 +327,15 @@ pub async fn check_external_modification(
     
     let service = FileSystemService::new();
     service.check_external_modification(&file_path, last_modified)
+}
+
+// 获取文件大小
+#[tauri::command]
+pub async fn get_file_size(path: String) -> Result<u64, String> {
+    let file_path = PathBuf::from(&path);
+    let metadata = std::fs::metadata(&file_path)
+        .map_err(|e| format!("获取文件信息失败: {}", e))?;
+    Ok(metadata.len())
 }
 
 // 获取文件修改时间
@@ -625,20 +644,51 @@ pub async fn open_docx_for_edit(path: String) -> Result<String, String> {
         ));
     }
     
-    eprintln!("📂 [open_docx_for_edit] 开始打开 DOCX 文件进行编辑（测试：使用 Pandoc 方案）: {}", path);
+    eprintln!("📂 [open_docx_for_edit] 开始打开 DOCX 文件进行编辑: {}", path);
+    eprintln!("📂 [open_docx_for_edit] 文件路径: {:?}", docx_path);
     
     // 3. 使用 Pandoc 方案（与预览模式相同）
+    eprintln!("📂 [open_docx_for_edit] 创建 PandocService...");
     let pandoc_service = PandocService::new();
     
+    eprintln!("📂 [open_docx_for_edit] 检查 Pandoc 可用性...");
     if !pandoc_service.is_available() {
+        eprintln!("❌ [open_docx_for_edit] Pandoc 不可用");
         return Err("Pandoc 不可用，请安装 Pandoc 或确保内置 Pandoc 可用。\n访问 https://pandoc.org/installing.html 获取安装指南。".to_string());
     }
+    eprintln!("✅ [open_docx_for_edit] Pandoc 可用");
     
     // 4. 转换 DOCX 到 HTML（使用与预览模式相同的逻辑）
-    let html = pandoc_service.convert_document_to_html(&docx_path)?;
-    
-    eprintln!("✅ [open_docx_for_edit] Pandoc 转换完成，HTML 长度: {} 字符", html.len());
-    
+    eprintln!("📂 [open_docx_for_edit] 开始转换 DOCX 到 HTML...");
+    let html = match std::panic::catch_unwind(|| {
+        // 编辑模式：传入文档所在目录，使 Pandoc --extract-media=. 解压到该目录，图片能被找到并转 base64；预览等其它路径不调用本函数
+        pandoc_service.convert_document_to_html(&docx_path, docx_path.parent())
+    }) {
+        Ok(Ok(html)) => {
+            eprintln!("✅ [open_docx_for_edit] Pandoc 转换成功，HTML 长度: {} 字节", html.len());
+            html
+        }
+        Ok(Err(e)) => {
+            eprintln!("❌ [open_docx_for_edit] Pandoc 转换失败: {}", e);
+            return Err(format!("DOCX 转换失败: {}", e));
+        }
+        Err(panic_info) => {
+            eprintln!("❌ [open_docx_for_edit] Pandoc 转换 panic: {:?}", panic_info);
+            return Err("DOCX 转换失败（panic）".to_string());
+        }
+    };
+
+    // 5. 限制返回 HTML 大小，避免超大内容导致 WebView/编辑器崩溃（OOM 或闪退）
+    const MAX_HTML_BYTES: usize = 15 * 1024 * 1024; // 15MB
+    if html.len() > MAX_HTML_BYTES {
+        eprintln!("❌ [open_docx_for_edit] 转换后 HTML 过大 ({} MB)，超过编辑模式限制 (15 MB)，可能导致应用崩溃", html.len() / 1024 / 1024);
+        return Err(format!(
+            "文档内容过大（转换后约 {:.1} MB），编辑模式暂不支持超过 15 MB 的文档，可能造成应用卡顿或闪退。\n建议：使用「预览」模式查看，或先缩小文档（如减少图片、分拆文档）后再编辑。",
+            html.len() as f64 / 1024.0 / 1024.0
+        ));
+    }
+
+    eprintln!("✅ [open_docx_for_edit] 完成，返回 HTML ({} 字节)", html.len());
     Ok(html)
 }
 
@@ -950,6 +1000,36 @@ pub async fn cleanup_all_temp_files(workspace_path: String) -> Result<usize, Str
     Ok(cleaned_count)
 }
 
+/// 一键清除预览缓存（仅清除 PDF 缓存与 temp，保留 lo_user 以保持预览默认字体一致）
+#[tauri::command]
+pub async fn clear_preview_cache() -> Result<String, String> {
+    let app_data_dir = dirs::data_dir()
+        .ok_or_else(|| "无法获取应用数据目录".to_string())?;
+    let cache_dir = app_data_dir.join("binder").join("cache").join("preview");
+    if !cache_dir.exists() {
+        return Ok("预览缓存目录不存在，无需清除".to_string());
+    }
+    let mut removed = 0u32;
+    // 只删除缓存的 PDF 文件与 temp 目录，保留 lo_user（字体配置 profile），避免清除后预览字体随机
+    if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.ends_with(".pdf") {
+                if std::fs::remove_file(&path).is_ok() {
+                    removed += 1;
+                }
+            } else if name == "temp" && path.is_dir() {
+                let _ = std::fs::remove_dir_all(&path);
+                removed += 1;
+            }
+        }
+    }
+    // 不删除 lo_user，保证 DOCX/PPTX/Excel 转 PDF 时默认字体（如 PingFang SC / Arial）稳定
+    eprintln!("✅ [clear_preview_cache] 已清除 PDF 与 temp，保留 lo_user: {:?}", cache_dir);
+    Ok("预览缓存已清除，下次预览将重新生成（默认字体配置已保留）".to_string())
+}
+
 #[tauri::command]
 pub async fn save_docx(path: String, html_content: String, app: tauri::AppHandle) -> Result<(), String> {
     let pandoc_service = PandocService::new();
@@ -1014,7 +1094,46 @@ pub async fn preview_docx_as_pdf(
         return Err(format!("文件不存在: {}", path));
     }
     
-    eprintln!("🔍 [preview_docx_as_pdf] 开始预览: {:?}", docx_path);
+    // 规范化文件路径（用于去重）
+    let normalized_path = docx_path.canonicalize()
+        .unwrap_or_else(|_| docx_path.clone())
+        .to_string_lossy()
+        .to_string();
+    
+    eprintln!("🔍 [preview_docx_as_pdf] 开始预览: {:?} (规范化路径: {})", docx_path, normalized_path);
+    
+    // 检查是否有正在进行的预览请求
+    let (tx, rx) = oneshot::channel();
+    let is_first_request = {
+        let mut requests = PREVIEW_REQUESTS.lock().unwrap();
+        if requests.contains_key(&normalized_path) {
+            // 已有请求在进行，等待第一个请求完成
+            eprintln!("⏳ [preview_docx_as_pdf] 检测到并发请求，等待第一个请求完成: {}", normalized_path);
+            false
+        } else {
+            // 这是第一个请求，注册它
+            requests.insert(normalized_path.clone(), tx);
+            eprintln!("✅ [preview_docx_as_pdf] 注册为新请求: {}", normalized_path);
+            true
+        }
+    };
+    
+    // 如果不是第一个请求，等待第一个请求的结果
+    if !is_first_request {
+        eprintln!("⏳ [preview_docx_as_pdf] 等待第一个请求完成...");
+        match rx.await {
+            Ok(result) => {
+                eprintln!("✅ [preview_docx_as_pdf] 收到第一个请求的结果");
+                return result;
+            }
+            Err(_) => {
+                eprintln!("⚠️ [preview_docx_as_pdf] 第一个请求的发送器已关闭，重新发起请求");
+                // 发送器已关闭，说明第一个请求失败了，重新发起
+                let mut requests = PREVIEW_REQUESTS.lock().unwrap();
+                requests.remove(&normalized_path);
+            }
+        }
+    }
     
     // 发送预览进度事件：开始
     app.emit("preview-progress", serde_json::json!({
@@ -1063,12 +1182,92 @@ pub async fn preview_docx_as_pdf(
     let pdf_path = match pdf_path_result {
         Ok(Ok(Ok(path))) => path,
         Ok(Ok(Err(e))) => {
-            // 转换失败
-            let error_msg = format!("预览失败: {}", e);
+            // 转换失败 - 收集详细的诊断信息
+            let mut diagnostics = Vec::new();
+            
+            // 重新创建服务实例以获取缓存目录（因为之前的实例在闭包内被移动了）
+            // 或者直接使用相同的逻辑获取缓存目录路径
+            let app_data_dir = dirs::data_dir()
+                .ok_or_else(|| "无法获取应用数据目录".to_string())?;
+            let cache_dir = app_data_dir.join("binder").join("cache").join("preview");
+            let output_dir = cache_dir.join("temp");
+            
+            // 检查输出目录
+            diagnostics.push(format!("输出目录: {:?}", output_dir));
+            
+            if output_dir.exists() {
+                diagnostics.push("输出目录存在".to_string());
+                // 列出输出目录内容
+                if let Ok(entries) = std::fs::read_dir(&output_dir) {
+                    let mut file_list = Vec::new();
+                    for entry in entries {
+                        if let Ok(entry) = entry {
+                            let path = entry.path();
+                            if let Ok(metadata) = std::fs::metadata(&path) {
+                                file_list.push(format!("{:?} ({} 字节)", 
+                                    path.file_name().unwrap_or_default(),
+                                    metadata.len()));
+                            }
+                        }
+                    }
+                    if file_list.is_empty() {
+                        diagnostics.push("输出目录为空".to_string());
+                    } else {
+                        diagnostics.push(format!("输出目录内容: {}", file_list.join(", ")));
+                    }
+                } else {
+                    diagnostics.push("无法读取输出目录".to_string());
+                }
+            } else {
+                diagnostics.push("输出目录不存在".to_string());
+            }
+            
+            // 检查 LibreOffice 路径
+            if let Ok(diag_service) = LibreOfficeService::new() {
+                if let Ok(lo_path) = diag_service.get_libreoffice_path() {
+                    diagnostics.push(format!("LibreOffice 路径: {:?}", lo_path));
+                    if lo_path.exists() {
+                        diagnostics.push("LibreOffice 可执行文件存在".to_string());
+                    } else {
+                        diagnostics.push("LibreOffice 可执行文件不存在".to_string());
+                    }
+                } else {
+                    diagnostics.push("无法获取 LibreOffice 路径".to_string());
+                }
+            }
+            
+            // 检查输入文件
+            diagnostics.push(format!("输入文件: {:?}", docx_path));
+            if docx_path.exists() {
+                if let Ok(metadata) = std::fs::metadata(&docx_path) {
+                    diagnostics.push(format!("输入文件大小: {} 字节", metadata.len()));
+                }
+            } else {
+                diagnostics.push("输入文件不存在".to_string());
+            }
+            
+            let error_msg = format!("预览失败: {}\n\n诊断信息:\n{}", e, diagnostics.join("\n"));
+            
+            // 发送详细的错误信息到前端
             app.emit("preview-progress", serde_json::json!({
                 "status": "failed",
-                "message": &error_msg
+                "message": &error_msg,
+                "diagnostics": diagnostics
             })).ok();
+            
+            eprintln!("❌ [preview_docx_as_pdf] 转换失败:");
+            eprintln!("   错误: {}", e);
+            eprintln!("   诊断信息:");
+            for diag in &diagnostics {
+                eprintln!("     - {}", diag);
+            }
+            
+            // 清理请求注册并通知等待的请求
+            let mut requests = PREVIEW_REQUESTS.lock().unwrap();
+            if let Some(tx) = requests.remove(&normalized_path) {
+                let _ = tx.send(Err(error_msg.clone()));
+            }
+            
             return Err(error_msg);
         }
         Ok(Err(e)) => {
@@ -1078,6 +1277,13 @@ pub async fn preview_docx_as_pdf(
                 "status": "failed",
                 "message": &error_msg
             })).ok();
+            
+            // 清理请求注册并通知等待的请求
+            let mut requests = PREVIEW_REQUESTS.lock().unwrap();
+            if let Some(tx) = requests.remove(&normalized_path) {
+                let _ = tx.send(Err(error_msg.clone()));
+            }
+            
             return Err(error_msg);
         }
         Err(_) => {
@@ -1088,6 +1294,13 @@ pub async fn preview_docx_as_pdf(
                 "message": &error_msg
             })).ok();
             eprintln!("⏱️ [preview_docx_as_pdf] 预览超时（30秒）");
+            
+            // 清理请求注册并通知等待的请求
+            let mut requests = PREVIEW_REQUESTS.lock().unwrap();
+            if let Some(tx) = requests.remove(&normalized_path) {
+                let _ = tx.send(Err(error_msg.clone()));
+            }
+            
             return Err(error_msg);
         }
     };
@@ -1104,6 +1317,604 @@ pub async fn preview_docx_as_pdf(
         "pdf_path": &pdf_url
     })).ok();
     
+    // 清理请求注册并通知等待的请求
+    let mut requests = PREVIEW_REQUESTS.lock().unwrap();
+    if let Some(tx) = requests.remove(&normalized_path) {
+        let _ = tx.send(Ok(pdf_url.clone()));
+        eprintln!("✅ [preview_docx_as_pdf] 已通知等待的请求");
+    }
+    
     Ok(pdf_url)
+}
+
+/// 预览 Excel 文件为 PDF（XLSX, XLS, ODS）
+/// 
+/// **功能**：转换 Excel → PDF，返回 PDF 文件路径
+/// 
+/// **使用场景**：
+/// - ExcelPreview 组件内部调用
+/// - 预览模式（isReadOnly = true）
+/// 
+/// **返回**：PDF 文件路径（file:// 绝对路径）
+/// 
+/// **缓存机制**：
+/// - 缓存键：文件路径 + 修改时间
+/// - 缓存过期：1 小时
+/// - 缓存位置：应用缓存目录
+/// 
+/// **注意**：CSV 文件不使用此命令，使用前端直接解析
+#[tauri::command]
+pub async fn preview_excel_as_pdf(
+    path: String,
+    app: AppHandle,
+) -> Result<String, String> {
+    let excel_path = PathBuf::from(&path);
+    
+    // 检查文件是否存在
+    if !excel_path.exists() {
+        return Err(format!("文件不存在: {}", path));
+    }
+    
+    eprintln!("🔍 [preview_excel_as_pdf] 开始预览: {:?}", excel_path);
+    
+    // 发送预览进度事件：开始
+    app.emit("preview-progress", serde_json::json!({
+        "status": "started",
+        "message": "正在预览..."
+    })).ok();
+    
+    // 创建 LibreOffice 服务
+    let lo_service = LibreOfficeService::new()
+        .map_err(|e| {
+            let error_msg = format!("LibreOffice 服务初始化失败: {}", e);
+            app.emit("preview-progress", serde_json::json!({
+                "status": "failed",
+                "message": &error_msg
+            })).ok();
+            error_msg
+        })?;
+    
+    // 检查 LibreOffice 是否可用
+    let libreoffice_path_result = lo_service.get_libreoffice_path();
+    if libreoffice_path_result.is_err() {
+        let error_msg = libreoffice_path_result.unwrap_err();
+        app.emit("preview-progress", serde_json::json!({
+            "status": "failed",
+            "message": &error_msg
+        })).ok();
+        return Err(error_msg);
+    }
+    
+    // 发送预览进度事件：预览中
+    app.emit("preview-progress", serde_json::json!({
+        "status": "converting",
+        "message": "正在预览..."
+    })).ok();
+    
+    // 执行转换（带超时：30秒）
+    let excel_path_clone = excel_path.clone();
+    let lo_service_arc = Arc::new(lo_service);
+    let pdf_path_result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || {
+            lo_service_arc.convert_excel_to_pdf(&excel_path_clone)
+        })
+    ).await;
+    
+    let pdf_path = match pdf_path_result {
+        Ok(Ok(Ok(path))) => path,
+        Ok(Ok(Err(e))) => {
+            let error_msg = format!("预览失败: {}", e);
+            app.emit("preview-progress", serde_json::json!({
+                "status": "failed",
+                "message": &error_msg
+            })).ok();
+            return Err(error_msg);
+        }
+        Ok(Err(e)) => {
+            let error_msg = format!("预览失败: {}", e);
+            app.emit("preview-progress", serde_json::json!({
+                "status": "failed",
+                "message": &error_msg
+            })).ok();
+            return Err(error_msg);
+        }
+        Err(_) => {
+            let error_msg = "预览失败，你的文件过大或存在无法预览的格式，请调整文档。".to_string();
+            app.emit("preview-progress", serde_json::json!({
+                "status": "failed",
+                "message": &error_msg
+            })).ok();
+            eprintln!("⏱️ [preview_excel_as_pdf] 预览超时（30秒）");
+            return Err(error_msg);
+        }
+    };
+    
+    // 转换为 file:// URL
+    let pdf_url = format!("file://{}", pdf_path.to_string_lossy());
+    
+    eprintln!("✅ [preview_excel_as_pdf] 转换完成: {}", pdf_url);
+    
+    // 发送预览进度事件：完成
+    app.emit("preview-progress", serde_json::json!({
+        "status": "completed",
+        "message": "预览完成",
+        "pdf_path": &pdf_url
+    })).ok();
+    
+    Ok(pdf_url)
+}
+
+/// 预览演示文稿文件为 PDF（PPTX, PPT, PPSX, PPS, ODP）
+/// 
+/// **功能**：转换演示文稿 → PDF，返回 PDF 文件路径
+/// 
+/// **使用场景**：
+/// - PresentationPreview 组件内部调用
+/// - 预览模式（isReadOnly = true）
+/// 
+/// **返回**：PDF 文件路径（file:// 绝对路径）
+/// 
+/// **缓存机制**：
+/// - 缓存键：文件路径 + 修改时间
+/// - 缓存过期：1 小时
+/// - 缓存位置：应用缓存目录
+#[tauri::command]
+pub async fn preview_presentation_as_pdf(
+    path: String,
+    app: AppHandle,
+) -> Result<String, String> {
+    let presentation_path = PathBuf::from(&path);
+    
+    // 检查文件是否存在
+    if !presentation_path.exists() {
+        return Err(format!("文件不存在: {}", path));
+    }
+    
+    // 规范化路径（与 preview_docx_as_pdf 共用 PREVIEW_REQUESTS，按路径去重，避免同一文件并发转换导致 temp 争用与字体不一致）
+    let normalized_path = presentation_path.canonicalize()
+        .unwrap_or_else(|_| presentation_path.clone())
+        .to_string_lossy()
+        .to_string();
+    
+    eprintln!("🔍 [preview_presentation_as_pdf] 开始预览: {:?} (规范化路径: {})", presentation_path, normalized_path);
+    
+    // 检查是否有正在进行的预览请求（同一文件只允许一个转换，后续请求等待第一个结果）
+    let (tx, rx) = oneshot::channel();
+    let is_first_request = {
+        let mut requests = PREVIEW_REQUESTS.lock().unwrap();
+        if requests.contains_key(&normalized_path) {
+            eprintln!("⏳ [preview_presentation_as_pdf] 检测到并发请求，等待第一个请求完成: {}", normalized_path);
+            false
+        } else {
+            requests.insert(normalized_path.clone(), tx);
+            eprintln!("✅ [preview_presentation_as_pdf] 注册为新请求: {}", normalized_path);
+            true
+        }
+    };
+    
+    if !is_first_request {
+        eprintln!("⏳ [preview_presentation_as_pdf] 等待第一个请求完成...");
+        match rx.await {
+            Ok(result) => {
+                eprintln!("✅ [preview_presentation_as_pdf] 收到第一个请求的结果");
+                return result;
+            }
+            Err(_) => {
+                eprintln!("⚠️ [preview_presentation_as_pdf] 第一个请求的发送器已关闭，重新发起请求");
+                let mut requests = PREVIEW_REQUESTS.lock().unwrap();
+                requests.remove(&normalized_path);
+            }
+        }
+    }
+    
+    // 发送预览进度事件：开始
+    app.emit("preview-progress", serde_json::json!({
+        "status": "started",
+        "message": "正在预览..."
+    })).ok();
+    
+    // 创建 LibreOffice 服务
+    let lo_service = match LibreOfficeService::new() {
+        Ok(s) => s,
+        Err(e) => {
+            let error_msg = format!("LibreOffice 服务初始化失败: {}", e);
+            app.emit("preview-progress", serde_json::json!({
+                "status": "failed",
+                "message": &error_msg
+            })).ok();
+            let mut requests = PREVIEW_REQUESTS.lock().unwrap();
+            if let Some(tx) = requests.remove(&normalized_path) {
+                let _ = tx.send(Err(error_msg.clone()));
+            }
+            return Err(error_msg);
+        }
+    };
+    
+    // 检查 LibreOffice 是否可用
+    let libreoffice_path_result = lo_service.get_libreoffice_path();
+    if libreoffice_path_result.is_err() {
+        let error_msg = libreoffice_path_result.unwrap_err();
+        app.emit("preview-progress", serde_json::json!({
+            "status": "failed",
+            "message": &error_msg
+        })).ok();
+        let mut requests = PREVIEW_REQUESTS.lock().unwrap();
+        if let Some(tx) = requests.remove(&normalized_path) {
+            let _ = tx.send(Err(error_msg.clone()));
+        }
+        return Err(error_msg);
+    }
+    
+    // 发送预览进度事件：预览中
+    app.emit("preview-progress", serde_json::json!({
+        "status": "converting",
+        "message": "正在预览..."
+    })).ok();
+    
+    // 执行转换（带超时：30秒）
+    let presentation_path_clone = presentation_path.clone();
+    let lo_service_arc = Arc::new(lo_service);
+    let pdf_path_result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || {
+            lo_service_arc.convert_presentation_to_pdf(&presentation_path_clone)
+        })
+    ).await;
+    
+    let pdf_path = match pdf_path_result {
+        Ok(Ok(Ok(path))) => path,
+        Ok(Ok(Err(e))) => {
+            let error_msg = format!("预览失败: {}", e);
+            app.emit("preview-progress", serde_json::json!({
+                "status": "failed",
+                "message": &error_msg
+            })).ok();
+            let mut requests = PREVIEW_REQUESTS.lock().unwrap();
+            if let Some(tx) = requests.remove(&normalized_path) {
+                let _ = tx.send(Err(error_msg.clone()));
+            }
+            return Err(error_msg);
+        }
+        Ok(Err(e)) => {
+            let error_msg = format!("预览失败: {}", e);
+            app.emit("preview-progress", serde_json::json!({
+                "status": "failed",
+                "message": &error_msg
+            })).ok();
+            let mut requests = PREVIEW_REQUESTS.lock().unwrap();
+            if let Some(tx) = requests.remove(&normalized_path) {
+                let _ = tx.send(Err(error_msg.clone()));
+            }
+            return Err(error_msg);
+        }
+        Err(_) => {
+            let error_msg = "预览失败，你的文件过大或存在无法预览的格式，请调整文档。".to_string();
+            app.emit("preview-progress", serde_json::json!({
+                "status": "failed",
+                "message": &error_msg
+            })).ok();
+            eprintln!("⏱️ [preview_presentation_as_pdf] 预览超时（30秒）");
+            let mut requests = PREVIEW_REQUESTS.lock().unwrap();
+            if let Some(tx) = requests.remove(&normalized_path) {
+                let _ = tx.send(Err(error_msg.clone()));
+            }
+            return Err(error_msg);
+        }
+    };
+    
+    // 转换为 file:// URL
+    let pdf_url = format!("file://{}", pdf_path.to_string_lossy());
+    
+    eprintln!("✅ [preview_presentation_as_pdf] 转换完成: {}", pdf_url);
+    
+    // 发送预览进度事件：完成
+    app.emit("preview-progress", serde_json::json!({
+        "status": "completed",
+        "message": "预览完成",
+        "pdf_path": &pdf_url
+    })).ok();
+    
+    // 通知等待的并发请求使用同一结果
+    let mut requests = PREVIEW_REQUESTS.lock().unwrap();
+    if let Some(tx) = requests.remove(&normalized_path) {
+        let _ = tx.send(Ok(pdf_url.clone()));
+        eprintln!("✅ [preview_presentation_as_pdf] 已通知等待的请求");
+    }
+    
+    Ok(pdf_url)
+}
+
+/// 记录文件为 Binder 创建的文件
+#[tauri::command]
+pub async fn record_binder_file(
+    file_path: String,
+    source: String, // "new" 或 "ai_generated"
+    workspace_path: Option<String>, // 可选的工作区路径（如果提供，直接使用；否则从文件路径推断）
+) -> Result<(), String> {
+    use serde_json;
+    use std::fs;
+    
+    // 确定工作区路径
+    let workspace_path = if let Some(ws_path) = workspace_path {
+        // 如果提供了工作区路径，直接使用
+        PathBuf::from(&ws_path)
+    } else {
+        // 否则从文件路径推断工作区路径
+        let path_buf = PathBuf::from(&file_path);
+        if let Some(parent) = path_buf.parent() {
+            // 向上查找 .binder 目录来确定工作区根目录
+            let mut current = parent;
+            loop {
+                let binder_dir = current.join(".binder");
+                if binder_dir.exists() {
+                    break current.to_path_buf();
+                }
+                if let Some(p) = current.parent() {
+                    current = p;
+                } else {
+                    // 如果找不到 .binder 目录，使用文件所在目录作为工作区
+                    break parent.to_path_buf();
+                }
+            }
+        } else {
+            return Err("无法确定工作区路径".to_string());
+        }
+    };
+    
+    let metadata_file = workspace_path.join(".binder").join("files_metadata.json");
+    
+    // 确保 .binder 目录存在
+    if let Some(parent) = metadata_file.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("创建 .binder 目录失败: {}", e))?;
+    }
+    
+    // 读取现有元数据
+    let mut metadata: HashMap<String, serde_json::Value> = if metadata_file.exists() {
+        let content = fs::read_to_string(&metadata_file)
+            .map_err(|e| format!("读取元数据文件失败: {}", e))?;
+        serde_json::from_str(&content).unwrap_or_else(|_| HashMap::new())
+    } else {
+        HashMap::new()
+    };
+    
+    // 规范化文件路径（使用相对路径）
+    // ⚠️ 关键：统一使用正斜杠，确保与前端一致
+    let workspace_path_str = workspace_path.to_string_lossy().to_string().replace('\\', "/");
+    let file_path_normalized = file_path.replace('\\', "/");
+    
+    // 规范化工作区路径和文件路径，移除末尾的斜杠
+    let workspace_path_clean = workspace_path_str.trim_end_matches('/');
+    let file_path_clean = file_path_normalized.trim_end_matches('/');
+    
+    let normalized_path = if file_path_clean.starts_with(workspace_path_clean) {
+        file_path_clean.strip_prefix(workspace_path_clean)
+            .unwrap_or(file_path_clean)
+            .trim_start_matches('/')
+            .trim_start_matches('\\')
+            .to_string()
+    } else {
+        // 如果路径不匹配，尝试规范化后再次匹配
+        // 可能是路径格式不一致导致的
+        eprintln!("⚠️ [record_binder_file] 路径不匹配，使用完整路径: file_path={}, workspace={}", file_path_clean, workspace_path_clean);
+        file_path_clean.to_string()
+    };
+    
+    // 记录文件元数据
+    metadata.insert(normalized_path.clone(), serde_json::json!({
+        "source": source,
+        "created_at": SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }));
+    
+    // 写回文件
+    let json_content = serde_json::to_string_pretty(&metadata)
+        .map_err(|e| format!("序列化元数据失败: {}", e))?;
+    fs::write(&metadata_file, json_content)
+        .map_err(|e| format!("写入元数据文件失败: {}", e))?;
+    
+    eprintln!("✅ [record_binder_file] 已记录文件:");
+    eprintln!("   原始文件路径: {}", file_path);
+    eprintln!("   工作区路径: {}", workspace_path_str);
+    eprintln!("   规范化路径: {} (source: {})", normalized_path, source);
+    eprintln!("   元数据文件: {:?}", metadata_file);
+    eprintln!("   元数据条目数（记录后）: {}", metadata.len());
+    
+    Ok(())
+}
+
+/// 获取文件的来源（如果是 Binder 创建的文件）
+#[tauri::command]
+pub async fn get_binder_file_source(
+    file_path: String,
+    workspace_path: Option<String>, // 可选的工作区路径（如果提供，直接使用；否则从文件路径推断）
+) -> Result<Option<String>, String> {
+    use serde_json;
+    use std::fs;
+    
+    // 确定工作区路径
+    let workspace_path = if let Some(ws_path) = workspace_path {
+        // 如果提供了工作区路径，直接使用
+        PathBuf::from(&ws_path)
+    } else {
+        // 否则从文件路径推断工作区路径
+        let path_buf = PathBuf::from(&file_path);
+        if let Some(parent) = path_buf.parent() {
+            let mut current = parent;
+            loop {
+                let binder_dir = current.join(".binder");
+                if binder_dir.exists() {
+                    break current.to_path_buf();
+                }
+                if let Some(p) = current.parent() {
+                    current = p;
+                } else {
+                    // 如果找不到 .binder 目录，使用文件所在目录作为工作区
+                    break parent.to_path_buf();
+                }
+            }
+        } else {
+            return Ok(None);
+        }
+    };
+    
+    let metadata_file = workspace_path.join(".binder").join("files_metadata.json");
+    
+    if !metadata_file.exists() {
+        return Ok(None);
+    }
+    
+    // 读取元数据
+    let content = fs::read_to_string(&metadata_file)
+        .map_err(|e| format!("读取元数据文件失败: {}", e))?;
+    let metadata: HashMap<String, serde_json::Value> = serde_json::from_str(&content)
+        .map_err(|e| format!("解析元数据文件失败: {}", e))?;
+    
+    // 规范化文件路径
+    // ⚠️ 关键：统一使用正斜杠，确保与前端一致
+    let workspace_path_str = workspace_path.to_string_lossy().to_string().replace('\\', "/");
+    let file_path_normalized = file_path.replace('\\', "/");
+    
+    // 规范化工作区路径和文件路径，移除末尾的斜杠
+    let workspace_path_clean = workspace_path_str.trim_end_matches('/');
+    let file_path_clean = file_path_normalized.trim_end_matches('/');
+    
+    let normalized_path = if file_path_clean.starts_with(workspace_path_clean) {
+        file_path_clean.strip_prefix(workspace_path_clean)
+            .unwrap_or(file_path_clean)
+            .trim_start_matches('/')
+            .trim_start_matches('\\')
+            .to_string()
+    } else {
+        // 如果路径不匹配，尝试规范化后再次匹配
+        // 可能是路径格式不一致导致的
+        eprintln!("⚠️ [get_binder_file_source] 路径不匹配，使用完整路径: file_path={}, workspace={}", file_path_clean, workspace_path_clean);
+        file_path_clean.to_string()
+    };
+    
+    // 查找文件元数据
+    eprintln!("🔍 [get_binder_file_source] 查询文件:");
+    eprintln!("   文件路径: {}", file_path);
+    eprintln!("   工作区路径: {}", workspace_path_str);
+    eprintln!("   规范化路径: {}", normalized_path);
+    eprintln!("   元数据文件: {:?}", metadata_file);
+    eprintln!("   元数据条目数: {}", metadata.len());
+    
+    if let Some(entry) = metadata.get(&normalized_path) {
+        if let Some(source) = entry.get("source").and_then(|s| s.as_str()) {
+            eprintln!("✅ [get_binder_file_source] 找到元数据: {}", source);
+            return Ok(Some(source.to_string()));
+        }
+    }
+    
+    // 如果直接匹配失败，尝试所有可能的路径变体
+    eprintln!("⚠️ [get_binder_file_source] 直接匹配失败，尝试路径变体...");
+    eprintln!("   尝试匹配的路径: {}", normalized_path);
+    
+    // 打印所有元数据键，用于调试
+    eprintln!("   元数据文件中的所有键:");
+    for key in metadata.keys() {
+        eprintln!("     - {}", key);
+    }
+    
+    // 尝试不同的路径分隔符和格式
+    let mut variants = vec![
+        normalized_path.clone(),
+        normalized_path.replace('/', "\\"),
+        normalized_path.replace('\\', "/"),
+        format!("/{}", normalized_path.trim_start_matches('/').trim_start_matches('\\')),
+        format!("\\{}", normalized_path.trim_start_matches('/').trim_start_matches('\\')),
+        normalized_path.trim_start_matches('/').trim_start_matches('\\').to_string(),
+    ];
+    
+    // ⚠️ 关键修复：如果路径匹配失败，尝试只用文件名匹配
+    // 因为有些旧文件可能只存储了文件名（历史遗留问题）
+    if let Some(file_name) = normalized_path.split('/').last().or_else(|| normalized_path.split('\\').last()) {
+        if !file_name.is_empty() && file_name != &normalized_path {
+            // 文件名与完整路径不同，添加文件名到变体列表
+            variants.push(file_name.to_string());
+            eprintln!("⚠️ [get_binder_file_source] 添加文件名变体: {}", file_name);
+        }
+    }
+    
+    for variant in variants {
+        if let Some(entry) = metadata.get(&variant) {
+            if let Some(source) = entry.get("source").and_then(|s| s.as_str()) {
+                eprintln!("✅ [get_binder_file_source] 通过路径变体找到: {} (variant: {})", source, variant);
+                return Ok(Some(source.to_string()));
+            }
+        }
+    }
+    
+    eprintln!("❌ [get_binder_file_source] 未找到元数据");
+    Ok(None)
+}
+
+/// 删除文件的元数据记录
+#[tauri::command]
+pub async fn remove_binder_file_record(
+    file_path: String,
+) -> Result<(), String> {
+    use serde_json;
+    use std::fs;
+    
+    // 从文件路径推断工作区路径
+    let path_buf = PathBuf::from(&file_path);
+    let workspace_path = if let Some(parent) = path_buf.parent() {
+        let mut current = parent;
+        loop {
+            let binder_dir = current.join(".binder");
+            if binder_dir.exists() {
+                break current.to_path_buf();
+            }
+            if let Some(p) = current.parent() {
+                current = p;
+            } else {
+                break parent.to_path_buf();
+            }
+        }
+    } else {
+        return Err("无法确定工作区路径".to_string());
+    };
+    
+    let metadata_file = workspace_path.join(".binder").join("files_metadata.json");
+    
+    if !metadata_file.exists() {
+        return Ok(()); // 文件不存在，无需删除
+    }
+    
+    // 读取现有元数据
+    let content = fs::read_to_string(&metadata_file)
+        .map_err(|e| format!("读取元数据文件失败: {}", e))?;
+    let mut metadata: HashMap<String, serde_json::Value> = serde_json::from_str(&content)
+        .map_err(|e| format!("解析元数据文件失败: {}", e))?;
+    
+    // 规范化文件路径
+    let workspace_path_str = workspace_path.to_string_lossy().to_string();
+    let normalized_path = if file_path.starts_with(&workspace_path_str) {
+        file_path.strip_prefix(&workspace_path_str)
+            .unwrap_or(&file_path)
+            .trim_start_matches('/')
+            .trim_start_matches('\\')
+            .to_string()
+    } else {
+        file_path.clone()
+    };
+    
+    // 删除记录
+    metadata.remove(&normalized_path);
+    
+    // 写回文件
+    let json_content = serde_json::to_string_pretty(&metadata)
+        .map_err(|e| format!("序列化元数据失败: {}", e))?;
+    fs::write(&metadata_file, json_content)
+        .map_err(|e| format!("写入元数据文件失败: {}", e))?;
+    
+    eprintln!("✅ [remove_binder_file_record] 已删除文件记录: {}", normalized_path);
+    
+    Ok(())
 }
 

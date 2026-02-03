@@ -7,6 +7,12 @@ export default defineConfig(async () => ({
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   clearScreen: false,
+  
+  // 禁用 source map 以减少控制台错误
+  build: {
+    sourcemap: false,
+  },
+  
   // tauri expects a fixed port, fail if that port is not available
   server: {
     port: 1420,

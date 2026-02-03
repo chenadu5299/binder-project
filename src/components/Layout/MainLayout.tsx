@@ -8,7 +8,7 @@ import EditorPanel from '../Editor/EditorPanel';
 import ChatPanel from '../Chat/ChatPanel';
 import FloatingActionButton from '../Chat/FloatingActionButton';
 import PanelResizer from './PanelResizer';
-import TitleBar from './TitleBar';
+import StatusBar from '../StatusBar/StatusBar';
 import { ToastContainer, useToastStore, toast } from '../Common/Toast';
 import { fileService } from '../../services/fileService';
 
@@ -135,9 +135,14 @@ const MainLayout: React.FC = () => {
     
     const minWidth = 250;
     const maxWidth = 800;
-    const newWidth = Math.max(minWidth, Math.min(maxWidth, chatStartWidthRef.current - deltaX));
+    
+    // 计算可用空间（窗口宽度减去文件树宽度，如果有的话）
+    const availableWidth = window.innerWidth - (fileTree.visible ? fileTree.width : 0);
+    const effectiveMaxWidth = Math.min(maxWidth, Math.max(minWidth, availableWidth - 20)); // 留出20px余量
+    
+    const newWidth = Math.max(minWidth, Math.min(effectiveMaxWidth, chatStartWidthRef.current - deltaX));
     setChatWidth(newWidth);
-  }, [chat.width, setChatWidth]);
+  }, [chat.width, fileTree.width, fileTree.visible, setChatWidth]);
 
   // 重置拖动起始宽度
   const resetDragState = useCallback(() => {
@@ -145,11 +150,31 @@ const MainLayout: React.FC = () => {
     chatStartWidthRef.current = null;
   }, []);
 
+  // 响应式处理：窗口大小变化时，确保聊天窗口不会超出可用空间
+  useEffect(() => {
+    const handleResize = () => {
+      if (!chat.visible || isFullscreenChatMode) return;
+      
+      // 计算可用空间
+      const availableWidth = window.innerWidth - (fileTree.visible ? fileTree.width : 0);
+      const minWidth = 250;
+      
+      // 如果聊天窗口宽度超过可用空间，自动缩小
+      if (chat.width > availableWidth - 20) {
+        const newWidth = Math.max(minWidth, availableWidth - 20);
+        setChatWidth(newWidth);
+      }
+    };
+
+    window.addEventListener('resize', handleResize);
+    // 初始检查
+    handleResize();
+    
+    return () => window.removeEventListener('resize', handleResize);
+  }, [chat.visible, chat.width, fileTree.visible, fileTree.width, isFullscreenChatMode, setChatWidth]);
+
   return (
     <div className="w-screen h-screen overflow-hidden bg-gray-50 dark:bg-gray-900 flex flex-col relative">
-      {/* 固定标题栏 - Fixed Header 区域 */}
-      <TitleBar />
-
       {/* 欢迎页面 - 全屏覆盖 */}
       {shouldShowWelcome && (
         <WelcomePage
@@ -230,21 +255,15 @@ const MainLayout: React.FC = () => {
               {chat.visible && !isFullscreenChatMode && (
                 <div
                   className="bg-white dark:bg-gray-800 border-l border-gray-200 dark:border-gray-700 overflow-hidden flex-shrink-0 relative"
-                  style={{ width: chat.width, height: '100%' }}
+                  style={{ 
+                    width: chat.width, 
+                    height: '100%',
+                    maxWidth: '100%', // 确保不会超出父容器
+                    minWidth: '250px', // 最小宽度
+                  }}
                 >
                   <ChatPanel />
                 </div>
-              )}
-
-              {/* 聊天窗口展开按钮（当窗口隐藏时显示） */}
-              {!chat.visible && (
-                <button
-                  onClick={() => setChatVisible(true)}
-                  className="absolute right-0 top-1/2 transform -translate-y-1/2 bg-blue-600 text-white px-3 py-6 rounded-l-lg hover:bg-blue-700 transition-colors z-50 shadow-lg"
-                  title="打开 AI 聊天"
-                >
-                  ▶
-                </button>
               )}
 
               {/* Toast 通知 */}
@@ -252,6 +271,11 @@ const MainLayout: React.FC = () => {
             </>
           )}
         </div>
+      )}
+
+      {/* 底部状态栏 - 横跨整个应用窗口 */}
+      {!shouldShowWelcome && (
+        <StatusBar />
       )}
     </div>
   );
