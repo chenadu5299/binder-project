@@ -16,7 +16,7 @@ Binder 的 AI 功能分为三个独立的层次，每个层次有明确的职责
 ┌─────────────────────────────────────────────────────────┐
 │  层次一：自动补全（自动续写）                              │
 │  - 无 UI 窗口，幽灵文字显示                                │
-│  - 自动触发（光标静止）                                    │
+│  - 快捷键触发（Cmd+J / Ctrl+J）                              │
 │  - 类似代码补全体验                                        │
 └─────────────────────────────────────────────────────────┘
 
@@ -45,7 +45,7 @@ Binder 的 AI 功能分为三个独立的层次，每个层次有明确的职责
 
 **核心特性**：
 - ✅ **无 UI 窗口**：不占用任何面板空间
-- ✅ **自动触发**：用户无需主动调用
+- ✅ **快捷键触发**：用户通过快捷键（如 Cmd+J）主动触发，不再自动触发
 - ✅ **幽灵文字**：在光标后方显示半透明的续写内容
 - ✅ **非侵入式**：不打断用户写作流程
 
@@ -56,77 +56,18 @@ Binder 的 AI 功能分为三个独立的层次，每个层次有明确的职责
 
 ### 2.2 触发机制
 
-**触发条件**：
-- 光标在文档中**静止不动**（无输入、无移动）
-- 静止时间达到阈值：**7 秒**（可配置，范围 5-15 秒）
+**触发方式**：快捷键触发（如 Cmd+J / Ctrl+J），用户主动触发，不再自动触发
+
+**触发条件**（快捷键按下时检查）：
+- 光标在文档中
 - 光标位置有足够的上下文（至少 100 字符）
 - 光标位置不是文档末尾（末尾不续写）
-- 用户未输入新内容
-- 用户未移动光标
+- 无选中文本
 
 **触发逻辑**：
-```typescript
-// src/hooks/useAutoComplete.ts
-export const useAutoComplete = (editor: Editor | null) => {
-  const [ghostText, setGhostText] = useState<string | null>(null);
-  const idleTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const IDLE_THRESHOLD = 7000; // 7秒（可配置，范围 5-15 秒）
-  
-  useEffect(() => {
-    if (!editor) return;
-    
-    // 监听光标位置变化
-    const handleSelectionUpdate = () => {
-      // 重置计时器
-      if (idleTimerRef.current) {
-        clearTimeout(idleTimerRef.current);
-        setGhostText(null); // 清除之前的幽灵文字
-      }
-      
-      // 开始新的计时
-      idleTimerRef.current = setTimeout(async () => {
-        const { from } = editor.state.selection;
-        
-        // 获取光标前的上下文（前 2000 字符）
-        const contextStart = Math.max(0, from - 2000);
-        const contextBefore = editor.state.doc.textBetween(contextStart, from);
-        
-        // 调用 AI 生成续写
-        const completion = await invoke<string>('ai_autocomplete', {
-          context: contextBefore,
-          position: from,
-          maxLength: 50, // 限制长度
-        });
-        
-        if (completion) {
-          setGhostText(completion);
-        }
-      }, IDLE_THRESHOLD);
-    };
-    
-    // 监听输入事件（重置计时器）
-    const handleUpdate = () => {
-      if (idleTimerRef.current) {
-        clearTimeout(idleTimerRef.current);
-        setGhostText(null);
-      }
-    };
-    
-    editor.on('selectionUpdate', handleSelectionUpdate);
-    editor.on('update', handleUpdate);
-    
-    return () => {
-      editor.off('selectionUpdate', handleSelectionUpdate);
-      editor.off('update', handleUpdate);
-      if (idleTimerRef.current) {
-        clearTimeout(idleTimerRef.current);
-      }
-    };
-  }, [editor]);
-  
-  return { ghostText };
-};
-```
+- 监听快捷键事件（如 Cmd+J / Ctrl+J）
+- 用户按下快捷键后立即调用 AI 生成续写
+- 显示幽灵文字
 
 ### 2.3 UI 实现
 
@@ -168,7 +109,7 @@ export const GhostText: React.FC<{ text: string; position: number }> = ({ text, 
 - 不阻塞编辑器操作
 - 使用快速模型（GPT-3.5、Claude Haiku 等）
 - 限制生成长度（20-50 字符）
-- 防抖机制（7 秒触发一次）
+- 快捷键触发（无自动触发，用户主动控制）
 
 ### 2.4 后端实现
 
@@ -213,7 +154,7 @@ pub async fn ai_autocomplete(
 **性能考虑**：
 - 使用快速模型（GPT-3.5、Claude Haiku 等）
 - 限制生成长度（20-50 字符）
-- 防抖机制（7 秒触发一次）
+- 快捷键触发（无自动触发，用户主动控制）
 
 ---
 
@@ -479,7 +420,7 @@ pub async fn ai_inline_assist(
 - ✅ AI 模型配置
 
 **与层次一的区别**：
-- 层次一：自动触发，续写
+- 层次一：快捷键触发，续写
 - 层次二：手动触发（快捷键），执行指令
 
 **与层次三的区别**：
@@ -1251,7 +1192,7 @@ impl AIService {
 1. **自动补全**：
    - 使用快速模型
    - 限制生成长度
-   - 防抖机制
+   - 快捷键 Cmd+J/Ctrl+J 触发
 
 2. **Inline Assist**：
    - 使用标准模型
@@ -1333,7 +1274,7 @@ src/
 
 | 特性 | 层次一（自动补全） | 层次二（Inline Assist） | 层次三（聊天窗口） |
 |------|-------------------|------------------------|-------------------|
-| **触发方式** | 自动（光标静止） | 快捷键（Cmd+K） | 手动打开窗口 |
+| **触发方式** | 快捷键（Cmd+J） | 快捷键（Cmd+K） | 手动打开窗口 |
 | **UI 形式** | 幽灵文字 | 浮动输入框 | 完整聊天界面 |
 | **交互方式** | Tab 接受 | Enter 执行 | 对话式交互 |
 | **历史记录** | 无 | 无 | 有 |
@@ -1350,7 +1291,7 @@ src/
 
 ### 10.3 关键点
 
-- **层次一**：完全自动，无 UI 窗口，类似代码补全
+- **层次一**：快捷键触发，无 UI 窗口，类似代码补全
 - **层次二**：快捷键调出，单次操作，直接修改文本
 - **层次三**：完整对话，有历史，有工具调用，有标签栏，支持引用和快捷应用
 

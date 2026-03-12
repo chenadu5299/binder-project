@@ -563,6 +563,9 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
                         fileName: source.fileName,
                         lineRange: source.lineRange || { start: 1, end: 1 },
                         charRange: source.charRange || { start: 0, end: text.length },
+                        blockId: source.blockId,
+                        startOffset: source.startOffset,
+                        endOffset: source.endOffset,
                     },
                     text
                 );

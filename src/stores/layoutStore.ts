@@ -11,6 +11,7 @@ interface LayoutState {
   // 编辑器状态
   editor: {
     visible: boolean;
+    zoom: number; // 编辑窗口缩放比例，100 = 100%
   };
   
   // 聊天窗口状态（简化版：固定右侧）
@@ -33,6 +34,7 @@ interface LayoutState {
   setFileTreeWidth: (width: number) => void;
   setFileTreeVisible: (visible: boolean) => void;
   setEditorVisible: (visible: boolean) => void;
+  setEditorZoom: (zoom: number) => void;
   setChatWidth: (width: number) => void;
   setChatVisible: (visible: boolean) => void;
   setAnalysisWidth: (width: number) => void;
@@ -48,6 +50,7 @@ const defaultState = {
   },
   editor: {
     visible: true,
+    zoom: 100,
   },
   chat: {
     width: 350,
@@ -79,6 +82,11 @@ export const useLayoutStore = create<LayoutState>()(
       setEditorVisible: (visible) =>
         set((state) => ({
           editor: { ...state.editor, visible },
+        })),
+      
+      setEditorZoom: (zoom) =>
+        set((state) => ({
+          editor: { ...state.editor, zoom: Math.max(50, Math.min(150, zoom)) },
         })),
       
       setChatWidth: (width) =>

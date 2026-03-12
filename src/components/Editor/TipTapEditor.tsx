@@ -22,10 +22,13 @@ import { useEffect, useRef } from 'react';
 import { useAutoComplete } from '../../hooks/useAutoComplete';
 import { GhostTextExtension } from './extensions/GhostTextExtension';
 import { CopyReferenceExtension } from './extensions/CopyReferenceExtension';
+import { BlockIdExtension } from './extensions/BlockIdExtension';
 import { FontSize } from './extensions/FontSize';
 import { DiffHighlightExtension } from './extensions/DiffHighlightExtension';
+import { PageTopCaretExtension } from './extensions/PageTopCaretExtension';
 import { useEditorStore } from '../../stores/editorStore';
-
+import { findBlockByBlockId, blockOffsetToPMRange } from '../../utils/editorOffsetUtils';
+import { PaginationPlus } from 'tiptap-pagination-plus';
 interface TipTapEditorProps {
   content: string;
   onChange: (content: string) => void;
@@ -33,9 +36,10 @@ interface TipTapEditorProps {
   editable?: boolean;
   onEditorReady?: (editor: any) => void;
   tabId?: string; // 添加 tabId 用于检测标签页切换
-  autoCompleteEnabled?: boolean; // 自动续写功能启用状态
   documentPath?: string; // 文档路径（用于记忆库检索）
   workspacePath?: string; // 工作区路径（用于记忆库检索）
+  layoutMode?: 'page' | 'flow'; // 分页模式：page=T-DOCX 分页编辑，flow=流式布局
+  editorZoom?: number; // 编辑窗口缩放比例，用于控制滚动条位置
 }
 
 const TipTapEditor: React.FC<TipTapEditorProps> = ({
@@ -45,9 +49,10 @@ const TipTapEditor: React.FC<TipTapEditorProps> = ({
   editable = true,
   onEditorReady,
   tabId,
-  autoCompleteEnabled = true,
   documentPath,
   workspacePath,
+  layoutMode = 'flow',
+  editorZoom = 100,
 }) => {
   // 使用 ref 来跟踪是否正在从外部设置内容，避免无限循环
   const isSettingContentRef = useRef(false);
@@ -123,6 +128,34 @@ const TipTapEditor: React.FC<TipTapEditorProps> = ({
       }),
       // 字数统计扩展
       CharacterCount,
+      // 块 ID 扩展（精确定位系统）
+      BlockIdExtension,
+      // T-DOCX 分页模式：使用 tiptap-pagination-plus（A4 纸张，Word 风格）
+      ...(layoutMode === 'page'
+        ? [
+            PaginationPlus.configure({
+              pageHeight: 1123,
+              pageWidth: 794,
+              pageGap: 24,
+              pageGapBorderSize: 1,
+              pageGapBorderColor: '#e5e5e5',
+              pageBreakBackground: '#f0f0f0',
+              marginTop: 95,
+              marginBottom: 95,
+              marginLeft: 76,
+              marginRight: 76,
+              contentMarginTop: 10,
+              contentMarginBottom: 10,
+              footerRight: '',
+              footerLeft: '',
+              headerRight: '',
+              headerLeft: '',
+              customHeader: {},
+              customFooter: {},
+            }),
+            PageTopCaretExtension,
+          ]
+        : []),
       // 添加幽灵文字扩展
       GhostTextExtension.configure({
         getGhostText: () => {
@@ -253,10 +286,32 @@ const TipTapEditor: React.FC<TipTapEditorProps> = ({
             }
             
             let tr = state.tr;
+            const doc = state.doc;
+            
+            // 精确定位：为含 block_id 的 diff 计算 from/to
+            const resolvedDiffs = currentTab.diffs.map((diff: any) => {
+              if (diff.from != null && diff.to != null) return diff;
+              const elemId = diff.element_identifier;
+              if (!elemId || typeof elemId !== 'string') return diff;
+              try {
+                const parsed = JSON.parse(elemId);
+                const { block_id, start_offset, end_offset } = parsed;
+                if (block_id != null && start_offset != null && end_offset != null) {
+                  const found = findBlockByBlockId(doc, block_id);
+                  if (found) {
+                    const range = blockOffsetToPMRange(found.node, found.docStart, start_offset, end_offset);
+                    if (range) {
+                      return { ...diff, from: range.from, to: range.to };
+                    }
+                  }
+                }
+              } catch (_) {}
+              return diff;
+            });
             
             // ⚠️ 关键修复：按从后往前的顺序应用 diff，避免位置偏移
             // 先对 diffs 按位置排序（从后往前）
-            const sortedDiffs = [...currentTab.diffs].sort((a, b) => {
+            const sortedDiffs = [...resolvedDiffs].sort((a, b) => {
               const aPos = a.to || a.from || 0;
               const bPos = b.to || b.from || 0;
               return bPos - aPos; // 从后往前排序
@@ -487,15 +542,14 @@ const TipTapEditor: React.FC<TipTapEditorProps> = ({
         onChange(html);
       }
     },
-  });
+  }, [tabId, layoutMode]); // 切换标签页或布局模式时重建编辑器
 
-  // 自动补全功能 Hook（必须在 editor 创建后调用）
+  // 自动补全功能 Hook（必须在 editor 创建后调用，快捷键 Cmd+J/Ctrl+J 触发）
   const autoComplete = useAutoComplete({
     editor,
-    triggerDelay: 7000, // 7秒延迟
     minContextLength: 50, // 最小50字符
     maxLength: 100, // 最大100字符（动态调整）
-    enabled: autoCompleteEnabled, // 使用传入的启用状态
+    enabled: true, // 快捷键 Cmd+J/Ctrl+J 触发，始终启用
     documentPath, // 文档路径（用于记忆库检索）
     workspacePath, // 工作区路径（用于记忆库检索）
   });
@@ -719,11 +773,21 @@ const TipTapEditor: React.FC<TipTapEditorProps> = ({
     );
   }
 
+  // 分页模式：所有滚动由 editor-zoom-scroll 统一处理，避免与 EditorContent 的 overflow-y-auto 产生重复/重合滚动条
+  // 流式模式：EditorContent 自身 overflow-y-auto
+  const scrollOnEditor = layoutMode !== 'page';
+
+  // 分页模式下去掉水平 padding，避免与页边距叠加导致边距为 0 时文字被遮挡
+  const contentPadding = layoutMode === 'page' ? 'py-4 px-0' : 'p-4';
+  // 分页模式下纸张居中显示
+  const contentLayout = layoutMode === 'page' ? 'flex justify-center' : '';
   return (
-    <div className="h-full flex flex-col">
+    <div className={`flex flex-col ${scrollOnEditor ? 'h-full' : 'min-h-full'}`}>
       <EditorContent 
         editor={editor} 
-        className="flex-1 overflow-y-auto p-4 prose dark:prose-invert max-w-none focus:outline-none"
+        className={`flex-1 ${contentPadding} ${contentLayout} prose dark:prose-invert max-w-none focus:outline-none ${
+          scrollOnEditor ? 'overflow-y-auto' : 'overflow-visible min-h-full'
+        }`}
       />
     </div>
   );

@@ -37,7 +37,6 @@ export interface EditorTab {
   isDraft: boolean; // ⚠️ 新增：是否为草稿文件
   lastModifiedTime: number; // ⚠️ Week 17.1.2：文件最后修改时间（毫秒时间戳）
   editor: Editor | null;
-  autoCompleteEnabled: boolean; // 自动续写功能启用状态
   diffAreaId?: string; // ⚠️ 新增：当前 diff area ID
   diffs?: Diff[]; // ⚠️ 新增：diff 数据
   oldContent?: string; // ⚠️ 新增：旧内容（用于 diff 显示）
@@ -47,7 +46,7 @@ export interface EditorTab {
 interface EditorState {
   tabs: EditorTab[];
   activeTabId: string | null;
-  addTab: (filePath: string, fileName: string, content: string, isReadOnly?: boolean, isDraft?: boolean, lastModifiedTime?: number, autoCompleteEnabled?: boolean) => string;
+  addTab: (filePath: string, fileName: string, content: string, isReadOnly?: boolean, isDraft?: boolean, lastModifiedTime?: number) => string;
   removeTab: (tabId: string) => void;
   setActiveTab: (tabId: string) => void;
   updateTabContent: (tabId: string, content: string) => void;
@@ -59,7 +58,6 @@ interface EditorState {
   updateTabPath: (tabId: string, newPath: string) => void; // ⚠️ 新增：更新标签页路径
   markTabConflict: (tabId: string) => void; // ⚠️ 新增：标记冲突
   updateTabModifiedTime: (tabId: string, modifiedTime: number) => void; // ⚠️ Week 17.1.2：更新文件修改时间
-  setAutoCompleteEnabled: (tabId: string, enabled: boolean) => void; // 设置自动续写启用状态
   setTabDiff: (tabId: string, diffAreaId: string, diffs: Diff[], oldContent: string, newContent: string) => void; // ⚠️ 新增：设置 diff 数据
   clearTabDiff: (tabId: string) => void; // ⚠️ 新增：清除 diff 数据
   applyTabDiff: (tabId: string) => void; // ⚠️ 新增：触发应用 diff（通过编辑器的 onApplyDiff）
@@ -69,7 +67,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   tabs: [],
   activeTabId: null,
 
-  addTab: (filePath, fileName, content, isReadOnly = false, isDraft = false, lastModifiedTime = Date.now(), autoCompleteEnabled = true) => {
+  addTab: (filePath, fileName, content, isReadOnly = false, isDraft = false, lastModifiedTime = Date.now()) => {
     // ⚠️ 关键：检查文件是否已打开，如果已打开则切换到该标签
     const state = get();
     const existingTab = state.tabs.find((tab) => tab.filePath === filePath);
@@ -93,7 +91,6 @@ export const useEditorStore = create<EditorState>((set, get) => ({
       isDraft, // ⚠️ 新增：草稿标记
       lastModifiedTime, // ⚠️ Week 17.1.2：文件最后修改时间
       editor: null,
-      autoCompleteEnabled, // 自动续写功能默认启用
       diffAreaId: undefined, // ⚠️ 新增：diff area ID
       diffs: undefined, // ⚠️ 新增：diff 数据
       oldContent: undefined, // ⚠️ 新增：旧内容
@@ -222,17 +219,6 @@ export const useEditorStore = create<EditorState>((set, get) => ({
       tabs: state.tabs.map((tab) =>
         tab.id === tabId
           ? { ...tab, lastModifiedTime: modifiedTime }
-          : tab
-      ),
-    }));
-  },
-
-  // 设置自动续写启用状态
-  setAutoCompleteEnabled: (tabId, enabled) => {
-    set((state) => ({
-      tabs: state.tabs.map((tab) =>
-        tab.id === tabId
-          ? { ...tab, autoCompleteEnabled: enabled }
           : tab
       ),
     }));

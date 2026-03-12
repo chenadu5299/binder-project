@@ -20,7 +20,6 @@ export interface EditorState {
 
 interface UseAutoCompleteOptions {
   editor: Editor | null;
-  triggerDelay?: number; // 触发延迟，默认 7000ms
   minContextLength?: number; // 最小上下文长度，默认 50
   maxLength?: number; // 最大续写长度，默认 50-150（动态调整）
   enabled?: boolean; // 是否启用，默认 true
@@ -30,7 +29,6 @@ interface UseAutoCompleteOptions {
 
 export function useAutoComplete({
   editor,
-  triggerDelay = 7000,
   minContextLength = 50,
   maxLength = 100, // 默认100，动态调整
   enabled = true,
@@ -44,7 +42,6 @@ export function useAutoComplete({
     isLoading: false,
   });
 
-  const triggerTimerRef = useRef<NodeJS.Timeout | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const lastContextRef = useRef<string>('');
   const lastPositionRef = useRef<number>(-1);
@@ -61,12 +58,6 @@ export function useAutoComplete({
       isVisible: false,
       isLoading: false,
     });
-
-    // 清除计时器
-    if (triggerTimerRef.current) {
-      clearTimeout(triggerTimerRef.current);
-      triggerTimerRef.current = null;
-    }
 
     // 取消请求
     if (abortControllerRef.current) {
@@ -747,11 +738,7 @@ export function useAutoComplete({
       isLoading: false,
     });
 
-    // 立即清除计时器和请求
-    if (triggerTimerRef.current) {
-      clearTimeout(triggerTimerRef.current);
-      triggerTimerRef.current = null;
-    }
+    // 立即取消请求
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
       abortControllerRef.current = null;
@@ -786,68 +773,51 @@ export function useAutoComplete({
     }, 0);
   }, [editor, state]);
 
-  // 监听编辑器事件
+  // 监听编辑器事件：用户输入或移动光标时清除幽灵文字（不自动触发）
   useEffect(() => {
-    console.log('[自动续写] 初始化事件监听', { editor: !!editor, enabled, triggerDelay });
-    if (!editor || !enabled) {
-      console.log('[自动续写] 跳过初始化: editor 或 enabled 为 false');
-      return;
-    }
+    if (!editor || !enabled) return;
 
-    // 处理选择更新（光标移动）
     const handleSelectionUpdate = () => {
-      console.log('[自动续写] 选择更新事件');
-      clear(); // 清除之前的补全
+      clear();
       isUserTypingRef.current = false;
-
-      // 清除之前的计时器
-      if (triggerTimerRef.current) {
-        clearTimeout(triggerTimerRef.current);
-      }
-
-      // 开始新的计时
-      triggerTimerRef.current = setTimeout(() => {
-        console.log('[自动续写] 定时器触发（选择更新后）');
-        trigger();
-      }, triggerDelay);
     };
 
-    // 处理内容更新（用户输入）
     const handleUpdate = () => {
-      console.log('[自动续写] 内容更新事件');
       isUserTypingRef.current = true;
-      clear(); // 用户输入时清除补全
-
-      // 清除之前的计时器，重新开始
-      if (triggerTimerRef.current) {
-        clearTimeout(triggerTimerRef.current);
-      }
-
-      triggerTimerRef.current = setTimeout(() => {
-        console.log('[自动续写] 定时器触发（内容更新后）');
-        trigger();
-      }, triggerDelay);
+      clear();
     };
 
-    // 注册事件监听
     editor.on('selectionUpdate', handleSelectionUpdate);
     editor.on('update', handleUpdate);
-    console.log('[自动续写] 事件监听已注册');
-
-    // 初始触发
-    console.log('[自动续写] 设置初始定时器', { delay: triggerDelay });
-    triggerTimerRef.current = setTimeout(() => {
-      console.log('[自动续写] 初始定时器触发');
-      trigger();
-    }, triggerDelay);
 
     return () => {
-      console.log('[自动续写] 清理事件监听');
       editor.off('selectionUpdate', handleSelectionUpdate);
       editor.off('update', handleUpdate);
       clear();
     };
-  }, [editor, enabled, triggerDelay, trigger, clear]);
+  }, [editor, enabled, clear]);
+
+  // 快捷键触发：Cmd+J (macOS) / Ctrl+J (Windows) 触发续写
+  useEffect(() => {
+    if (!editor || !enabled) return;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      // 仅在编辑器聚焦且按下 Cmd+J (Mac) 或 Ctrl+J (Win) 时触发
+      if (!editor.isFocused) return;
+      if (event.key !== 'j') return;
+      const isMod = navigator.platform.includes('Mac') ? event.metaKey : event.ctrlKey;
+      if (!isMod) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+      console.log('[自动续写] 快捷键触发：Cmd+J/Ctrl+J 请求续写');
+      clear(); // 先清除已有幽灵文字
+      trigger();
+    };
+
+    document.addEventListener('keydown', handleKeyDown, true);
+    return () => document.removeEventListener('keydown', handleKeyDown, true);
+  }, [editor, enabled, trigger, clear]);
 
   // 处理键盘事件（Tab 接受，Escape 拒绝）
   useEffect(() => {
@@ -866,19 +836,12 @@ export function useAutoComplete({
         return;
       }
 
-      // Escape 键拒绝续写，并重新触发生成
+      // Escape 键拒绝续写（用户可再次按 Cmd+J/Ctrl+J 重新触发）
       if (event.key === 'Escape') {
         event.preventDefault();
         event.stopPropagation();
-        console.log('[自动续写] 快捷键触发：拒绝续写，将重新生成');
+        console.log('[自动续写] 快捷键触发：Esc 拒绝续写');
         clear();
-        // 延迟重新触发，让清除操作完成
-        setTimeout(() => {
-          if (editor && enabled) {
-            console.log('[自动续写] ESC 取消后重新触发生成');
-            trigger();
-          }
-        }, 100);
       }
     };
 
@@ -888,7 +851,7 @@ export function useAutoComplete({
     return () => {
       document.removeEventListener('keydown', handleKeyDown, true);
     };
-  }, [editor, state.isVisible, accept, clear, enabled, trigger]);
+  }, [editor, state.isVisible, accept, clear, enabled]);
 
   // 暴露 getGhostText 函数供 Extension 使用
   const getGhostText = useCallback(() => {

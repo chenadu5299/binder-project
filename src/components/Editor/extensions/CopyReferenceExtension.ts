@@ -1,6 +1,7 @@
 import { Extension } from '@tiptap/core';
 import { Plugin, PluginKey } from '@tiptap/pm/state';
 import { EditorView } from '@tiptap/pm/view';
+import { createAnchorFromSelection } from '../../../utils/anchorFromSelection';
 
 interface CopyReferenceExtensionOptions {
   tabId?: string; // 标签页 ID，用于从 store 获取文件信息
@@ -80,8 +81,11 @@ export const CopyReferenceExtension = Extension.create<CopyReferenceExtensionOpt
                 return false;
               }
 
-              // 计算行号范围
+              // 精确定位：计算 blockId + offset（用于 edit_target）
               const doc = state.doc;
+              const anchor = createAnchorFromSelection(doc, from, to);
+
+              // 计算行号范围
               let startLine = 1;
               let endLine = 1;
               let currentPos = 0;
@@ -102,7 +106,7 @@ export const CopyReferenceExtension = Extension.create<CopyReferenceExtensionOpt
                 currentPos += childSize;
               }
 
-              // 创建引用元数据
+              // 创建引用元数据（含 blockId+offset 用于精确定位）
               const sourceData = {
                 filePath,
                 fileName,
@@ -114,6 +118,11 @@ export const CopyReferenceExtension = Extension.create<CopyReferenceExtensionOpt
                   start: charRange.from,
                   end: charRange.to,
                 },
+                ...(anchor && {
+                  blockId: anchor.blockId,
+                  startOffset: anchor.startOffset,
+                  endOffset: anchor.endOffset,
+                }),
               };
 
               console.log('📋 复制文字并添加引用元数据:', {

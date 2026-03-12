@@ -95,9 +95,14 @@ interface ToastState {
   removeToast: (id: string) => void;
 }
 
+// 保存相关消息不显示 Toast，由底部状态栏展示保存状态
+const isSaveRelatedMessage = (type: ToastType, message: string) =>
+  (type === 'success' || type === 'info') && /保存|已保存|转换格式|文档内容已更新/.test(message);
+
 export const useToastStore = create<ToastState>((set) => ({
   toasts: [],
   showToast: (type, message, duration) => {
+    if (isSaveRelatedMessage(type, message)) return;
     const id = Date.now().toString() + Math.random().toString(36).substr(2, 9);
     set((state) => ({
       toasts: [...state.toasts, { id, type, message, duration }],

@@ -32,8 +32,8 @@
 │  DOCX → LibreOffice → PDF → iframe + data URL           │
 │                                                           │
 │  编辑模式（完全独立）                                      │
-│  DOCX → Pandoc → HTML → CSS样式表 → TipTap               │
-│  （三层样式处理：提取样式 + 预设样式 + 工具样式）          │
+│  DOCX → Pandoc → HTML → TipTap + 分页（tiptap-pagination） │
+│  （三层样式处理，详见 T-DOCX编辑器分页模式优化方案）        │
 │                                                           │
 │  保存模式（完全独立）                                      │
 │  TipTap HTML → Pandoc → DOCX                             │
@@ -46,7 +46,7 @@
 - ✅ 预览模式使用 LibreOffice（PDF 转换）
 - ✅ 编辑模式使用 Pandoc（三层样式处理策略）
 - ✅ 文件树显示原 DOCX 文件，用户感知不到变化
-- ✅ 编辑模式采用三层样式处理：提取样式（100% 复现）+ 预设样式（层次化展示）+ 工具样式（完整编辑能力）
+- ✅ 编辑模式采用三层样式处理 + tiptap-pagination-plus 分页（详见 `T-DOCX编辑器分页模式优化方案.md`）
 
 ---
 

@@ -358,6 +358,7 @@ pub async fn ai_chat_stream(
     current_file: Option<String>, // 当前打开的文档路径（第二层上下文）
     selected_text: Option<String>, // 当前选中的文本（第二层上下文）
     current_editor_content: Option<String>, // 当前编辑器内容（用于文档编辑功能）
+    edit_target: Option<serde_json::Value>, // 精确定位：{ anchor: { block_id, start_offset, end_offset } }
     app: tauri::AppHandle,
     service: State<'_, AIServiceState>,
     watcher: State<'_, Mutex<FileWatcherService>>,
@@ -538,6 +539,7 @@ pub async fn ai_chat_stream(
             let current_file_clone = current_file.clone();
             let current_editor_content_clone = current_editor_content.clone();
             let selected_text_clone = selected_text.clone();
+            let edit_target_clone = edit_target.clone();
             
             // ⚠️ 关键修复：使用已注册的取消标志（已在上面创建并注册到 CANCEL_FLAGS）
             // cancel_flag 已经在上面注册到 CANCEL_FLAGS 中，这里直接使用
@@ -707,8 +709,12 @@ pub async fn ai_chat_stream(
                                         if let Some(ref content) = current_editor_content {
                                             parsed_arguments["current_content"] = serde_json::Value::String(content.clone());
                                         }
-                                        // 若有选中文本，作为 target_content 传入，便于后端做短语级替换（如「将选中词修改为英文」）
-                                        if let Some(ref sel) = selected_text {
+                                        // 精确定位：若有 edit_target，注入 anchor，优先于 target_content
+                                        if let Some(ref et) = edit_target {
+                                            parsed_arguments["edit_target"] = et.clone();
+                                            eprintln!("📝 已增强 edit_current_editor_document 参数: edit_target (精确定位)");
+                                        } else if let Some(ref sel) = selected_text {
+                                            // 若有选中文本，作为 target_content 传入（降级）
                                             if !sel.trim().is_empty() && parsed_arguments.get("target_content").is_none() {
                                                 parsed_arguments["target_content"] = serde_json::Value::String(sel.trim().to_string());
                                                 eprintln!("📝 已增强 edit_current_editor_document 参数: target_content 来自选中文本 (长度: {})", sel.trim().len());
@@ -1606,7 +1612,11 @@ pub async fn ai_chat_stream(
                                                                     eprintln!("📝 [继续对话] 已添加 current_content (长度: {})", content.len());
                                                                 }
                                                             }
-                                                            if !map.contains_key("target_content") {
+                                                            if !map.contains_key("edit_target") && edit_target_clone.is_some() {
+                                                                map.insert("edit_target".to_string(), edit_target_clone.clone().unwrap());
+                                                                eprintln!("📝 [继续对话] 已添加 edit_target (精确定位)");
+                                                            }
+                                                            if !map.contains_key("target_content") && !map.contains_key("edit_target") {
                                                                 if let Some(ref sel) = selected_text_clone {
                                                                     if !sel.trim().is_empty() {
                                                                         map.insert("target_content".to_string(), serde_json::Value::String(sel.trim().to_string()));

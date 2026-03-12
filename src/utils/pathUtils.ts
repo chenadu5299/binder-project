@@ -94,3 +94,20 @@ export function getAbsolutePath(relativePath: string, workspacePath: string): st
   return normalizePath(combined);
 }
 
+/**
+ * 判断两个路径是否指向同一文档（用于 edit_target 路径匹配）
+ * Phase 1：简单规范化后比较；Phase 2 将支持 workspacePath 统一相对/绝对
+ */
+export function isSameDocumentForEdit(
+  refPath: string,
+  currentPath: string,
+  _workspacePath?: string | null
+): boolean {
+  const a = normalizePath(refPath);
+  const b = normalizePath(currentPath);
+  if (a === b) return true;
+  // 处理尾随斜杠差异
+  const aTrim = a.replace(/\/$/, '');
+  const bTrim = b.replace(/\/$/, '');
+  return aTrim === bTrim;
+}

@@ -452,10 +452,42 @@ export const useChatStore = create<ChatState>((set, get) => {
                 
                 // 获取选中的文本（如果有编辑器实例）
                 let selectedText: string | null = null;
+                let editTarget: { anchor: { block_id: string; start_offset: number; end_offset: number } } | null = null;
                 if (activeEditorTab?.editor) {
                     const { from, to } = activeEditorTab.editor.state.selection;
                     if (from !== to) {
                         selectedText = activeEditorTab.editor.state.doc.textBetween(from, to);
+                        // 精确定位：选区 → edit_target
+                        const { createAnchorFromSelection } = await import('../utils/anchorFromSelection');
+                        const anchor = createAnchorFromSelection(activeEditorTab.editor.state.doc, from, to);
+                        if (anchor && currentFile) {
+                            editTarget = { anchor: { block_id: anchor.blockId, start_offset: anchor.startOffset, end_offset: anchor.endOffset } };
+                        }
+                    }
+                }
+                // 若无选区 edit_target，检查引用：TextRef 含 blockId 且 pathMatch → edit_target
+                if (!editTarget && currentFile) {
+                    const { getReferences } = (await import('./referenceStore')).useReferenceStore.getState();
+                    const refs = getReferences(tabId);
+                    const { isSameDocumentForEdit } = await import('../utils/pathUtils');
+                    const { ReferenceType } = await import('../types/reference');
+                    const textRefWithBlock = refs.find(
+                        (r): r is import('../types/reference').TextReference =>
+                            r.type === ReferenceType.TEXT &&
+                            'blockId' in r &&
+                            r.blockId != null &&
+                            r.startOffset != null &&
+                            r.endOffset != null &&
+                            isSameDocumentForEdit(r.sourceFile, currentFile)
+                    );
+                    if (textRefWithBlock) {
+                        editTarget = {
+                            anchor: {
+                                block_id: textRefWithBlock.blockId!,
+                                start_offset: textRefWithBlock.startOffset!,
+                                end_offset: textRefWithBlock.endOffset!,
+                            },
+                        };
                     }
                 }
                 
@@ -491,6 +523,7 @@ export const useChatStore = create<ChatState>((set, get) => {
                     currentFile: currentFile, // ⚠️ 关键修复：传递当前编辑器打开的文件路径
                     selectedText: selectedText, // ⚠️ 关键修复：传递当前选中的文本
                     currentEditorContent: currentEditorContent, // ⚠️ 文档编辑功能：传递当前编辑器内容
+                    editTarget: editTarget ?? undefined, // 精确定位：blockId+offset，用于 edit_current_editor_document
                 });
             } catch (error) {
                 console.error('发送消息失败:', error);

@@ -60,7 +60,8 @@ const HTMLPreview: React.FC<{ content: string }> = ({ content }) => {
 const EditorPanel: React.FC = () => {
   const { currentWorkspace } = useFileStore();
   const { tabs, activeTabId, updateTabContent, markTabSaved, setTabEditor, setTabSaving, updateTabModifiedTime } = useEditorStore();
-  const { analysis, setAnalysisVisible, editor, setEditorVisible } = useLayoutStore();
+  const { analysis, setAnalysisVisible, editor: editorLayout, setEditorVisible } = useLayoutStore();
+  const editorZoom = editorLayout?.zoom ?? 100;
   
   // ⚠️ Week 17.1.2：外部修改检测状态
   const [externalModificationTab, setExternalModificationTab] = useState<string | null>(null);
@@ -73,6 +74,7 @@ const EditorPanel: React.FC = () => {
   // Inline Assist 功能
   const inlineAssist = useInlineAssist(activeTab?.editor || null);
 
+  const editorZoomScrollRef = useRef<HTMLDivElement | null>(null);
 
   // Agent 模式：监听编辑器内容更新事件（来自 AI 工具调用）
   useEffect(() => {
@@ -88,9 +90,8 @@ const EditorPanel: React.FC = () => {
           if (tab && tab.editor) {
             // 更新编辑器内容
             tab.editor.commands.setContent(payload.content);
-            // 更新 store 中的内容
+            // 更新 store 中的内容（状态栏会显示未保存/已保存）
             updateTabContent(payload.tabId, payload.content);
-            toast.success('文档内容已更新');
           }
         });
 
@@ -240,10 +241,19 @@ const EditorPanel: React.FC = () => {
   }, [activeTab, inlineAssist]);
   
   // 使用 useCallback 稳定函数引用
+  const saveTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const lastContentRef = useRef<string>('');
+
   const handleSave = useCallback(async () => {
     if (!activeTab || !activeTab.editor) {
       console.warn('⚠️ 保存失败: 没有活动的标签页或编辑器未就绪');
       return;
+    }
+    
+    // 手动保存时取消待执行的自动保存，避免同一内容被保存两次
+    if (saveTimerRef.current) {
+      clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = null;
     }
     
     try {
@@ -315,10 +325,7 @@ const EditorPanel: React.FC = () => {
     return 'txt';
   };
 
-  // 自动保存功能
-  const saveTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const lastContentRef = useRef<string>('');
-
+  // 自动保存功能（saveTimerRef、lastContentRef 已在 handleSave 上方声明）
   useEffect(() => {
     if (!activeTab || activeTab.isReadOnly || !activeTab.isDirty) {
       return;
@@ -339,29 +346,28 @@ const EditorPanel: React.FC = () => {
     // 2 秒防抖后自动保存
     saveTimerRef.current = setTimeout(async () => {
       try {
-        if (activeTab.isReadOnly || !activeTab.editor) {
-          console.warn('⚠️ 自动保存跳过: 文件是只读模式或编辑器未就绪');
+        // 再次检查：避免重复保存（可能手动保存已完成）
+        const store = useEditorStore.getState();
+        const currentTab = store.tabs.find(t => t.id === activeTab.id);
+        if (!currentTab || currentTab.isReadOnly || !currentTab.editor || !currentTab.isDirty || currentTab.isSaving) {
           return;
         }
         
         // ⚠️ 关键修复：直接从编辑器获取最新内容
-        const currentContent = activeTab.editor.getHTML();
+        const currentContent = currentTab.editor.getHTML();
         
         console.log('💾 自动保存文件:', {
-          filePath: activeTab.filePath,
+          filePath: currentTab.filePath,
           contentLength: currentContent.length,
         });
         
-        setTabSaving(activeTab.id, true);
-        // 使用编辑器中的最新内容
-        await documentService.saveFile(activeTab.filePath, currentContent);
-        // 同步更新 store 中的内容
-        updateTabContent(activeTab.id, currentContent);
-        markTabSaved(activeTab.id);
-        // ⚠️ 关键修复：自动保存后更新文件修改时间，避免误判为外部修改
+        setTabSaving(currentTab.id, true);
+        await documentService.saveFile(currentTab.filePath, currentContent);
+        updateTabContent(currentTab.id, currentContent);
+        markTabSaved(currentTab.id);
         try {
-          const newModifiedTime = await invoke<number>('get_file_modified_time', { path: activeTab.filePath });
-          updateTabModifiedTime(activeTab.id, newModifiedTime);
+          const newModifiedTime = await invoke<number>('get_file_modified_time', { path: currentTab.filePath });
+          updateTabModifiedTime(currentTab.id, newModifiedTime);
         } catch (error) {
           console.error('更新文件修改时间失败:', error);
         }
@@ -369,9 +375,10 @@ const EditorPanel: React.FC = () => {
         console.log('✅ 自动保存成功');
       } catch (error) {
         console.error('❌ 自动保存失败:', error);
-        // 静默失败，不打扰用户，但记录错误
       } finally {
-        setTabSaving(activeTab.id, false);
+        const store = useEditorStore.getState();
+        const tab = store.tabs.find(t => t.id === activeTab.id);
+        if (tab) setTabSaving(tab.id, false);
       }
     }, 2000);
 
@@ -387,21 +394,15 @@ const EditorPanel: React.FC = () => {
     const setupSaveProgressListener = async () => {
       try {
         const unlisten = await listen<SaveProgressEvent>('fs-save-progress', (event) => {
-          const { file_path, status, progress, error } = event.payload;
+          const { file_path, status, error } = event.payload;
           
-          // 只处理当前标签页的文件
+          // 只处理当前标签页的文件，仅同步状态（不弹 Toast，由底部状态栏显示）
           if (activeTab && activeTab.filePath === file_path) {
             if (status === 'started') {
               setTabSaving(activeTab.id, true);
-              toast.info('开始保存文件...');
-            } else if (status === 'converting') {
-              toast.info(`正在转换格式... ${progress}%`);
-            } else if (status === 'saving') {
-              toast.info(`正在保存... ${progress}%`);
             } else if (status === 'completed') {
               setTabSaving(activeTab.id, false);
               markTabSaved(activeTab.id);
-              toast.success('文件保存成功');
             } else if (status === 'failed') {
               setTabSaving(activeTab.id, false);
               toast.error(`保存失败: ${error || '未知错误'}`);
@@ -467,9 +468,31 @@ const EditorPanel: React.FC = () => {
       
       {/* 编辑器内容区域（包含编辑器和分析面板） */}
       <div className="flex-1 overflow-hidden flex" style={{ minWidth: 0 }}>
-        {/* 编辑器内容 */}
-        <div className="flex-1 overflow-hidden" style={{ minWidth: 0 }}>
-          {activeTab ? (() => {
+        {/* 编辑器内容（支持缩放，T-DOCX 时外部区域淡灰、滚动条固定） */}
+        {(() => {
+          const isTDocxEdit = activeTab && getFileType(activeTab.filePath) === 'docx' && !activeTab.isReadOnly;
+          return (
+        <div
+          ref={editorZoomScrollRef}
+          className={`flex-1 min-h-0 overflow-auto editor-zoom-scroll ${
+            isTDocxEdit ? 'bg-[#f0f0f0] dark:bg-gray-700' : ''
+          }`}
+          style={{ minWidth: 0 }}
+          data-zoomed={isTDocxEdit ? 'true' : undefined}
+        >
+          <div
+            className="h-full"
+            style={
+              isTDocxEdit
+                ? {
+                    width: 794 * (editorZoom / 100),
+                    minHeight: '100%',
+                    margin: '0 auto',
+                  }
+                : undefined
+            }
+          >
+            {activeTab ? (() => {
             const fileType = getFileType(activeTab.filePath);
             
             // PDF 和图片文件使用预览组件
@@ -560,10 +583,13 @@ const EditorPanel: React.FC = () => {
               return <PresentationPreview filePath={activeTab.filePath} />;
             }
             
-            // DOCX 文件（编辑模式）：使用普通编辑器
+            // DOCX 文件（编辑模式）：使用分页编辑器（页码导航在工具栏内）
+            // 注意：分页模式纸张宽度固定(如794px)，不能用 overflow-hidden 裁剪，否则文字被遮挡
+            // 统一逻辑：外层 zoom 包装始终有 width=794*(zoom/100)，使 scrollWidth 正确；zoom≠100 时内层 transform scale 实现视觉缩放
+            // 100% 时也需显式 width，否则窗口小于 794px 时无法横向滚动到纸张边缘
             if (fileType === 'docx' && !activeTab.isReadOnly) {
-              return (
-                <div className="h-full overflow-hidden relative">
+              const docxContent = (
+                <div className="h-full overflow-visible relative min-w-[794px]">
                   <TipTapEditor
                     content={activeTab.content}
                     onChange={handleContentChange}
@@ -573,9 +599,9 @@ const EditorPanel: React.FC = () => {
                     documentPath={activeTab.filePath}
                     workspacePath={currentWorkspace || undefined}
                     tabId={activeTab.id}
-                    autoCompleteEnabled={activeTab.autoCompleteEnabled ?? true}
+                    layoutMode="page"
+                    editorZoom={editorZoom}
                   />
-                  
                   {/* Inline Assist 面板 */}
                   {inlineAssist.state.isVisible && activeTab.editor && (
                     <InlineAssistPosition editor={activeTab.editor}>
@@ -592,6 +618,18 @@ const EditorPanel: React.FC = () => {
                   )}
                 </div>
               );
+              return editorZoom !== 100 ? (
+                <div
+                  style={{
+                    transform: `scale(${editorZoom / 100})`,
+                    transformOrigin: 'top left',
+                    width: 794,
+                    minHeight: '100%',
+                  }}
+                >
+                  {docxContent}
+                </div>
+              ) : docxContent;
             }
             
             // 所有文件：使用编辑器
@@ -606,7 +644,7 @@ const EditorPanel: React.FC = () => {
                   documentPath={activeTab.filePath}
                   workspacePath={currentWorkspace || undefined}
                   tabId={activeTab.id}
-                  autoCompleteEnabled={activeTab.autoCompleteEnabled ?? true}
+                  editorZoom={editorZoom}
                 />
                 
                 {/* Inline Assist 面板 */}
@@ -633,7 +671,10 @@ const EditorPanel: React.FC = () => {
               </p>
             </div>
           )}
+          </div>
         </div>
+          );
+        })()}
         
         {/* 分析面板 */}
         {activeTab && analysis.visible && (

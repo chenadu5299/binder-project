@@ -2,6 +2,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use crate::utils::path_validator::PathValidator;
+use scraper::{Html, Selector};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
@@ -997,6 +998,32 @@ impl ToolService {
         None
     }
 
+    /// 从 HTML 内容中根据 block_id 和 offset 提取块内文本
+    fn extract_block_text_by_id(
+        html_content: &str,
+        block_id: &str,
+        start_offset: usize,
+        end_offset: usize,
+    ) -> Result<String, String> {
+        let document = Html::parse_document(html_content);
+        let selector = Selector::parse(&format!("[data-block-id=\"{}\"]", block_id))
+            .map_err(|e| format!("Selector 解析失败: {}", e))?;
+        let element = document
+            .select(&selector)
+            .next()
+            .ok_or_else(|| format!("未找到 block_id={} 的块", block_id))?;
+        let block_text: String = element.text().collect();
+        let char_count = block_text.chars().count();
+        if start_offset >= char_count || end_offset > char_count || start_offset >= end_offset {
+            return Err(format!(
+                "offset 越界: start={}, end={}, block_len={}",
+                start_offset, end_offset, char_count
+            ));
+        }
+        let extracted: String = block_text.chars().skip(start_offset).take(end_offset - start_offset).collect();
+        Ok(extracted)
+    }
+
     /// 编辑当前编辑器打开的文档
     /// 新实现：获取当前编辑器内容，计算 diff，返回完整的编辑信息
     async fn edit_current_editor_document(
@@ -1006,7 +1033,57 @@ impl ToolService {
         eprintln!("📝 [edit_current_editor_document] 开始处理文档编辑请求");
         eprintln!("📝 [edit_current_editor_document] 工具调用参数: {:?}", tool_call.arguments);
         
-        use crate::services::diff_service::DiffService;
+        use crate::services::diff_service::{DiffService, Diff as DiffStruct, DiffType};
+        
+        // 0. 若有 edit_target（精确定位），走 Anchor 路径，直接返回单条 diff
+        if let Some(et) = tool_call.arguments.get("edit_target") {
+            if let Some(anchor) = et.get("anchor") {
+                let block_id = anchor.get("block_id").and_then(|v| v.as_str());
+                let start_offset = anchor.get("start_offset").and_then(|v| v.as_u64()).map(|u| u as usize);
+                let end_offset = anchor.get("end_offset").and_then(|v| v.as_u64()).map(|u| u as usize);
+                if let (Some(bid), Some(so), Some(eo)) = (block_id, start_offset, end_offset) {
+                    let current_content = tool_call.arguments.get("current_content").and_then(|v| v.as_str()).unwrap_or("");
+                    if let Ok(original_code) = Self::extract_block_text_by_id(current_content, bid, so, eo) {
+                        let elem_id = serde_json::json!({
+                            "block_id": bid,
+                            "start_offset": so,
+                            "end_offset": eo,
+                        }).to_string();
+                        let diff_area_id = format!("diff_area_{}", uuid::Uuid::new_v4());
+                        let new_code = tool_call.arguments.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                        // 注意：不在此处做全文替换，由前端根据 element_identifier 在编辑器中精确定位并替换
+                        let effective_new_content = current_content.to_string();
+                        eprintln!("✅ [edit_current_editor_document] 使用 edit_target 精确定位路径 (block_id={})", bid);
+                        return Ok(ToolResult {
+                            success: true,
+                            data: Some(serde_json::json!({
+                                "diff_area_id": diff_area_id,
+                                "file_path": tool_call.arguments.get("current_file").and_then(|v| v.as_str()).unwrap_or(""),
+                                "old_content": current_content,
+                                "new_content": effective_new_content,
+                                "diffs": vec![DiffStruct {
+                                    diff_id: format!("diff_{}", uuid::Uuid::new_v4()),
+                                    diff_area_id: diff_area_id.clone(),
+                                    diff_type: DiffType::Edit,
+                                    original_code: original_code.clone(),
+                                    original_start_line: 1,
+                                    original_end_line: 1,
+                                    new_code: new_code.to_string(),
+                                    start_line: 1,
+                                    end_line: 1,
+                                    context_before: None,
+                                    context_after: None,
+                                    element_type: Some("text".to_string()),
+                                    element_identifier: Some(elem_id),
+                                }],
+                            })),
+                            error: None,
+                            message: Some("文档编辑已准备（精确定位）".to_string()),
+                        });
+                    }
+                }
+            }
+        }
         
         // 1. 获取当前编辑器内容（从工具调用参数中获取，已在 ai_commands.rs 中增强）
         let current_file = tool_call
@@ -1070,7 +1147,6 @@ impl ToolService {
         
         // 5. 计算 Diff（使用 DiffService）
         eprintln!("📝 [edit_current_editor_document] 开始计算 diff...");
-        use crate::services::diff_service::{Diff as DiffStruct, DiffType};
         let diff_service = DiffService::new();
         let mut diffs = diff_service.calculate_diff(current_content, &effective_new_content)
             .map_err(|e| {

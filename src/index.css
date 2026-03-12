@@ -1,3 +1,4 @@
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -43,3 +44,99 @@ code {
     monospace;
 }
 
+/* 移除 TipTap/ProseMirror 编辑区聚焦时的灰框/轮廓 */
+.ProseMirror:focus,
+.ProseMirror-focused {
+  outline: none !important;
+  box-shadow: none !important;
+}
+.ProseMirror {
+  outline: none !important;
+}
+
+/* T-DOCX 分页模式：仅在页首行时隐藏原生光标（由 PageTopCaretExtension 设置 data-caret-at-page-top） */
+.ProseMirror.rm-with-pagination[data-caret-at-page-top="true"] {
+  caret-color: transparent;
+}
+
+/* 页首行模拟光标：挂载到 scrollContainer ?? body；top/left/height 由 JS 动态设置 */
+/* 1px 宽度接近原生光标；闪烁动画与原生光标一致 */
+@keyframes rm-caret-blink {
+  0%, 50% { opacity: 1; }
+  50.01%, 100% { opacity: 0; }
+}
+.rm-page-top-caret {
+  position: fixed;
+  /* width 由 JS 根据 zoom 动态设置 */
+  pointer-events: none;
+  z-index: 998;
+  background-color: #808080;
+  animation: rm-caret-blink 1s step-end infinite;
+}
+
+/* T-DOCX 分页模式：移除边框灰框；A4 纸内部（ProseMirror 内容区）白色 */
+/* 关键：width/min-width 使用 !important 防止被 flex 父级 minWidth:0 压缩；确保纸张宽度与 CSS 变量一致 */
+/* overflow-x: auto 替代 hidden，允许内容超出时出现横向滚动而非裁剪遮挡 */
+.rm-with-pagination {
+  box-sizing: border-box;
+  border: none !important;
+  background-color: #ffffff !important;
+  width: var(--rm-page-width) !important;
+  min-width: var(--rm-page-width) !important;
+  overflow-x: auto;
+  /* 内容区换行，防止长文本/长单词超出 */
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+}
+.dark .rm-with-pagination {
+  background-color: #1f2937 !important;
+}
+
+/* T-DOCX 分页模式：每页右下角默认半透明页码，仅屏幕显示，不可编辑、不保存、不打印 */
+.rm-with-pagination .rm-page-footer-right,
+.rm-with-pagination .rm-page-header-right {
+  color: rgba(107, 114, 128, 0.5) !important; /* gray-500 半透明 */
+  pointer-events: none !important;
+  user-select: none !important;
+}
+.dark .rm-with-pagination .rm-page-footer-right,
+.dark .rm-with-pagination .rm-page-header-right {
+  color: rgba(156, 163, 175, 0.4) !important; /* gray-400 半透明 */
+}
+/* 分割缝中的模拟页码：确保在遮罩之上可见，深色模式适配 */
+.rm-with-pagination .rm-gap-page-number {
+  z-index: 1000 !important;
+  color: #6b7280 !important;
+}
+.dark .rm-with-pagination .rm-gap-page-number {
+  color: #9ca3af !important;
+}/* 分割缝中的模拟页码：仅屏幕显示，不打印 */
+@media print {
+  .rm-with-pagination .rm-page-footer-right,
+  .rm-with-pagination .rm-page-header-right,
+  .rm-with-pagination .rm-gap-page-number {
+    display: none !important;
+  }
+}
+
+/* 编辑窗口缩放时：滚动条置于页面前方，避免被遮挡 */
+/* 使用 zoom 替代 transform，使 scrollWidth/scrollHeight 正确，支持横向滚动查看纸张边缘 */
+.editor-zoom-scroll {
+  isolation: isolate;
+  position: relative;
+  z-index: 1;
+}
+.editor-zoom-scroll > * {
+  position: relative;
+  z-index: 0;
+}
+
+/* T-DOCX 分页编辑：由 editor-zoom-scroll 统一处理横向滚动，避免 .rm-with-pagination 内层产生重复/重合的横向滚动条 */
+.editor-zoom-scroll[data-zoomed="true"] .rm-with-pagination {
+  overflow-x: visible !important;
+}
+
+/* 调试：block ID 定位符已隐藏，避免影响版面（需调试时可恢复 content/display） */
+.ProseMirror [data-block-id]::before {
+  display: none;
+}

@@ -36,6 +36,10 @@ export interface TextReference extends BaseReference {
         end: number;
     };
     displayText: string;       // 显示文本：如 "main.ts (行 10-15)"
+    // 精确定位（可选，用于 edit_target）
+    blockId?: string;
+    startOffset?: number;
+    endOffset?: number;
 }
 
 // 文件引用

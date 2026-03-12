@@ -11,11 +11,17 @@ import {
   Bars3BottomLeftIcon,
   Bars3BottomRightIcon,
   Bars3Icon,
+  MagnifyingGlassPlusIcon,
+  MagnifyingGlassMinusIcon,
+  AdjustmentsHorizontalIcon,
 } from '@heroicons/react/24/outline';
 import { useLayoutStore } from '../../stores/layoutStore';
-import { useEditorStore } from '../../stores/editorStore';
+import { usePaginationFromEditor } from '../../hooks/usePaginationFromEditor';
+import { ChevronLeftIcon, ChevronRightIcon } from '@heroicons/react/24/outline';
 import { toast } from '../Common/Toast';
 import ToolbarDropdown from './ToolbarDropdown';
+import PageSizeDropdown from './PageSizeDropdown';
+import MarginsModal from './MarginsModal';
 
 interface EditorToolbarProps {
   editor: Editor | null;
@@ -24,13 +30,13 @@ interface EditorToolbarProps {
 }
 
 const EditorToolbar: React.FC<EditorToolbarProps> = ({ editor, fileType, documentPath }) => {
-  const { analysis, setAnalysisVisible } = useLayoutStore();
-  const { tabs, activeTabId } = useEditorStore();
+  const { analysis, setAnalysisVisible, editor: editorLayout, setEditorZoom } = useLayoutStore();
   const [headingLevel, setHeadingLevel] = React.useState<string | number>('paragraph');
   const [textAlign, setTextAlign] = React.useState<string>('left');
+  const [marginsModalOpen, setMarginsModalOpen] = React.useState(false);
   
-  // 获取当前标签页
-  const activeTab = tabs.find(t => t.id === activeTabId);
+  // T-DOCX 分页模式：页码导航（简化显示在工具栏内）
+  const pagination = usePaginationFromEditor(editor, fileType === 'docx');
   
   // 监听编辑器状态变化，更新标题等级
   React.useEffect(() => {
@@ -105,24 +111,6 @@ const EditorToolbar: React.FC<EditorToolbarProps> = ({ editor, fileType, documen
 
   return (
     <div className="flex items-center gap-0.5 p-1.5 border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 min-w-0 flex-wrap">
-      {/* 自动续写开关 */}
-      <label className="flex items-center gap-1.5 px-2 py-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 cursor-pointer shrink-0">
-        <input
-          type="checkbox"
-          checked={activeTab?.autoCompleteEnabled ?? true}
-          onChange={(e) => {
-            if (activeTab) {
-              const { setAutoCompleteEnabled } = useEditorStore.getState();
-              setAutoCompleteEnabled(activeTab.id, e.target.checked);
-            }
-          }}
-          className="w-4 h-4 rounded border-gray-300 dark:border-gray-600 text-blue-600 focus:ring-blue-500 dark:focus:ring-blue-400"
-          title="自动续写"
-        />
-        <span className="text-xs text-gray-700 dark:text-gray-300 whitespace-nowrap">自动续写</span>
-      </label>
-      <div className="w-px h-5 bg-gray-300 dark:bg-gray-600 mx-0.5 shrink-0" />
-      
       {/* 基础格式 */}
       <button
         onClick={(e) => {
@@ -520,6 +508,77 @@ const EditorToolbar: React.FC<EditorToolbarProps> = ({ editor, fileType, documen
         </>
       )}
 
+      {/* 编辑窗口缩放（50%-150%） */}
+      <div className="w-px h-5 bg-gray-300 dark:bg-gray-600 mx-0.5 shrink-0" />
+      <div className="flex items-center gap-0.5 shrink-0">
+        <button
+          onClick={() => setEditorZoom((editorLayout?.zoom ?? 100) - 10)}
+          disabled={(editorLayout?.zoom ?? 100) <= 50}
+          className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed"
+          title="缩小"
+        >
+          <MagnifyingGlassMinusIcon className="w-4 h-4" />
+        </button>
+        <span className="text-xs text-gray-600 dark:text-gray-400 min-w-[2.5rem] text-center">
+          {(editorLayout?.zoom ?? 100)}%
+        </span>
+        <button
+          onClick={() => setEditorZoom((editorLayout?.zoom ?? 100) + 10)}
+          disabled={(editorLayout?.zoom ?? 100) >= 150}
+          className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed"
+          title="放大"
+        >
+          <MagnifyingGlassPlusIcon className="w-4 h-4" />
+        </button>
+      </div>
+
+      {/* T-DOCX 分页模式：页面尺寸、页边距 */}
+      {fileType === 'docx' && (
+        <>
+          <div className="w-px h-5 bg-gray-300 dark:bg-gray-600 mx-0.5 shrink-0" />
+          <PageSizeDropdown editor={editor} />
+          <button
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              setMarginsModalOpen(true);
+            }}
+            className="p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 shrink-0"
+            title="页边距"
+          >
+            <AdjustmentsHorizontalIcon className="w-4 h-4" />
+          </button>
+          <MarginsModal isOpen={marginsModalOpen} onClose={() => setMarginsModalOpen(false)} editor={editor} />
+        </>
+      )}
+
+      {/* T-DOCX 页码导航（简化，仅多页时显示） */}
+      {fileType === 'docx' && pagination.totalPages > 1 && (
+        <>
+          <div className="w-px h-5 bg-gray-300 dark:bg-gray-600 mx-0.5 shrink-0" />
+          <div className="flex items-center gap-0.5 shrink-0">
+            <button
+              onClick={() => pagination.scrollToPage(pagination.currentPage - 1)}
+              disabled={pagination.currentPage <= 1}
+              className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed"
+              title="上一页"
+            >
+              <ChevronLeftIcon className="w-4 h-4" />
+            </button>
+            <span className="text-xs text-gray-600 dark:text-gray-400 px-1 min-w-[2.5rem] text-center">
+              {pagination.currentPage}/{pagination.totalPages}
+            </span>
+            <button
+              onClick={() => pagination.scrollToPage(pagination.currentPage + 1)}
+              disabled={pagination.currentPage >= pagination.totalPages}
+              className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed"
+              title="下一页"
+            >
+              <ChevronRightIcon className="w-4 h-4" />
+            </button>
+          </div>
+        </>
+      )}
 
       {/* 分析面板切换按钮 */}
       <div className="w-px h-5 bg-gray-300 dark:bg-gray-600 mx-0.5 shrink-0" />

@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>tiptap-pagination-plus 分页效果试验</title>
+  <script type="importmap">
+  {
+    "imports": {
+      "@tiptap/core": "https://esm.sh/@tiptap/core@2.10.3",
+      "@tiptap/pm": "https://esm.sh/@tiptap/pm@2.10.3",
+      "@tiptap/starter-kit": "https://esm.sh/@tiptap/starter-kit@2.10.3",
+      "tiptap-pagination-plus": "./dist/index.js"
+    }
+  }
+  </script>
+  <style>
+    body { font-family: sans-serif; padding: 20px; max-width: 700px; margin: 0 auto; }
+    #editor { border: 1px solid #ccc; min-height: 500px; padding: 16px; }
+    .ProseMirror { min-height: 400px; }
+    .rm-with-pagination { max-height: 700px; overflow-y: auto; }
+  </style>
+</head>
+<body>
+  <h2>tiptap-pagination-plus 分页效果试验</h2>
+  <div id="editor"></div>
+  <p style="margin-top:16px;color:#666;">输入多段文字，观察分页线、页眉页脚、页码是否出现。</p>
+  <script type="module">
+    import { Editor } from '@tiptap/core';
+    import StarterKit from '@tiptap/starter-kit';
+    import { PaginationPlus } from 'tiptap-pagination-plus';
+    const editor = new Editor({
+      element: document.querySelector('#editor'),
+      extensions: [
+        StarterKit,
+        PaginationPlus.configure({
+          pageHeight: 400,
+          pageWidth: 600,
+          pageGap: 30,
+          marginTop: 20,
+          marginBottom: 20,
+          marginLeft: 30,
+          marginRight: 30,
+          headerRight: 'Page {page}',
+          footerRight: '{page}',
+        }),
+      ],
+      content: '<p>第一段：这是分页试验。</p><p>第二段：当内容超过一页高度时，会自动出现分页线。</p><p>第三段：页眉页脚会显示页码。</p>'.repeat(8),
+    });
+  </script>
+</body>
+</html>

@@ -32,20 +32,32 @@ export function createTextReference(params: {
 
 /**
  * 从编辑器复制的数据创建 TextReference
+ * 支持 blockId、startOffset、endOffset（精确定位系统）
  */
 export function createTextReferenceFromClipboard(source: {
     filePath: string;
     fileName?: string;
     lineRange: { start: number; end: number };
     charRange: { start: number; end: number };
+    blockId?: string;
+    startOffset?: number;
+    endOffset?: number;
 }, text: string): Omit<TextReference, 'id' | 'createdAt'> {
-    return createTextReference({
+    const base = createTextReference({
         content: text,
         sourceFile: source.filePath,
         fileName: source.fileName,
         lineRange: source.lineRange,
         charRange: source.charRange,
     });
+    return {
+        ...base,
+        ...(source.blockId != null && {
+            blockId: source.blockId,
+            startOffset: source.startOffset ?? 0,
+            endOffset: source.endOffset ?? 0,
+        }),
+    };
 }
 
 /**

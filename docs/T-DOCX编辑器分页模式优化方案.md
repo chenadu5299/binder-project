@@ -1,10 +1,41 @@
 # T-DOCX 编辑器分页模式优化方案
 
 ## 文档信息
-- **版本**：v1.0
+- **版本**：v1.1
 - **创建日期**：2025-02
-- **状态**：📋 方案分析
+- **更新日期**：2025-02
+- **状态**：✅ 方案 E 已实现
 - **目标**：将 T-DOCX 文件（应用模拟的 docx 文件）的编辑器改造为 Word 风格的分页编辑样式
+
+---
+
+## 〇、当前实现状态（2025-02 更新）
+
+**已采用方案 E：tiptap-pagination-plus 开源库 + 定制**
+
+| 功能 | 状态 | 说明 |
+|------|------|------|
+| 分页扩展 | ✅ | `tiptap-pagination-plus` 已接入，T-DOCX 编辑时 `layoutMode=page` |
+| 页码导航 | ✅ | 简化显示在工具栏内（◀ 当前页/总页数 ▶），多页时显示；当前页随滚动实时更新 |
+| 页面尺寸 | ✅ | PageSizeDropdown：A4/A3/Letter 等 |
+| 页边距 | ✅ | MarginsModal：上下、左右边距可调 |
+| 编辑窗口缩放 | ✅ | 工具栏 50%-150% 缩放，使用 CSS zoom（非 transform），scrollWidth 正确，支持横向滚动查看纸张边缘；窗口内横向居中 |
+| 背景色 | ✅ | A4 纸内部白色，外部/页缝淡灰 `#f0f0f0` |
+| 聚焦灰框 | ✅ | 已移除 ProseMirror 聚焦时的 outline/border |
+| 文字遮挡修复 | ✅ | 容器 `overflow-visible`、EditorContent 无水平 padding，详见分页布局逻辑梳理 |
+
+**关键代码路径**：
+- `TipTapEditor.tsx`：`layoutMode`、`PaginationPlus`、`editorZoom`
+- `EditorToolbar.tsx`：`usePaginationFromEditor`、缩放按钮、页码
+- `EditorPanel.tsx`：zoom 容器、T-DOCX 淡灰背景
+- `index.css`：`.rm-with-pagination` 白色、`.ProseMirror` 无 outline
+- `layoutStore`：`editor.zoom`
+
+**布局与容器方案**（详见 `docs/分页布局逻辑梳理.md`）：
+- 纸张宽度固定（794px），编辑窗口可变宽，中间容器必须 `overflow-visible`，否则文字被遮挡
+- TipTapEditor 包装 div 使用 `overflow-visible`，由上层 `editor-zoom-scroll` 提供滚动
+- 分页模式下 EditorContent 使用 `py-4 px-0`，无水平 padding，避免与页边距叠加
+- 当前页检测：`usePaginationFromEditor` 从 `editor.view.dom` 向上找第一个 `overflow-y: auto/scroll` 的祖先作为滚动容器，根据视口中心与 `.rm-page-break` 位置计算当前页
 
 ---
 
@@ -24,18 +55,16 @@ EditorPanel
 └── EditorStatusBar
 ```
 
-### 1.2 TipTapEditor 当前样式
+### 1.2 TipTapEditor 样式（T-DOCX 分页模式）
 
 | 属性 | 当前值 | 说明 |
 |-----|--------|------|
-| 容器 | `h-full flex flex-col` | 填满父容器高度 |
-| EditorContent | `flex-1 overflow-y-auto p-4 prose dark:prose-invert max-w-none` | **max-w-none** 表示无宽度限制 |
-| 宽度 | 跟随父容器，可随窗口调节 | 编辑区域宽度 = 窗口可用宽度 |
-| 高度 | 连续滚动 | 无分页，内容流式展示 |
-
-**关键代码位置**：
-- `TipTapEditor.tsx` 第 524-530 行：EditorContent 的 className
-- `TipTapEditor.tsx` 第 69-72 行：editorProps.attributes.class
+| 布局模式 | `layoutMode: 'page' \| 'flow'` | T-DOCX 编辑时 `page`，其他为 `flow` |
+| 分页扩展 | PaginationPlus | A4 尺寸 794×1123px，页缝淡灰 |
+| 纸张内部 | 白色 `#ffffff` | `.rm-with-pagination` |
+| 外部/页缝 | 淡灰 `#f0f0f0` | zoom 容器、pageBreakBackground |
+| 页码 | 半透明、仅屏幕 | 每页右下角，不可编辑/保存/打印，`index.css` |
+| 缩放 | 50%-150% | layoutStore.editor.zoom，滚动条固定 |
 
 ### 1.3 T-DOCX 文件识别
 
@@ -53,7 +82,8 @@ EditorPanel
 
 ### 1.4 现有相关能力
 
-- **PageNavigator**：已有页码导航组件，当前未在编辑器中使用
+- **PageNavigator**：已集成到 EditorToolbar，T-DOCX 多页时显示简化页码（◀ 1/9 ▶）
+- **usePaginationFromEditor**：从 PaginationPlus DOM 获取 currentPage、totalPages、scrollToPage
 - **ProseMirror/TipTap**：基于 ProseMirror，支持自定义 Node、Decoration、Plugin
 - **布局**：MainLayout 支持文件树、编辑区、聊天区宽度调节，编辑区宽度可变
 
@@ -161,8 +191,8 @@ EditorPanel
 | E 开源库 | 中 | 中高 | 中 | ⭐⭐⭐ 折中方案 |
 
 **推荐路径**：
-1. **第一阶段**：采用方案 A，实现 T-DOCX 的限定宽度 + 纯 CSS 分页，快速达到 Word 观感
-2. **第二阶段**：评估 TipTap Pages 或方案 E，若满足需求则逐步替换或增强
+1. ~~**第一阶段**：采用方案 A~~ → **已采用方案 E**（tiptap-pagination-plus）
+2. **第二阶段**：可选增强（分页符、打印优化、页眉页脚）
 3. **第三阶段**：若对打印、精确分页要求高，再考虑方案 C 自研
 
 ---
@@ -251,18 +281,19 @@ EditorPanel
 
 ## 六、技术实现要点
 
-### 6.1 文件与职责划分
+### 6.1 文件与职责划分（方案 E 已实现）
 
 ```
 src/components/Editor/
-├── TipTapEditor.tsx          # 保持不变，增加 layoutMode 等 props
-├── DocxPageEditor.tsx        # 新建：T-DOCX 分页布局包装器
-├── DocxPageEditor.css        # 新建：分页相关样式
-├── EditorPanel.tsx           # 修改：T-DOCX 时使用 DocxPageEditor
-└── ...
+├── TipTapEditor.tsx          # layoutMode、PaginationPlus、editorZoom
+├── EditorToolbar.tsx         # 页码导航、缩放按钮
+├── EditorPanel.tsx           # zoom 容器、T-DOCX 淡灰背景
+src/hooks/
+├── usePaginationFromEditor.ts  # 页码/滚动
+index.css                     # .rm-with-pagination 白色、ProseMirror 无 outline
 ```
 
-### 6.2 关键样式示意（方案 A，稳定版）
+### 6.2 关键样式示意（方案 A 备选，当前已采用方案 E）
 
 > ⚠️ **重要**：以下为**正确**实现方式。切勿使用多个 `.t-docx-editor-page` 包裹内容的做法，易导致文本丢失、光标异常。
 

@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "build": "npm run build:pagination && tsc && vite build",
+    "build:pagination": "cd tiptap-pagination-plus && npm run build",
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
@@ -43,6 +44,7 @@
     "pdfjs-dist": "^3.11.174",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
+    "tiptap-pagination-plus": "file:tiptap-pagination-plus",
     "xlsx": "^0.18.5",
     "zustand": "^4.4.7"
   },
