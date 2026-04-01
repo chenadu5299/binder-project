@@ -107,7 +107,11 @@ export const MessageContextMenu: React.FC<MessageContextMenuProps> = ({
             id: `ref-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
             type: ReferenceType.TEXT,
             content: message.content,
-            sourceFile: undefined,
+            sourceFile: '',
+            fileName: '',
+            lineRange: { start: 1, end: 1 },
+            charRange: { start: 0, end: message.content.length },
+            displayText: message.content.slice(0, 50) + (message.content.length > 50 ? '...' : ''),
             createdAt: Date.now(),
         };
 

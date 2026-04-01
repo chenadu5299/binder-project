@@ -4,13 +4,14 @@ import { useChatStore } from '../../stores/chatStore';
 import { useReferenceStore } from '../../stores/referenceStore';
 import { useFileStore } from '../../stores/fileStore';
 import { useEditorStore } from '../../stores/editorStore';
-import { ReferenceTags } from './ReferenceTags';
 import { MentionSelector, MentionItem } from './MentionSelector';
-import { ReferenceType, TextReference, FileReference, ImageReference, MemoryReference, LinkReference } from '../../types/reference';
+import { useMentionData } from '../../hooks/useMentionData';
+import { ReferenceType, TextReference, FileReference, ImageReference, LinkReference } from '../../types/reference';
 import { invoke } from '@tauri-apps/api/core';
-import { flattenFileTree, filterFiles } from '../../utils/fileTreeUtils';
 import { memoryService } from '../../services/memoryService';
 import { extractUrls } from '../../utils/urlDetector';
+import { getReferenceDisplayText, type DisplayNode } from '../../utils/inlineContentParser';
+import { toast } from '../Common/Toast';
 
 interface ChatInputProps {
     tabId: string | null; // 可以为 null（没有标签页时）
@@ -20,25 +21,24 @@ interface ChatInputProps {
 
 export const ChatInput: React.FC<ChatInputProps> = ({ tabId, pendingMode = 'agent', onCreateTab }) => {
     const { sendMessage, regenerate, tabs, createTab, setActiveTab } = useChatStore();
-    const { addReference, removeReference, getReferences, clearReferences } = useReferenceStore();
-    const { currentWorkspace, fileTree } = useFileStore();
+    const { addReference, getReferences, clearReferences } = useReferenceStore();
+    const { currentWorkspace } = useFileStore();
     const { getActiveTab: getEditorActiveTab } = useEditorStore();
     const [input, setInput] = useState('');
     const [mentionState, setMentionState] = useState<{
         show: boolean;
         query: string;
-        type: 'file' | 'memory' | 'knowledge';
         position: { top: number; left: number };
     } | null>(null);
+    const prevInputRef = useRef('');
     const textareaRef = useRef<HTMLTextAreaElement>(null);
     const containerRef = useRef<HTMLDivElement>(null);
     const isComposingRef = useRef<boolean>(false); // 用于跟踪是否正在使用中文输入法
     const compositionEndTimeRef = useRef<number>(0); // 记录输入法结束的时间，用于判断回车是否用于确认输入
+    const { itemsByCategory, getItemsByCategory } = useMentionData();
     const tab = tabId ? tabs.find(t => t.id === tabId) : null;
     const hasMessages = tab && tab.messages.length > 0;
     const isStreaming = tab ? tab.messages.some(m => m.isLoading) : false;
-    const references = tabId ? getReferences(tabId) : [];
-    
     // 自动调整高度
     useEffect(() => {
         if (textareaRef.current) {
@@ -47,7 +47,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId, pendingMode = 'agen
         }
     }, [input]);
     
-    // 检测 @ 语法并显示选择器
+    // 检测 @ 语法并显示选择器 - Phase 1.2：激活规则（仅输入 @ 激活；空格取消；回删不激活）
     useEffect(() => {
         if (!textareaRef.current || !containerRef.current) return;
         
@@ -57,33 +57,35 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId, pendingMode = 'agen
         
         // 检测 @ 语法（从光标位置向前查找）
         const atMatch = textBeforeCursor.match(/@([^\s@]*)$/);
+        const prevInput = prevInputRef.current;
+        prevInputRef.current = input;
         
         if (atMatch) {
             const query = atMatch[1];
+            // 空格取消：query 含空格，或 @ 后紧跟空格（如 "@ "）→ 关闭列表
+            if (/\s/.test(query) || textBeforeCursor.match(/@\s/)) {
+                setMentionState(null);
+                return;
+            }
+            // 回删不激活：query 为空且输入变短 → 回删形成的 @（如 "a@" 回删为 "@"），不激活
+            if (query === '' && input.length < prevInput.length) {
+                setMentionState(null);
+                return;
+            }
+            
             const atIndex = textBeforeCursor.lastIndexOf('@');
-            
-            // 检查是否是 @记忆库: 格式
-            const memoryMatch = textBeforeCursor.match(/@记忆库[：:]([^\s@]*)$/);
-            const mentionType = memoryMatch ? 'memory' : 'file';
-            const mentionQuery = memoryMatch ? memoryMatch[1] : query;
-            
-            // 计算选择器位置（相对于容器）
             const textareaRect = textarea.getBoundingClientRect();
             const containerRect = containerRef.current.getBoundingClientRect();
-            
-            // 计算 @ 符号在文本中的位置
             const textBeforeAt = input.substring(0, atIndex);
             const lines = textBeforeAt.split('\n');
             const lineNumber = lines.length - 1;
-            const lineHeight = 24; // 估算行高
-            
-            const top = textareaRect.top - containerRect.top + (lineNumber * lineHeight) + 30;
+            const lineHeight = 24;
+            const top = textareaRect.top - containerRect.top + (lineNumber * lineHeight);
             const left = textareaRect.left - containerRect.left;
-            
+
             setMentionState({
                 show: true,
-                query: mentionQuery,
-                type: mentionType,
+                query,
                 position: { top, left },
             });
         } else {
@@ -191,10 +193,57 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId, pendingMode = 'agen
         console.log('📥 拖拽数据:', { filePath, isDirectory });
         
         if (filePath && !isDirectory) {
-            // 从文件树拖拽的文件，创建文件引用
             console.log('✅ 检测到文件树拖拽，创建文件引用:', filePath);
             await handleFileTreeReference(filePath);
             return;
+        }
+
+        // Phase 2.1：处理记忆库拖拽
+        const memoryData = e.dataTransfer.getData('application/binder-reference-memory');
+        if (memoryData) {
+            try {
+                const payload = JSON.parse(memoryData);
+                if (payload.type === 'memory' && payload.entityName && currentTabId) {
+                    const memories = currentWorkspace
+                        ? await memoryService.getAllMemories(currentWorkspace).catch(() => [])
+                        : [];
+                    const items = memories.filter(m => m.entity_name === payload.entityName);
+                    addReference(currentTabId, {
+                        id: '',
+                        type: ReferenceType.MEMORY,
+                        createdAt: Date.now(),
+                        memoryId: `memory-${payload.entityName}`,
+                        name: payload.entityName,
+                        itemCount: items.length,
+                        items: items.map(m => ({ content: m.content })),
+                    });
+                    return;
+                }
+            } catch (err) {
+                console.warn('解析记忆库拖拽数据失败:', err);
+            }
+        }
+
+        // Phase 2.1：处理聊天标签拖拽
+        const chatData = e.dataTransfer.getData('application/binder-reference-chat');
+        if (chatData) {
+            try {
+                const payload = JSON.parse(chatData);
+                if (payload.type === 'chat' && payload.chatTabId && currentTabId) {
+                    addReference(currentTabId, {
+                        id: '',
+                        type: ReferenceType.CHAT,
+                        createdAt: Date.now(),
+                        chatTabId: payload.chatTabId,
+                        chatTabTitle: payload.chatTabTitle || '聊天',
+                        messageIds: payload.messageIds || [],
+                        messageRange: payload.messageRange,
+                    });
+                    return;
+                }
+            } catch (err) {
+                console.warn('解析聊天标签拖拽数据失败:', err);
+            }
         }
         
         // 处理外部拖拽的文件
@@ -217,41 +266,39 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId, pendingMode = 'agen
         }
     };
     
-    // 处理图片文件
+    // 处理外部图片文件（Phase 3.1：统一用 save_external_file 存 .binder/temp，符合设计「不展示于文件树」）
     const handleImageFile = async (file: File) => {
-        if (!currentWorkspace) {
-            console.error('未打开工作区');
+        if (!tabId || !currentWorkspace) {
+            toast.warning('请先打开工作区后再拖入图片');
             return;
         }
-        
         try {
             const arrayBuffer = await file.arrayBuffer();
             const imageData = Array.from(new Uint8Array(arrayBuffer));
-            
-            const relativePath = await invoke<string>('save_chat_image', {
+            const tempPath = await invoke<string>('save_external_file', {
                 workspacePath: currentWorkspace,
-                imageData,
+                fileData: imageData,
                 fileName: file.name,
             });
-            
             const imageRef: ImageReference = {
-                id: '',
+                id: `ref-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
                 type: ReferenceType.IMAGE,
                 createdAt: Date.now(),
-                path: relativePath,
+                path: tempPath,
                 name: file.name,
                 size: file.size,
                 mimeType: file.type,
             };
-            
             addReference(tabId, imageRef);
         } catch (error) {
+            toast.error('保存图片失败');
             console.error('保存图片失败:', error);
         }
     };
     
     // 处理从文件树拖拽的文件引用
     const handleFileTreeReference = async (filePath: string) => {
+        if (!tabId) return;
         try {
             console.log('📄 处理文件树引用:', filePath);
             
@@ -316,21 +363,49 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId, pendingMode = 'agen
         }
     };
     
-    // 处理文件引用
+    // 处理外部文件引用（Phase 3.1：上传至 .binder/temp 临时存储）
     const handleFileReference = async (file: File) => {
-        // 对于拖拽的文件，需要获取完整路径
-        // 这里暂时使用文件名，后续可以通过文件选择器获取路径
-        const fileRef: FileReference = {
-            id: `ref-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-            type: ReferenceType.FILE,
-            createdAt: Date.now(),
-            path: file.name, // 临时使用文件名
-            name: file.name,
-            size: file.size,
-            mimeType: file.type,
-        };
-        
-        addReference(tabId, fileRef);
+        if (!tabId || !currentWorkspace) {
+            toast.warning('请先打开工作区后再拖入外部文件');
+            return;
+        }
+        const MAX_FILE_SIZE = 10 * 1024 * 1024;
+        if (file.size > MAX_FILE_SIZE) {
+            toast.warning(`文件 "${file.name}" 超过 10MB，已跳过`);
+            return;
+        }
+        try {
+            const arrayBuffer = await file.arrayBuffer();
+            const fileData = Array.from(new Uint8Array(arrayBuffer));
+            const tempPath = await invoke<string>('save_external_file', {
+                workspacePath: currentWorkspace,
+                fileData,
+                fileName: file.name,
+            });
+            let content: string | undefined;
+            try {
+                const textContent = await file.text();
+                if (textContent?.length && !textContent.includes('\0')) {
+                    content = textContent;
+                }
+            } catch {
+                /* 非文本文件忽略 */
+            }
+            const fileRef: FileReference = {
+                id: `ref-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+                type: ReferenceType.FILE,
+                createdAt: Date.now(),
+                path: tempPath,
+                name: file.name,
+                size: file.size,
+                mimeType: file.type,
+                content,
+            };
+            addReference(tabId, fileRef);
+        } catch (error) {
+            toast.error('保存外部文件失败');
+            console.error('❌ 保存外部文件失败:', error);
+        }
     };
     
     // 处理粘贴事件
@@ -404,7 +479,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId, pendingMode = 'agen
                 // 尝试从文件树中查找文件路径
                 const { currentWorkspace, fileTree } = useFileStore.getState();
                 const { flattenFileTree } = await import('../../utils/fileTreeUtils');
-                const allFiles = flattenFileTree(fileTree);
+                const allFiles = fileTree ? flattenFileTree(fileTree) : [];
                 const matchedFile = allFiles.find(f => f.name === parsed.fileName);
                 
                 if (matchedFile && currentWorkspace) {
@@ -555,24 +630,28 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId, pendingMode = 'agen
             return;
         }
         
-        // 格式化引用信息
-        const { formatForAI } = useReferenceStore.getState();
+        // 格式化引用信息（发给 AI 的完整内容）
+        const { formatForAI, getReferences } = useReferenceStore.getState();
         const referenceText = await formatForAI(currentTabId);
+        const refs = getReferences(currentTabId);
         
         // 合并消息内容和引用
         let content = input.trim();
         if (referenceText) {
             content = `${content}\n\n[引用信息]\n${referenceText}`;
         }
+        // 消息记录展示：结构化节点，引用以标签形式渲染（与输入框一致）
+        const displayNodes: DisplayNode[] = input.trim()
+            ? [{ type: 'text', content: refs.length ? input.trim() + '\n\n' : input.trim() }, ...refs.map(r => ({ type: 'ref' as const, displayText: getReferenceDisplayText(r) }))]
+            : refs.map(r => ({ type: 'ref' as const, displayText: getReferenceDisplayText(r) }));
         
-        const inputContent = input.trim();
         setInput('');
         if (textareaRef.current) {
             textareaRef.current.style.height = 'auto';
         }
         
         // 发送消息后清除引用
-        await sendMessage(currentTabId, content);
+        await sendMessage(currentTabId, content, { displayNodes: displayNodes.length > 0 ? displayNodes : undefined });
         clearReferences(currentTabId);
     };
     
@@ -620,7 +699,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId, pendingMode = 'agen
     };
     
     // 处理中文输入法结束（确认输入）
-    const handleCompositionEnd = (e: React.CompositionEvent<HTMLTextAreaElement>) => {
+    const handleCompositionEnd = (_e: React.CompositionEvent<HTMLTextAreaElement>) => {
         // 记录输入法结束的时间
         compositionEndTimeRef.current = Date.now();
         
@@ -632,67 +711,66 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId, pendingMode = 'agen
         }, 0);
     };
     
-    // 处理 @ 选择器选择
+    // 处理 @ 选择器选择（Phase 1.2：支持 file / memory / chat）
     const handleMentionSelect = async (item: MentionItem) => {
-        if (!textareaRef.current) return;
+        if (!textareaRef.current || !tabId) return;
         
         const textarea = textareaRef.current;
         const selectionStart = textarea.selectionStart;
         const textBeforeCursor = input.substring(0, selectionStart);
         
-        // 查找 @ 的位置
-        const atMatch = textBeforeCursor.match(/@(记忆库[：:])?([^\s@]*)$/);
+        const atMatch = textBeforeCursor.match(/@([^\s@]*)$/);
         if (!atMatch) return;
         
         const atIndex = textBeforeCursor.lastIndexOf('@');
         const beforeAt = input.substring(0, atIndex);
         const afterCursor = input.substring(selectionStart);
-        
-        // 根据类型构建替换文本
-        let replacement: string;
-        if (mentionState?.type === 'memory') {
-            replacement = `@记忆库:${item.name} `;
-        } else {
-            replacement = `@${item.name} `;
-        }
-        
+        const replacement = `@${item.name} `;
         const newInput = `${beforeAt}${replacement}${afterCursor}`;
         setInput(newInput);
         setMentionState(null);
         
-        // 根据类型添加引用
+        // 根据 item.type 添加对应引用
         if (item.type === 'file' && item.path) {
-            const fileRef: FileReference = {
+            addReference(tabId, {
                 id: '',
                 type: ReferenceType.FILE,
                 createdAt: Date.now(),
                 path: item.path,
                 name: item.name,
-            };
-            addReference(tabId, fileRef);
+            });
         } else if (item.type === 'memory') {
-            // 获取该记忆库的所有记忆项
             if (currentWorkspace) {
                 try {
-                    const memories = await memoryService.getAllMemories(currentWorkspace);
+                    const memories = await memoryService.getAllMemories(currentWorkspace as string);
                     const memoryItems = memories.filter(m => m.entity_name === item.name);
-                    
-                    const memoryRef: MemoryReference = {
+                    addReference(tabId, {
                         id: '',
                         type: ReferenceType.MEMORY,
                         createdAt: Date.now(),
                         memoryId: `memory-${item.name}`,
                         name: item.name,
                         itemCount: memoryItems.length,
-                    };
-                    addReference(tabId, memoryRef);
+                    });
                 } catch (error) {
                     console.error('获取记忆库详情失败:', error);
                 }
             }
+        } else if (item.type === 'chat' && item.chatTabId) {
+            const chatTab = tabs.find(t => t.id === item.chatTabId);
+            if (chatTab) {
+                addReference(tabId, {
+                    id: '',
+                    type: ReferenceType.CHAT,
+                    createdAt: Date.now(),
+                    chatTabId: item.chatTabId,
+                    chatTabTitle: item.name,
+                    messageIds: chatTab.messages.map(m => m.id),
+                    messageRange: { start: 0, end: chatTab.messages.length },
+                });
+            }
         }
         
-        // 聚焦到输入框并设置光标位置
         setTimeout(() => {
             textarea.focus();
             const newCursorPos = beforeAt.length + replacement.length;
@@ -700,61 +778,8 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId, pendingMode = 'agen
         }, 0);
     };
     
-    // 获取文件列表用于 @ 选择器
-    const getFileItems = (): MentionItem[] => {
-        if (!fileTree) return [];
-        
-        const flatTree = flattenFileTree(fileTree);
-        const files = filterFiles(flatTree);
-        
-        return files.map(file => ({
-            id: file.path,
-            name: file.name,
-            path: file.path,
-            type: 'file' as const,
-        }));
-    };
-    
-    // 获取记忆库列表用于 @ 选择器
-    const [memoryItems, setMemoryItems] = useState<MentionItem[]>([]);
-    
-    useEffect(() => {
-        const loadMemories = async () => {
-            if (!currentWorkspace) return;
-            
-            try {
-                const memories = await memoryService.getAllMemories(currentWorkspace);
-                // 按实体名称分组（同一实体名称的记忆项视为一个记忆库）
-                const memoryMap = new Map<string, number>();
-                memories.forEach(m => {
-                    const count = memoryMap.get(m.entity_name) || 0;
-                    memoryMap.set(m.entity_name, count + 1);
-                });
-                
-                const items: MentionItem[] = Array.from(memoryMap.keys()).map((name) => ({
-                    id: `memory-${name}`,
-                    name,
-                    type: 'memory' as const,
-                }));
-                
-                setMemoryItems(items);
-            } catch (error) {
-                console.error('加载记忆库失败:', error);
-            }
-        };
-        
-        loadMemories();
-    }, [currentWorkspace]);
-    
-    // 根据类型获取选择器项目
-    const getMentionItems = (): MentionItem[] => {
-        if (mentionState?.type === 'memory') {
-            return memoryItems;
-        }
-        return getFileItems();
-    };
-    
     const handleRegenerate = async () => {
+        if (!tabId) return;
         await regenerate(tabId);
     };
     
@@ -796,7 +821,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId, pendingMode = 'agen
     return (
         <div 
             ref={containerRef}
-            className="flex-shrink-0 border-t border-gray-200 dark:border-gray-700 p-4 bg-white dark:bg-gray-800"
+            className="relative flex-shrink-0 border-t border-gray-200 dark:border-gray-700 p-4 bg-white dark:bg-gray-800"
             onDrop={handleDrop}
             onDragOver={(e) => {
                 e.preventDefault();
@@ -805,8 +830,9 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId, pendingMode = 'agen
                 const types = Array.from(e.dataTransfer.types);
                 const hasFilePath = types.includes('application/file-path') || types.includes('text/plain');
                 const hasFiles = types.includes('Files');
+                const hasBinderRef = types.includes('application/binder-reference-memory') || types.includes('application/binder-reference-chat');
                 
-                if (hasFilePath || hasFiles) {
+                if (hasFilePath || hasFiles || hasBinderRef) {
                     e.dataTransfer.dropEffect = 'copy'; // 显示复制图标（创建引用）
                 } else {
                     e.dataTransfer.dropEffect = 'none';
@@ -825,26 +851,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId, pendingMode = 'agen
                 </div>
             )}
             
-            {/* 引用标签（仅在已有标签页时显示） */}
-            {tabId && (
-                <ReferenceTags 
-                    references={references} 
-                    onRemove={(refId) => removeReference(tabId, refId)} 
-                />
-            )}
-            
-            <div className="flex items-end gap-2 relative">
-                {/* @ 语法选择器 */}
-                {mentionState?.show && (
-                    <MentionSelector
-                        query={mentionState.query}
-                        type={mentionState.type}
-                        items={getMentionItems()}
-                        position={mentionState.position}
-                        onSelect={handleMentionSelect}
-                        onClose={() => setMentionState(null)}
-                    />
-                )}
+            <div className="flex items-end gap-2">
                 <textarea
                     ref={textareaRef}
                     value={input}
@@ -906,6 +913,18 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId, pendingMode = 'agen
                     </button>
                 )}
             </div>
+
+            {/* @ 语法选择器 Phase 1.2：五类树状、点选/字符匹配，定位相对于 containerRef */}
+            {mentionState?.show && (
+                <MentionSelector
+                    query={mentionState.query}
+                    itemsByCategory={itemsByCategory}
+                    getItemsByCategory={getItemsByCategory}
+                    position={mentionState.position}
+                    onSelect={handleMentionSelect}
+                    onClose={() => setMentionState(null)}
+                />
+            )}
         </div>
     );
 };

@@ -122,7 +122,7 @@ export const GhostTextExtension = Extension.create<GhostTextOptions>({
           decorations(state) {
             const decorations = this.getState(state);
             console.log('[GhostTextExtension] decorations prop 被调用', { 
-              decorationCount: decorations?.size || 0 
+              decorationCount: decorations?.find()?.length ?? 0 
             });
             return decorations;
           },

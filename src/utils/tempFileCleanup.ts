@@ -32,7 +32,7 @@ export async function cleanupTempFiles(
     setTimeout(async () => {
         try {
             const { invoke } = await import('@tauri-apps/api/core');
-            const cleanedCount = await invoke<number>('cleanup_temp_files', {
+            await invoke<number>('cleanup_temp_files', {
                 workspacePath,
                 filePaths,
             });

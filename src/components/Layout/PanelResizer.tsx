@@ -17,7 +17,6 @@ const PanelResizer: React.FC<PanelResizerProps> = ({
 }) => {
   const [isDragging, setIsDragging] = useState(false);
   const startXRef = useRef<number>(0);
-  const startWidthRef = useRef<number>(0);
 
   useEffect(() => {
     if (!isDragging) return;

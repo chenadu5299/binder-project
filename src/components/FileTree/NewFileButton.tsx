@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { useFileStore } from '../../stores/fileStore';
 import { fileService } from '../../services/fileService';
 import { FileTreeRef } from './FileTree';

@@ -9,10 +9,22 @@ import { parseWorkPlan } from '../../utils/workPlanParser';
 import { ToolCallSummary } from './ToolCallSummary';
 import { AuthorizationCard } from './AuthorizationCard';
 import { QuickApplyButton } from './QuickApplyButton';
-import { DocumentDiffView } from './DocumentDiffView';
 import { needsAuthorization, generateAuthorizationDescription } from '../../utils/toolDescription';
 import { useFileStore } from '../../stores/fileStore';
 import { useEditorStore } from '../../stores/editorStore';
+import {
+  useDiffStore,
+  buildAcceptReadRow,
+  userVisibleMessageForSnapshotGate,
+} from '../../stores/diffStore';
+import { resolveEditorTabForEditResultWithRequestContext } from '../../utils/editToolTabResolve';
+import { applyDiffReplaceInEditor } from '../../utils/applyDiffReplaceInEditor';
+import { blockRangeToPMRange } from '../../utils/editorOffsetUtils';
+import { DiffCard } from './DiffCard';
+import { positionToLine } from '../../utils/editorOffsetUtils';
+import { documentService } from '../../services/documentService';
+import { toast } from '../Common/Toast';
+import './InlineChatInput.css';
 
 interface ChatMessagesProps {
     messages: ChatMessage[];
@@ -35,52 +47,9 @@ export const ChatMessages: React.FC<ChatMessagesProps> = ({
     const scrollContainerRef = useRef<HTMLDivElement>(null);
     const { updateToolCall, regenerate, deleteMessage, updateContentBlock } = useChatStore();
     const { currentWorkspace } = useFileStore();
+    const { getActiveTab, updateTabContent } = useEditorStore();
+    useDiffStore((s) => s.byTab);
     
-    // 文档编辑功能：确认编辑
-    const handleConfirmEdit = async (
-        diffAreaId: string,
-        _level: 'paragraph' | 'document' | 'all', // MVP 阶段未使用，阶段二会使用
-        _paragraphId: string | undefined, // MVP 阶段未使用，阶段二会使用
-        newContent: string,
-    ) => {
-        try {
-            const { getActiveTab, applyTabDiff } = useEditorStore.getState();
-            const activeTab = getActiveTab();
-            
-            if (!activeTab) {
-                throw new Error('编辑器已关闭，无法应用编辑');
-            }
-            
-            // ⚠️ 关键修复：不应该使用 newContent 更新整个文档，而应该触发编辑器的 onApplyDiff
-            // 编辑器的 onApplyDiff 会通过 diff 数据只应用修改的部分，保留原有格式
-            // 通过 applyTabDiff 触发编辑器应用 diff
-            applyTabDiff(activeTab.id);
-            
-            console.log('✅ [前端] 已触发编辑器应用 diff');
-        } catch (error) {
-            console.error('应用编辑失败:', error);
-            // 显示错误提示（可选）
-        }
-    };
-    
-    // 文档编辑功能：拒绝编辑
-    const handleRejectEdit = async (diffAreaId: string) => {
-        try {
-            // ⚠️ 新增：清除编辑器中的 diff 数据
-            const { getActiveTab, clearTabDiff } = useEditorStore.getState();
-            const activeTab = getActiveTab();
-            if (activeTab) {
-                clearTabDiff(activeTab.id);
-            }
-            
-            // MVP 阶段：直接移除预览，不更新编辑器
-            // 编辑器内容保持不变
-            // diffAreaId 在阶段二会用于调用 Tauri Command
-            console.log('❌ 已拒绝编辑，diff 已清除');
-        } catch (error) {
-            console.error('拒绝编辑失败:', error);
-        }
-    };
     const [contextMenu, setContextMenu] = useState<{
         message: ChatMessage;
         position: { x: number; y: number };
@@ -92,39 +61,8 @@ export const ChatMessages: React.FC<ChatMessagesProps> = ({
     const userScrolledRef = useRef<boolean>(false);
     const isAutoScrollingRef = useRef<boolean>(false);
     const scrollTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-    
-    // AI 返回文档修改结果时，立即同步 diff 到 EditorStore，使编辑器同步显示 diff 高亮（点击确认时才应用）
-    useEffect(() => {
-        const { getActiveTab, setTabDiff } = useEditorStore.getState();
-        const activeTab = getActiveTab();
-        if (!activeTab) return;
-        // 从最新消息往旧找，取第一个带完整 diff 的 edit_current_editor_document 块
-        for (let i = messages.length - 1; i >= 0; i--) {
-            const msg = messages[i];
-            if (!msg.contentBlocks?.length) continue;
-            for (const block of msg.contentBlocks) {
-                if ((block.type !== 'tool' && block.type !== 'authorization') || block.toolCall?.name !== 'edit_current_editor_document') continue;
-                const toolResult = block.toolCall?.result;
-                if (!toolResult?.success) continue;
-                let resultData: any = {};
-                if (toolResult.data !== undefined && toolResult.data !== null) {
-                    if (typeof toolResult.data === 'string') {
-                        try { resultData = JSON.parse(toolResult.data); } catch { resultData = {}; }
-                    } else if (typeof toolResult.data === 'object') resultData = toolResult.data;
-                } else if (toolResult.diff_area_id || toolResult.old_content || toolResult.oldContent || toolResult.new_content || toolResult.newContent) {
-                    resultData = toolResult;
-                } else continue;
-                const diffAreaId = resultData.diff_area_id || '';
-                const diffs = resultData.diffs || [];
-                const oldContent = resultData.old_content ?? resultData.oldContent ?? '';
-                const newContent = resultData.new_content ?? resultData.newContent ?? '';
-                if (diffAreaId && Array.isArray(diffs) && diffs.length > 0 && oldContent !== undefined && newContent !== undefined) {
-                    setTabDiff(activeTab.id, diffAreaId, diffs, oldContent, newContent);
-                    return;
-                }
-            }
-        }
-    }, [messages]);
+    // 旧的 ChatMessages 二次 diff 同步路径已禁用。
+    // edit_current_editor_document 的结果同步现在只保留 ChatPanel 单一路径。
     
     // 检查是否在底部附近（距离底部 100px 以内）
     const isNearBottom = (): boolean => {
@@ -336,151 +274,201 @@ export const ChatMessages: React.FC<ChatMessagesProps> = ({
                     );
                 }
                 
-                // 文本编辑使用 Diff 预览
+                // 对话编辑：edit_current_editor_document（Phase 2a/3：diffStore + DiffCard）
                 if (block.toolCall.name === 'edit_current_editor_document') {
-                    console.log('📝 [前端] 检测到 edit_current_editor_document 工具调用', {
-                        toolCall: block.toolCall,
-                        result: block.toolCall.result,
-                    });
-                    
                     const toolResult = block.toolCall.result;
-                    
-                    // ⚠️ 调试：打印完整的 toolResult 结构（使用 JSON.stringify 确保能看到所有字段）
-                    const toolResultStr = JSON.stringify(toolResult, null, 2);
-                    console.log('🔍 [前端] 工具调用结果结构:', {
-                        toolResult,
-                        toolResultType: typeof toolResult,
-                        toolResultKeys: toolResult ? Object.keys(toolResult) : [],
-                        hasData: !!toolResult?.data,
-                        dataType: typeof toolResult?.data,
-                        dataValue: toolResult?.data,
-                        dataKeys: toolResult?.data ? Object.keys(toolResult.data) : [],
-                        // 打印完整的 toolResult 结构（用于调试）
-                        toolResultString: toolResultStr,
-                        // 检查是否是 success 字段
-                        hasSuccess: 'success' in (toolResult || {}),
-                        successValue: toolResult?.success,
-                    });
-                    
-                    // ⚠️ 关键修复：确保从正确的位置获取数据
-                    // 后端返回的数据结构：{ success: true, data: { diff_area_id, file_path, old_content, new_content, diffs } }
-                    // 但是，如果 data 是字符串（JSON 字符串），需要先解析
-                    // 另外，如果 toolResult 本身就是一个对象（而不是 { success, data } 结构），可能需要直接使用
-                    let resultData: any = {};
-                    
                     if (!toolResult) {
-                        console.error('❌ [前端] toolResult 不存在');
                         return (
                             <div key={block.id} className="mt-2 p-3 bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-300 dark:border-yellow-700 rounded text-sm text-yellow-800 dark:text-yellow-200">
-                                ⚠️ 文档编辑数据不完整，无法显示预览。工具调用结果不存在。
+                                文档编辑数据不完整，无法显示预览。
                             </div>
                         );
                     }
-                    
-                    // 检查 toolResult 的结构
-                    // 情况 1: toolResult.data 存在（标准结构 { success, data, ... }）
+
+                    let resultData: any = {};
                     if (toolResult.data !== undefined && toolResult.data !== null) {
-                        console.log('✅ [前端] 使用标准结构 toolResult.data');
-                        if (typeof toolResult.data === 'string') {
-                            try {
-                                resultData = JSON.parse(toolResult.data);
-                            } catch (e) {
-                                console.error('❌ [前端] 解析 data JSON 失败:', e);
-                                resultData = {};
-                            }
-                        } else if (typeof toolResult.data === 'object') {
-                            resultData = toolResult.data;
-                        }
-                    } 
-                    // 情况 2: toolResult 本身可能就是 data（如果后端直接返回 data 对象，而不是包装在 ToolResult 中）
-                    else if (toolResult.diff_area_id || toolResult.old_content || toolResult.oldContent || toolResult.new_content || toolResult.newContent) {
-                        console.log('✅ [前端] toolResult 本身可能就是 data 对象，直接使用', {
-                            hasDiffAreaId: !!toolResult.diff_area_id,
-                            hasOldContent: !!(toolResult.old_content || toolResult.oldContent),
-                            hasNewContent: !!(toolResult.new_content || toolResult.newContent),
-                        });
+                        resultData = typeof toolResult.data === 'string'
+                            ? (() => { try { return JSON.parse(toolResult.data); } catch { return {}; } })()
+                            : toolResult.data;
+                    } else if (toolResult.diff_area_id || toolResult.old_content || toolResult.oldContent || toolResult.new_content || toolResult.newContent) {
                         resultData = toolResult;
-                    }
-                    // 情况 3: toolResult.data 是 null（Rust 的 Option::None 序列化为 null）
-                    else if (toolResult.data === null) {
-                        console.error('❌ [前端] toolResult.data 是 null，后端可能返回了错误或空数据', {
-                            toolResult,
-                            success: toolResult.success,
-                            error: toolResult.error,
-                            message: toolResult.message,
-                        });
+                    } else if (toolResult.data === null) {
                         return (
                             <div key={block.id} className="mt-2 p-3 bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-300 dark:border-yellow-700 rounded text-sm text-yellow-800 dark:text-yellow-200">
-                                ⚠️ 文档编辑数据不完整，无法显示预览。后端返回的数据为空。
-                                {toolResult.error && <div className="mt-2 text-xs">错误: {toolResult.error}</div>}
+                                文档编辑数据为空。{toolResult.error && <span className="mt-2 block text-xs">错误: {toolResult.error}</span>}
                             </div>
                         );
-                    }
-                    // 情况 4: toolResult 是其他结构，尝试从不同位置获取
-                    else {
-                        console.warn('⚠️ [前端] toolResult.data 不存在，且 toolResult 也不是 data 对象', {
-                            toolResultKeys: Object.keys(toolResult),
-                            toolResult,
-                        });
-                        // 尝试从 toolResult 的其他字段获取
+                    } else {
                         resultData = toolResult as any;
                     }
-                    
-                    const diffAreaId = resultData.diff_area_id || '';
-                    const oldContent = resultData.old_content || resultData.oldContent || '';
-                    const newContent = resultData.new_content || resultData.newContent || '';
-                    const filePath = resultData.file_path || resultData.filePath || '当前文档';
-                    const diffs = resultData.diffs || [];
-                    
-                    console.log('📝 [前端] 文档编辑数据:', {
-                        diffAreaId,
-                        filePath,
-                        oldContentLength: oldContent.length,
-                        newContentLength: newContent.length,
-                        diffsCount: diffs.length,
-                        resultDataKeys: Object.keys(resultData),
-                        resultData,
-                    });
-                    
-                    // ⚠️ 关键修复：检查数据完整性
-                    // oldContent 和 newContent 可能是空字符串（如果文档为空），这是合法的
-                    // 但如果字段不存在（undefined），才是真正的错误
-                    if (oldContent === undefined || newContent === undefined) {
-                        console.error('❌ [前端] 文档编辑数据字段缺失:', {
-                            hasOldContent: oldContent !== undefined,
-                            hasNewContent: newContent !== undefined,
-                            oldContent,
-                            newContent,
-                            toolResult,
-                            resultData,
-                            resultDataKeys: Object.keys(resultData),
-                        });
+
+                    if (resultData.new_content === undefined && resultData.newContent === undefined) {
                         return (
                             <div key={block.id} className="mt-2 p-3 bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-300 dark:border-yellow-700 rounded text-sm text-yellow-800 dark:text-yellow-200">
-                                ⚠️ 文档编辑数据不完整，无法显示预览。请检查工具调用结果。
+                                文档编辑数据不完整，缺少 new_content。
                             </div>
                         );
                     }
-                    
-                    // 编辑器 diff 由 ChatPanel 在收到工具结果时设置（setTabDiff），避免在渲染中产生副作用
-                    
+
+                    // Phase 2a/3：有 blockId 格式 diffs 时用 DiffCard 精准替换（P3：按 file_path 解析 tab）
+                    const diffTab =
+                        resolveEditorTabForEditResultWithRequestContext(resultData.file_path, tabId) ?? getActiveTab();
+                    const toolCallId = block.toolCall?.id;
+                    const displayDiffs =
+                        diffTab && toolCallId
+                            ? useDiffStore.getState().getDisplayDiffs(diffTab.filePath, toolCallId)
+                            : [];
+
+                    // 后端返回了 blockId 格式（diff_area_id + diffs），但 displayDiffs 可能为空：1) 首次渲染尚未 sync；2) 已全部接受
+                    const hasBlockIdFormat = !!(resultData.diff_area_id && Array.isArray(resultData.diffs) && resultData.diffs.length > 0);
+
+                    if (displayDiffs.length > 0 && diffTab?.editor) {
+                        const diffStore = useDiffStore.getState();
+                        const workspacePath = currentWorkspace ?? null;
+                        const tabRev = diffTab.documentRevision ?? 1;
+                        return (
+                            <div key={block.id} className="mt-2 w-full space-y-2">
+                                {displayDiffs.map((entry) => {
+                                    const doc = diffTab.editor!.state.doc;
+                                    const entryBrOpts = {
+                                        occurrenceIndex: entry.occurrenceIndex,
+                                        originalTextFallback: entry.originalText,
+                                    };
+                                    const range =
+                                        entry.mappedFrom != null && entry.mappedTo != null
+                                            ? { from: entry.mappedFrom, to: entry.mappedTo }
+                                            : entry.status === 'accepted' && entry.acceptedFrom != null && entry.acceptedTo != null
+                                              ? { from: entry.acceptedFrom, to: entry.acceptedTo }
+                                              : blockRangeToPMRange(
+                                                    doc,
+                                                    entry.startBlockId,
+                                                    entry.startOffset,
+                                                    entry.endBlockId,
+                                                    entry.endOffset,
+                                                    entryBrOpts
+                                                );
+                                    const lineStart = range ? positionToLine(doc, range.from) : undefined;
+                                    const lineEnd = range ? positionToLine(doc, Math.max(range.from, range.to - 1)) : undefined;
+                                    return (
+                                    <DiffCard
+                                        key={entry.diffId}
+                                        diff={entry}
+                                        filePath={diffTab.filePath}
+                                        workspacePath={workspacePath}
+                                        lineStart={lineStart}
+                                        lineEnd={lineEnd}
+                                        onLocate={range ? () => {
+                                            const { tabs, setActiveTab } = useEditorStore.getState();
+                                            const tab = tabs.find((t) => t.filePath === diffTab.filePath);
+                                            if (tab) {
+                                                setActiveTab(tab.id);
+                                                if (tab.editor) {
+                                                    try {
+                                                        const { node } = tab.editor.view.domAtPos(Math.min(range.from, tab.editor.state.doc.content.size - 1));
+                                                        const el = node.nodeType === Node.TEXT_NODE ? node.parentElement : (node as Element);
+                                                        if (el && el instanceof HTMLElement) {
+                                                            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                                                        }
+                                                    } catch {
+                                                        useEditorStore.getState().setPendingScrollTo(tab.id, range.from, range.to);
+                                                    }
+                                                } else {
+                                                    useEditorStore.getState().setPendingScrollTo(tab.id, range.from, range.to);
+                                                }
+                                            } else {
+                                                documentService.openFile(diffTab.filePath).then(() => {
+                                                    const t = useEditorStore.getState().tabs.find((tb) => tb.filePath === diffTab.filePath);
+                                                    if (t) useEditorStore.getState().setPendingScrollTo(t.id, range.from, range.to);
+                                                });
+                                            }
+                                        } : undefined}
+                                        onAccept={async () => {
+                                            const editor = diffTab.editor;
+                                            if (!editor) return;
+                                            const readRow = await buildAcceptReadRow(entry, editor, {
+                                                tabDocumentRevision: tabRev,
+                                                filePath: diffTab.filePath,
+                                            });
+                                            if (readRow.kind === 'fail') {
+                                                const reason = readRow.reason;
+                                                diffStore.updateDiff(diffTab.filePath, entry.diffId, {
+                                                    status: 'expired',
+                                                    expireReason: reason,
+                                                });
+                                                if (
+                                                    reason === 'document_revision_mismatch' ||
+                                                    reason === 'content_snapshot_mismatch' ||
+                                                    reason === 'block_order_snapshot_mismatch'
+                                                ) {
+                                                    toast.warning(userVisibleMessageForSnapshotGate(reason));
+                                                } else if (reason === 'original_text_mismatch') {
+                                                    toast.warning('修改建议已失效：文档内容已被修改，无法应用此处的 AI 建议');
+                                                }
+                                                return;
+                                            }
+                                            const inserted = applyDiffReplaceInEditor(
+                                                editor,
+                                                { from: readRow.from, to: readRow.to },
+                                                entry.newText
+                                            );
+                                            if (!inserted) {
+                                                diffStore.updateDiff(diffTab.filePath, entry.diffId, {
+                                                    status: 'expired',
+                                                    expireReason: 'apply_replace_failed',
+                                                });
+                                                return;
+                                            }
+                                            diffStore.acceptDiff(diffTab.filePath, entry.diffId, {
+                                                from: inserted.insertFrom,
+                                                to: inserted.insertTo,
+                                            });
+                                            updateTabContent(diffTab.id, editor.getHTML());
+                                        }}
+                                        onReject={() => {
+                                            diffStore.rejectDiff(diffTab.filePath, entry.diffId);
+                                            diffTab.editor?.view.dispatch(diffTab.editor.state.tr);
+                                        }}
+                                    />
+                                )})}
+                            </div>
+                        );
+                    }
+
+                    // 有 blockId 格式但 displayDiffs 为空：已全部接受或 sync 尚未完成
+                    // 不显示「无法精准定位」错误，改为成功态或保留全文替换兜底
+                    if (hasBlockIdFormat) {
+                        // 若该 tool call 存在已接受的 diffs，说明用户已接受，显示成功
+                        const tabDiffs = diffTab ? useDiffStore.getState().byTab[diffTab.filePath]?.diffs : undefined;
+                        const hasAcceptedDiffs = tabDiffs
+                            ? [...tabDiffs.values()].some(
+                                  (d) => d.status === 'accepted' && (toolCallId == null || d.toolCallId === toolCallId)
+                              )
+                            : false;
+                        if (hasAcceptedDiffs) {
+                            return (
+                                <div key={block.id} className="mt-2 w-full p-3 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-700 rounded-lg">
+                                    <p className="text-xs text-green-700 dark:text-green-300">
+                                        修改已应用。如需撤销可编辑文档后手动恢复。
+                                    </p>
+                                </div>
+                            );
+                        }
+                        // 旧的全文替换兜底已禁用，不再从聊天卡片直接覆盖文档。
+                        return (
+                            <div key={block.id} className="mt-2 w-full p-3 bg-gray-50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-600 rounded-lg">
+                                <p className="text-xs text-gray-500 dark:text-gray-400 mb-2">
+                                    旧版全文替换兜底已禁用；仅保留规范 diff 卡渲染。
+                                </p>
+                            </div>
+                        );
+                    }
+
+                    // 无 blockId 规范 diff：旧版全文替换兜底已禁用。
                     return (
-                        <div key={block.id} className="mt-2 w-full">
-                            <DocumentDiffView
-                                diffAreaId={diffAreaId}
-                                oldContent={oldContent}
-                                newContent={newContent}
-                                filePath={filePath}
-                                diffs={diffs}
-                                onConfirm={async (level: 'paragraph' | 'document' | 'all', paragraphId?: string) => {
-                                    console.log('✅ [前端] 用户确认编辑', { diffAreaId, level, paragraphId });
-                                    await handleConfirmEdit(diffAreaId, level, paragraphId, newContent);
-                                }}
-                                onReject={async () => {
-                                    console.log('❌ [前端] 用户拒绝编辑', { diffAreaId });
-                                    await handleRejectEdit(diffAreaId);
-                                }}
-                            />
+                        <div key={block.id} className="mt-2 w-full p-3 bg-gray-50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-600 rounded-lg">
+                            <p className="text-xs text-gray-500 dark:text-gray-400 mb-2">
+                                旧版全文替换兜底已禁用；当前只接受 blockId 规范 diff。
+                            </p>
                         </div>
                     );
                 }
@@ -575,16 +563,7 @@ export const ChatMessages: React.FC<ChatMessagesProps> = ({
                                                 if ((block.type === 'tool' || block.type === 'authorization') && block.toolCall?.name === 'edit_current_editor_document') {
                                                     const toolResult = block.toolCall?.result;
                                                     
-                                                    // ⚠️ 关键修复：如果 toolResult 不存在或没有 success，说明数据不完整，跳过（避免显示错误的 diff）
-                                                    if (!toolResult || !toolResult.success) {
-                                                        console.warn('⚠️ [前端] 工具调用结果不完整，跳过渲染', {
-                                                            blockId: block.id,
-                                                            toolCallId: block.toolCall?.id,
-                                                            hasResult: !!toolResult,
-                                                            success: toolResult?.success,
-                                                        });
-                                                        return false; // 跳过不完整的数据
-                                                    }
+                                                    if (!toolResult || !toolResult.success) return false;
                                                     
                                                     let resultData: any = {};
                                                     
@@ -605,25 +584,9 @@ export const ChatMessages: React.FC<ChatMessagesProps> = ({
                                                     const diffAreaId = resultData.diff_area_id || '';
                                                     const diffs = resultData.diffs || [];
                                                     
-                                                    // ⚠️ 关键修复：如果 diffAreaId 为空或 diffs 为空，说明数据不完整，跳过
-                                                    if (!diffAreaId || !Array.isArray(diffs) || diffs.length === 0) {
-                                                        console.warn('⚠️ [前端] diff 数据不完整，跳过渲染', {
-                                                            blockId: block.id,
-                                                            toolCallId: block.toolCall?.id,
-                                                            hasDiffAreaId: !!diffAreaId,
-                                                            diffsCount: Array.isArray(diffs) ? diffs.length : 0,
-                                                        });
-                                                        return false; // 跳过不完整的数据
-                                                    }
+                                                    if (!diffAreaId || !Array.isArray(diffs) || diffs.length === 0) return false;
                                                     
-                                                    if (diffAreaId && seenDiffAreaIds.has(diffAreaId)) {
-                                                        console.warn('⚠️ [前端] 检测到重复的 diff 预览，跳过渲染', {
-                                                            diffAreaId,
-                                                            blockId: block.id,
-                                                            toolCallId: block.toolCall?.id,
-                                                        });
-                                                        return false; // 跳过重复的 diff
-                                                    }
+                                                    if (diffAreaId && seenDiffAreaIds.has(diffAreaId)) return false;
                                                     
                                                     if (diffAreaId) {
                                                         seenDiffAreaIds.add(diffAreaId);
@@ -632,13 +595,7 @@ export const ChatMessages: React.FC<ChatMessagesProps> = ({
                                                 
                                                 // 对于其他工具调用，使用 toolCall.id 去重
                                                 if ((block.type === 'tool' || block.type === 'authorization') && block.toolCall?.id) {
-                                                    if (seenToolCallIds.has(block.toolCall.id)) {
-                                                        console.warn('⚠️ [前端] 检测到重复的工具调用，跳过渲染', {
-                                                            toolCallId: block.toolCall.id,
-                                                            blockId: block.id,
-                                                        });
-                                                        return false; // 跳过重复的工具调用
-                                                    }
+                                                    if (seenToolCallIds.has(block.toolCall.id)) return false;
                                                     seenToolCallIds.add(block.toolCall.id);
                                                 }
                                                 
@@ -662,15 +619,29 @@ export const ChatMessages: React.FC<ChatMessagesProps> = ({
                                     })()}
                                 </div>
                             ) : (
-                                /* 兼容旧格式：如果没有 contentBlocks，使用旧方式渲染 */
-                                <div className={`whitespace-pre-wrap break-words ${message.content?.includes('❌ AI 功能未配置') ? 'text-red-600 dark:text-red-400' : ''}`}>
-                                    {message.content || (message.isLoading ? (
+                                /* 兼容旧格式：如果没有 contentBlocks，使用旧方式渲染。用户消息优先用 displayNodes（引用以标签形式） */
+                                <div className={`break-words ${(message.displayContent ?? message.content)?.includes('❌ AI 功能未配置') ? 'text-red-600 dark:text-red-400' : ''}`}>
+                                    {message.isLoading ? (
                                         <div className="flex items-center gap-1">
                                             <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></div>
                                             <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></div>
                                             <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></div>
                                         </div>
-                                    ) : null)}
+                                    ) : message.role === 'user' && message.displayNodes && message.displayNodes.length > 0 ? (
+                                        <span className="whitespace-pre-wrap">
+                                            {message.displayNodes.map((node, i) =>
+                                                node.type === 'text' ? (
+                                                    <React.Fragment key={i}>{node.content}</React.Fragment>
+                                                ) : (
+                                                    <span key={i} className="message-ref-tag" title={node.displayText}>
+                                                        <span className="ref-label">@{node.displayText}</span>
+                                                    </span>
+                                                )
+                                            )}
+                                        </span>
+                                    ) : (
+                                        (message.role === 'user' && message.displayContent != null ? message.displayContent : message.content) || null
+                                    )}
                                 </div>
                             )}
                             
@@ -710,6 +681,8 @@ export const ChatMessages: React.FC<ChatMessagesProps> = ({
                                         <ToolCallCard
                                             key={toolCall.id}
                                             toolCall={toolCall}
+                                            chatTabId={tabId}
+                                            messageId={message.id}
                                             onResult={(result: ToolResult) => {
                                                 const activeTabId = useChatStore.getState().activeTabId;
                                                 if (activeTabId) {
@@ -769,5 +742,3 @@ export const ChatMessages: React.FC<ChatMessagesProps> = ({
         </div>
     );
 };
-
-

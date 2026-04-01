@@ -8,6 +8,9 @@ interface ExternalModificationDialogProps {
   onLoadChanges: () => void;
   onCompare?: () => void;
   onCancel?: () => void;
+  /** Phase 4：是否有 pending diffs，若有则显示「重新加载但保留 pending diff」 */
+  hasPendingDiffs?: boolean;
+  onReloadKeepDiffs?: () => void;
 }
 
 const ExternalModificationDialog: React.FC<ExternalModificationDialogProps> = ({
@@ -16,6 +19,8 @@ const ExternalModificationDialog: React.FC<ExternalModificationDialogProps> = ({
   onLoadChanges,
   onCompare,
   onCancel,
+  hasPendingDiffs,
+  onReloadKeepDiffs,
 }) => {
   const fileName = filePath.split('/').pop() || filePath;
 
@@ -51,6 +56,15 @@ const ExternalModificationDialog: React.FC<ExternalModificationDialogProps> = ({
           >
             加载更改（放弃当前编辑，加载外部修改）
           </button>
+
+          {hasPendingDiffs && onReloadKeepDiffs && (
+            <button
+              onClick={onReloadKeepDiffs}
+              className="px-4 py-2 bg-amber-500 text-white rounded hover:bg-amber-600 transition-colors"
+            >
+              重新加载但保留待确认修改（加载外部更改后仍显示红色删除线）
+            </button>
+          )}
           
           {onCompare && (
             <button

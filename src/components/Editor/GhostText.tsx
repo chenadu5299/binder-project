@@ -61,7 +61,7 @@ export const createGhostTextPlugin = (
 
 export const GhostText: React.FC<GhostTextProps> = () => {
     // 这个组件暂时不实现，因为 TipTap 的插件需要通过 extensions 配置
-    // 幽灵文字功能已通过 useAutoComplete hook 在 TipTapEditor 中集成
+    // 幽灵文字功能已废弃
     return null;
 };
 

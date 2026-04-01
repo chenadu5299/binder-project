@@ -25,13 +25,6 @@ interface CsvPreviewProps {
   filePath: string;
 }
 
-interface CsvCell {
-  value: string;
-  rowIndex: number;
-  colIndex: number;
-  cellRef: string; // A1, B2, etc.
-}
-
 interface SelectedCell {
   rowIndex: number;
   colIndex: number;
@@ -442,6 +435,7 @@ const CsvPreview: React.FC<CsvPreviewProps> = ({ filePath }) => {
         document.removeEventListener('mousedown', handleClickOutside);
       };
     }
+    return undefined;
   }, [showReferenceButton]);
 
   // 解析 CSV 文件
@@ -479,7 +473,7 @@ const CsvPreview: React.FC<CsvPreviewProps> = ({ filePath }) => {
           let processedBytes = 0;
           
           Papa.parse(content, {
-            step: (results, parser) => {
+            step: (results, _parser) => {
               if (results.data) {
                 parsedRows.push(results.data as string[]);
                 processedBytes += JSON.stringify(results.data).length;
@@ -529,9 +523,9 @@ const CsvPreview: React.FC<CsvPreviewProps> = ({ filePath }) => {
               setProgress(100);
               setLoading(false);
             },
-            error: (error) => {
-              console.error('CSV 解析错误:', error);
-              setError(`CSV 解析失败: ${error.message}`);
+            error: (err: Error) => {
+              console.error('CSV 解析错误:', err);
+              setError(`CSV 解析失败: ${err.message}`);
               setLoading(false);
             },
             skipEmptyLines: true,
@@ -584,9 +578,9 @@ const CsvPreview: React.FC<CsvPreviewProps> = ({ filePath }) => {
 
               setLoading(false);
             },
-            error: (error) => {
-              console.error('CSV 解析错误:', error);
-              setError(`CSV 解析失败: ${error.message}`);
+            error: (err: Error) => {
+              console.error('CSV 解析错误:', err);
+              setError(`CSV 解析失败: ${err.message}`);
               setLoading(false);
             },
             skipEmptyLines: true,

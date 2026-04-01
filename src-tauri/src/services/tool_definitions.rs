@@ -5,11 +5,11 @@ use serde_json::json;
 // 工具定义（英文版，中文注释）
 // 参考void的工具定义方式，使用简洁清晰的描述
 pub fn get_tool_definitions() -> Vec<ToolDefinition> {
-    vec![
+  vec![
         ToolDefinition {
             name: "read_file".to_string(),
-            // 读取文件内容，返回完整内容
-            description: "Reads the full contents of a file. Returns the complete file content.".to_string(),
+            // 读取文件内容，返回完整内容（问题5：DOCX 与编辑器缓存一致）
+            description: "Reads the full contents of a file. Returns the complete file content.\n\nFor .docx files: the tool returns Pandoc-converted HTML/text. For editing with `update_file`+use_diff, the server compares against workspace file_cache HTML (same source as the Binder editor). Do not mix markdown with HTML for docx edits; `read_file` output may differ slightly from cache—when unsure, rely on `current_editor_content` if the file is open.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -54,7 +54,11 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "content": {
                         "type": "string",
-                        "description": "The new file content"
+                        "description": "The new file content. For .docx files, MUST be HTML (paragraphs as <p>, headings as <h1>…), NOT markdown, so diffs align with editor. For .md/.txt use plain text."
+                    },
+                    "use_diff": {
+                        "type": "boolean",
+                        "description": "If true, generate pending diffs instead of writing directly. User must confirm before disk write. Use for files NOT currently open in editor."
                     }
                 },
                 "required": ["path", "content"]
@@ -161,26 +165,60 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "edit_current_editor_document".to_string(),
             // 编辑当前在编辑器中打开的文档（直接修改编辑器内容，需要用户确认）
-            description: "⚠️⚠️⚠️ CRITICAL: Use this tool when editing the document currently open in the editor.\n\nThis is the PRIMARY and ONLY tool for editing documents that are currently visible in the editor.\n\nWhen to use:\n- The user wants to edit/modify/update/change/rewrite/improve the document currently visible in the editor\n- The user asks about \"current document\", \"this file\", \"current file\", \"the document\" and wants to edit it\n- The context indicates a file is open in the editor and the user wants to edit it\n- ANY editing request for the currently open document\n\n⚠️ IMPORTANT RULES:\n1. DO NOT call 'read_file' first. This tool already has access to the current content.\n2. DO NOT call 'update_file' for files open in the editor. 'update_file' is ONLY for files NOT currently open.\n3. When the user wants to edit the current document, call this tool DIRECTLY with the new content.\n4. If you need the current content, it will be automatically provided by the system.\n\nWhat this tool does:\n- Automatically retrieves the current content from the editor\n- Calculates the diff between old and new content\n- Shows a diff preview to the user\n- Requires user confirmation before applying changes\n- Modifies the editor content directly (not the file on disk)\n\nImportant: When calling this tool, arguments must be in strict JSON format: all key names and string values must be wrapped in double quotes. Example: {\"content\":\"# New Content\"}. Do not omit quotes.".to_string(),
+            description: "Edit the document currently open in the editor. This is the ONLY tool for editing open files.\n\nDo NOT call read_file before this tool — current content is provided automatically.\nDo NOT use update_file for open files.\n\nProtocol (frozen):\n- Model fields: edit_mode, block_index, target, content, occurrence_index\n- System-injected fields: current_file, current_content, document_revision, baseline_id, _sel_start_block_id, _sel_start_offset, _sel_end_block_id, _sel_end_offset, _sel_text, cursor_block_id, cursor_offset\n\nRequired fields: edit_mode + block_index (except rewrite_document).\n  edit_mode: replace | delete | insert | rewrite_block | rewrite_document\n  block_index: 0-based index from [文档块列表] in context. Required unless edit_mode=rewrite_document.\n  target: exact plain text from the block (no HTML tags). Required for replace/delete/insert.\n  content: replacement or insertion text. Required for replace/insert/rewrite_block/rewrite_document.\n  occurrence_index: when target appears multiple times in the block, specifies which one (0-based, default 0).\n\nChanges are shown as diff preview and require user confirmation before applying.\n\nblock_index comes from [文档块列表] in context (0-based). Required unless edit_mode=rewrite_document.\ntarget must exactly match the plain text shown in the block. No HTML tags.\nIf block-level text search fails, the system automatically falls back to full-block replacement.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
+                    "edit_mode": {
+                        "type": "string",
+                        "description": "Required. replace | delete | insert | rewrite_block | rewrite_document."
+                    },
+                    "block_index": {
+                        "type": "integer",
+                        "description": "Block number (0-based) from the [文档块列表] in context. Required for all edit_mode values except rewrite_document."
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "Exact plain text to find within the block (no HTML tags). Required for replace/delete/insert."
+                    },
                     "content": {
                         "type": "string",
-                        "description": "The new document content. For phrase-level edits (e.g. translate one word), pass ONLY the replacement phrase here, e.g. \"Highly Automated\". For full-document rewrite, pass the complete new content."
+                        "description": "Replacement or insertion text. Required for replace/insert/rewrite_block/rewrite_document. Omit for delete."
                     },
-                    "instruction": {
-                        "type": "string",
-                        "description": "For phrase replacement, use format: 将\"原文\"修改为英文\"译文\" or 将\"X\"改为\"Y\". Example: 将\"高度自动化\"修改为英文\"High Automation\". This ensures only that phrase is replaced."
-                    },
-                    "target_content": {
-                        "type": "string",
-                        "description": "Optional. The exact text to be replaced (e.g. selected by user). When provided with short content, only this phrase is replaced. System may auto-fill from user selection."
+                    "occurrence_index": {
+                        "type": "integer",
+                        "description": "When the same target text appears multiple times within a block, specifies which occurrence to edit (0-based). Defaults to 0."
                     }
                 },
-                "required": ["content"]
+                "required": ["edit_mode"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: "save_file_dependency".to_string(),
+            description: "Saves a file dependency relationship. Use when user says 'sync these files', 'these files are related', or when you infer that modifying source_path affects target_path. Dependency type: 'references' (source imports/includes target), 'template' (target is template for source), 'generated' (source generates target), or 'sync' (changes should propagate).".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "source_path": {
+                        "type": "string",
+                        "description": "The source file path (relative to workspace)"
+                    },
+                    "target_path": {
+                        "type": "string",
+                        "description": "The target file path (relative to workspace)"
+                    },
+                    "dependency_type": {
+                        "type": "string",
+                        "description": "Type: references, template, generated, or sync"
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Optional description of the dependency"
+                    }
+                },
+                "required": ["source_path", "target_path", "dependency_type"]
             }),
         },
     ]
 }
-

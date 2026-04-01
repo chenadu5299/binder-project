@@ -106,7 +106,7 @@ export const CopyReferenceExtension = Extension.create<CopyReferenceExtensionOpt
                 currentPos += childSize;
               }
 
-              // 创建引用元数据（含 blockId+offset 用于精确定位）
+              // 创建引用元数据（含 blockId+offset 用于精确定位，Phase 0.2 支持跨块）
               const sourceData = {
                 filePath,
                 fileName,
@@ -119,9 +119,13 @@ export const CopyReferenceExtension = Extension.create<CopyReferenceExtensionOpt
                   end: charRange.to,
                 },
                 ...(anchor && {
-                  blockId: anchor.blockId,
+                  blockId: anchor.startBlockId,
                   startOffset: anchor.startOffset,
                   endOffset: anchor.endOffset,
+                  ...(anchor.startBlockId !== anchor.endBlockId && {
+                    startBlockId: anchor.startBlockId,
+                    endBlockId: anchor.endBlockId,
+                  }),
                 }),
               };
 

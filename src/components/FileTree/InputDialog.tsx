@@ -32,13 +32,13 @@ const InputDialog: React.FC<InputDialogProps> = ({
     if (value.trim()) {
       console.log('[InputDialog] 调用 onConfirm:', value.trim(), 'onConfirm 类型:', typeof onConfirm, 'onConfirm:', onConfirm);
       try {
-        const result = onConfirm(value.trim());
+        const result = onConfirm(value.trim()) as unknown;
         console.log('[InputDialog] ✅ onConfirm 调用完成，返回值:', result);
         // 如果返回 Promise，等待完成
-        if (result && typeof result.then === 'function') {
-          result.then(() => {
+        if (result != null && typeof (result as Promise<unknown>).then === 'function') {
+          (result as Promise<unknown>).then(() => {
             console.log('[InputDialog] ✅ onConfirm Promise 完成');
-          }).catch((error: any) => {
+          }).catch((error: unknown) => {
             console.error('[InputDialog] ❌ onConfirm Promise 失败:', error);
           });
         }

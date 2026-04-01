@@ -1,5 +1,5 @@
 import { useState, useEffect, useImperativeHandle, forwardRef } from 'react';
-import { useFileStore } from '../../stores/fileStore';
+import { useFileStore, shouldIgnoreFileTreeRefresh } from '../../stores/fileStore';
 import { fileService } from '../../services/fileService';
 import { documentService } from '../../services/documentService';
 import FileTreeNode from './FileTreeNode';
@@ -19,14 +19,16 @@ const FileTree = forwardRef<FileTreeRef>((_props, ref) => {
   const [isDragOver, setIsDragOver] = useState(false);
   const [organizeFiles, setOrganizeFiles] = useState<string[] | null>(null);
 
-  const loadFileTree = async () => {
+  /** @param preserveExpanded 为 true 时保持当前展开状态（用于外部修改刷新），否则重置为仅根目录 */
+  const loadFileTree = async (preserveExpanded = false) => {
     if (!currentWorkspace) return;
     setIsLoading(true);
     try {
       const tree = await fileService.buildFileTree(currentWorkspace, 5);
       setFileTree(tree);
-      // 默认展开根目录
-      setExpandedPaths(new Set([tree.path]));
+      if (!preserveExpanded) {
+        setExpandedPaths(new Set([tree.path]));
+      }
     } catch (error) {
       console.error('加载文件树失败:', error);
     } finally {
@@ -53,11 +55,14 @@ const FileTree = forwardRef<FileTreeRef>((_props, ref) => {
 
     // 监听文件树变化事件
     listen<string>('file-tree-changed', (event) => {
-      // 检查事件的工作区路径是否匹配当前工作区
-      if (event.payload === currentWorkspace) {
-        console.log('检测到文件系统变化，自动刷新文件树');
-        loadFileTree();
+      if (event.payload !== currentWorkspace) return;
+      // 优化1：忽略自身保存触发的刷新（编辑时自动保存会导致文件树折叠）
+      if (shouldIgnoreFileTreeRefresh(currentWorkspace)) {
+        return;
       }
+      console.log('检测到文件系统变化，自动刷新文件树');
+      // 优化2：外部修改刷新时保持文件树展开状态
+      loadFileTree(true);
     }).then((cleanup) => {
       unlisten = cleanup;
     }).catch((error) => {
@@ -272,8 +277,8 @@ const FileTree = forwardRef<FileTreeRef>((_props, ref) => {
           }
     }
 
-    // 刷新文件树
-    await loadFileTree();
+    // 刷新文件树（保持展开状态）
+    await loadFileTree(true);
   };
 
   // ⚠️ Week 18.2：处理文件重命名
@@ -285,7 +290,7 @@ const FileTree = forwardRef<FileTreeRef>((_props, ref) => {
 
     try {
       await fileService.renameFile(filePath, newName.trim());
-      await loadFileTree();
+      await loadFileTree(true);
     } catch (error) {
       console.error('重命名文件失败:', error);
       toast.error(`重命名文件失败: ${error instanceof Error ? error.message : String(error)}`);
@@ -296,7 +301,7 @@ const FileTree = forwardRef<FileTreeRef>((_props, ref) => {
   const handleDelete = async (filePath: string) => {
     try {
       await fileService.deleteFile(filePath);
-      await loadFileTree();
+      await loadFileTree(true);
     } catch (error) {
       console.error('删除文件失败:', error);
       toast.error(`删除文件失败: ${error instanceof Error ? error.message : String(error)}`);
@@ -307,7 +312,7 @@ const FileTree = forwardRef<FileTreeRef>((_props, ref) => {
   const handleDuplicate = async (filePath: string) => {
     try {
       await fileService.duplicateFile(filePath);
-      await loadFileTree();
+      await loadFileTree(true);
     } catch (error) {
       console.error('复制文件失败:', error);
       toast.error(`复制文件失败: ${error instanceof Error ? error.message : String(error)}`);
@@ -330,7 +335,7 @@ const FileTree = forwardRef<FileTreeRef>((_props, ref) => {
       await fileService.moveFile(sourcePath, destinationPath, currentWorkspace);
       toast.success(`文件已移动到: ${destinationPath.split('/').pop()}`);
       // 刷新文件树（会通过 file-tree-changed 事件自动刷新，但这里也手动刷新确保同步）
-      await loadFileTree();
+      await loadFileTree(true);
     } catch (error) {
       console.error('移动文件失败:', error);
       toast.error(`移动文件失败: ${error instanceof Error ? error.message : String(error)}`);
@@ -392,7 +397,7 @@ const FileTree = forwardRef<FileTreeRef>((_props, ref) => {
           filePaths={organizeFiles}
           onClose={() => setOrganizeFiles(null)}
           onComplete={async () => {
-            await loadFileTree();
+            await loadFileTree(true);
           }}
         />
       )}

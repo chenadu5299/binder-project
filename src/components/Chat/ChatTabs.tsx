@@ -24,6 +24,18 @@ export const ChatTabs: React.FC = () => {
             {tabs.map((tab) => (
                 <div
                     key={tab.id}
+                    draggable
+                    onDragStart={(e) => {
+                        e.dataTransfer.effectAllowed = 'copy';
+                        e.dataTransfer.setData('application/binder-reference-chat', JSON.stringify({
+                            type: 'chat',
+                            chatTabId: tab.id,
+                            chatTabTitle: tab.title,
+                            messageIds: tab.messages.map(m => m.id),
+                            messageRange: { start: 0, end: tab.messages.length },
+                        }));
+                        e.dataTransfer.setData('text/plain', `@${tab.title}`);
+                    }}
                     onClick={() => handleTabClick(tab.id)}
                     className={`
                         flex items-center gap-2 px-4 py-2 border-b-2 cursor-pointer flex-shrink-0

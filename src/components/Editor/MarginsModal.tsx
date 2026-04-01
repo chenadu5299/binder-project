@@ -47,7 +47,7 @@ const MarginsModal: React.FC<MarginsModalProps> = ({ isOpen, onClose, editor }) 
   const handleApply = () => {
     const v = Math.max(0, Math.min(200, Number(vertical) || 0));
     const h = Math.max(0, Math.min(200, Number(horizontal) || 0));
-    editor?.chain().focus().updateMargins({ top: v, bottom: v, left: h, right: h }).run();
+    (editor?.chain().focus() as any).updateMargins({ top: v, bottom: v, left: h, right: h }).run();
     editor?.view?.dispatch(editor.state.tr);
     setVertical(v);
     setHorizontal(h);

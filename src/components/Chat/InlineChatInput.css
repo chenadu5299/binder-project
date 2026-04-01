@@ -276,3 +276,25 @@
     color: #93c5fd;
 }
 
+/* 消息记录中的引用标签（与输入框样式一致；用户消息气泡为蓝色时需浅色标签） */
+.message-ref-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    margin: 0 2px;
+    background: rgba(255, 255, 255, 0.95);
+    border: 1px solid rgba(255, 255, 255, 0.6);
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 500;
+    color: #1e40af;
+    vertical-align: middle;
+}
+
+.dark .message-ref-tag {
+    background: rgba(59, 130, 246, 0.3);
+    border-color: rgba(147, 197, 253, 0.5);
+    color: #93c5fd;
+}
+

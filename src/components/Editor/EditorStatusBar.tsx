@@ -77,7 +77,7 @@ const getFileTypeDisplay = (filePath: string): string => {
 };
 
 const EditorStatusBar: React.FC<EditorStatusBarProps> = ({ editor }) => {
-  const { tabs, activeTabId } = useEditorStore();
+  const { tabs, activeTabId, invalidCommandHint } = useEditorStore();
   const activeTab = tabs.find(t => t.id === activeTabId);
   
   // 字数统计状态
@@ -167,7 +167,7 @@ const EditorStatusBar: React.FC<EditorStatusBarProps> = ({ editor }) => {
       
       // 通过遍历文档节点，提取到光标位置的所有文本
       let textBefore = '';
-      editor.state.doc.nodesBetween(0, $from.pos, (node, pos) => {
+      editor.state.doc.nodesBetween(0, $from.pos, (node, _pos) => {
         if (node.isText) {
           textBefore += node.text;
         }
@@ -296,6 +296,13 @@ const EditorStatusBar: React.FC<EditorStatusBarProps> = ({ editor }) => {
           <StatusIcon className={`w-3.5 h-3.5 ${saveStatus.color}`} />
           <span className={saveStatus.color}>{saveStatus.text}</span>
         </div>
+
+        {/* Phase 0.1：指令无效提示（光标未激活时按 Cmd+J/K） */}
+        {invalidCommandHint && (
+          <span className="animate-pulse text-amber-600 dark:text-amber-400 text-xs">
+            {invalidCommandHint}
+          </span>
+        )}
 
         {/* 编辑模式 */}
         {activeTab?.isReadOnly && (

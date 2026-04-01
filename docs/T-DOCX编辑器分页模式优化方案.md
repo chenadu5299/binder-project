@@ -1,15 +1,17 @@
 # T-DOCX 编辑器分页模式优化方案
 
 ## 文档信息
-- **版本**：v1.1
+- **版本**：v1.2
 - **创建日期**：2025-02
-- **更新日期**：2025-02
+- **更新日期**：2025-03
 - **状态**：✅ 方案 E 已实现
 - **目标**：将 T-DOCX 文件（应用模拟的 docx 文件）的编辑器改造为 Word 风格的分页编辑样式
 
+> **当前实现说明**：详见 `分页功能说明.md`
+
 ---
 
-## 〇、当前实现状态（2025-02 更新）
+## 〇、当前实现状态（2025-03 更新）
 
 **已采用方案 E：tiptap-pagination-plus 开源库 + 定制**
 
@@ -17,9 +19,9 @@
 |------|------|------|
 | 分页扩展 | ✅ | `tiptap-pagination-plus` 已接入，T-DOCX 编辑时 `layoutMode=page` |
 | 页码导航 | ✅ | 简化显示在工具栏内（◀ 当前页/总页数 ▶），多页时显示；当前页随滚动实时更新 |
-| 页面尺寸 | ✅ | PageSizeDropdown：A4/A3/Letter 等 |
+| 页面尺寸 | ✅ | PageSizeDropdown：A4/A3/Letter 竖排/横排 |
 | 页边距 | ✅ | MarginsModal：上下、左右边距可调 |
-| 编辑窗口缩放 | ✅ | 工具栏 50%-150% 缩放，使用 CSS zoom（非 transform），scrollWidth 正确，支持横向滚动查看纸张边缘；窗口内横向居中 |
+| 编辑窗口缩放 | ✅ | 工具栏 50%-150% 缩放，使用 transform scale，width=794*(zoom/100) 使 scrollWidth 正确，支持横向滚动；窗口内横向居中 |
 | 背景色 | ✅ | A4 纸内部白色，外部/页缝淡灰 `#f0f0f0` |
 | 聚焦灰框 | ✅ | 已移除 ProseMirror 聚焦时的 outline/border |
 | 文字遮挡修复 | ✅ | 容器 `overflow-visible`、EditorContent 无水平 padding，详见分页布局逻辑梳理 |
@@ -78,7 +80,7 @@ EditorPanel
 - `useAutoComplete.getDocumentFormat()`：`docx/draft` → `'t-docx'`
 
 **编辑模式入口**：
-- `EditorPanel.tsx` 第 563-588 行：`fileType === 'docx' && !activeTab.isReadOnly` 时渲染 TipTapEditor
+- `EditorPanel.tsx`：`fileType === 'docx' && !activeTab.isReadOnly` 时渲染 TipTapEditor（layoutMode='page'）
 
 ### 1.4 现有相关能力
 
@@ -197,85 +199,13 @@ EditorPanel
 
 ---
 
-## 五、项目拆解与细化
+## 五、项目拆解与细化（历史参考）
 
-### 5.1 阶段一：T-DOCX 限定宽度 + CSS 分页（方案 A）
+> **说明**：以下为方案 A 阶段的任务拆解，当前已采用方案 E（tiptap-pagination-plus），上述任务已由实现替代，无需执行。保留供理解方案演进与稳定性原则参考。
 
-#### 任务 1.1：T-DOCX 模式识别与组件拆分
-- **目标**：在编辑 T-DOCX 时使用独立布局逻辑
-- **子任务**：
-  - [ ] 在 `EditorPanel` 中增加 `isTDocxEditMode` 判断（docx 且非只读）
-  - [ ] 新建 `DocxPageEditor` 包装组件，或在 TipTapEditor 上增加 `layoutMode: 'page' | 'flow'` 属性
-  - [ ] 确保 md/html/txt 继续使用原有流式布局
-
-#### 任务 1.2：输入区域宽度限定
-- **目标**：T-DOCX 编辑时，输入区域固定宽度、居中
-- **子任务**：
-  - [ ] 定义页面宽度常量（如 A4：210mm / 794px）
-  - [ ] 使用 `max-width` + `margin: 0 auto` 实现居中
-  - [ ] 窗口宽度变化时，编辑区两侧留白自动调整
-  - [ ] 可选：提供页面宽度预设（A4、Letter 等）或用户可调
-
-#### 任务 1.3：高度分块（CSS 分页，纯视觉层）
-- **目标**：视觉上呈现「一页一页」的效果
-- **子任务**：
-  - [ ] 定义页高常量（如 A4：297mm ≈ 1122px）
-  - [ ] 使用 `repeating-linear-gradient` 在内容区背景绘制分页线（**禁止**用 div 包裹内容）
-  - [ ] 或使用绝对定位的装饰层绘制分页线，设置 `pointer-events: none`
-  - [ ] 确保**不**使用 `overflow: hidden` 或按页拆分的 div 包裹 ProseMirror 内容
-
-#### 任务 1.4：样式与主题
-- **目标**：与现有 dark 模式、prose 样式兼容
-- **子任务**：
-  - [ ] 为分页区域编写 CSS，支持 light/dark
-  - [ ] 确保 TipTap 的 `prose` 在限定宽度内正常显示
-  - [ ] 检查工具栏、Inline Assist、Diff 高亮等在分页布局下的表现
-
-#### 任务 1.5：滚动与导航
-- **目标**：保持良好的滚动与导航体验
-- **子任务**：
-  - [ ] 确认纵向滚动流畅
-  - [ ] 可选：集成 `PageNavigator`，实现「上一页/下一页」跳转
-  - [ ] 可选：滚动时高亮当前页
-
----
-
-### 5.2 阶段二：增强与可选能力
-
-#### 任务 2.1：页面尺寸与边距
-- **目标**：支持多种纸张和边距
-- **子任务**：
-  - [ ] 提供 A4、A3、Letter 等预设
-  - [ ] 支持上下左右边距配置
-  - [ ] 将配置持久化（如 localStorage 或用户设置）
-
-#### 任务 2.2：分页符支持
-- **目标**：用户可手动插入分页符
-- **子任务**：
-  - [ ] 新增 `pageBreak` 节点或使用 `horizontalRule` 扩展
-  - [ ] 在工具栏增加「插入分页符」按钮
-  - [ ] 保存/导出时转换为 DOCX 分页符
-
-#### 任务 2.3：打印优化
-- **目标**：打印时按页分割、避免内容被裁切
-- **子任务**：
-  - [ ] 使用 `@media print` 和 `page-break-after` 等
-  - [ ] 验证打印输出与屏幕显示一致
-
----
-
-### 5.3 阶段三：高级能力（可选）
-
-#### 任务 3.1：精确分页计算（方案 C 方向）
-- 根据字号、行高、段落、表格、图片计算真实分页位置
-- 处理跨页表格、跨页图片等
-
-#### 任务 3.2：页眉页脚
-- 每页顶部/底部固定区域
-- 页码、总页数等动态内容
-
-#### 任务 3.3：TipTap Pages 或开源库集成
-- 若采用方案 B 或 E，在本阶段集成并替换方案 A 的 CSS 分页
+- **阶段一**：T-DOCX 模式识别、宽度限定、CSS 分页、样式与主题、滚动与导航 → 已由方案 E 实现
+- **阶段二**：页面尺寸与边距、分页符、打印优化 → 页面尺寸与边距已实现；分页符、打印为后续可选
+- **阶段三**：精确分页、页眉页脚 → 后续可选
 
 ---
 
@@ -293,51 +223,14 @@ src/hooks/
 index.css                     # .rm-with-pagination 白色、ProseMirror 无 outline
 ```
 
-### 6.2 关键样式示意（方案 A 备选，当前已采用方案 E）
+### 6.2 稳定性原则（方案 A/E 通用）
 
-> ⚠️ **重要**：以下为**正确**实现方式。切勿使用多个 `.t-docx-editor-page` 包裹内容的做法，易导致文本丢失、光标异常。
+- **单文档**：ProseMirror 内容在一棵连续 DOM 树中，无分页 div 包裹
+- **分页仅作视觉**：用背景、渐变或扩展实现，不改变内容 DOM
+- **单一滚动**：由 `editor-zoom-scroll` 统一处理
+- **禁止 overflow: hidden 裁切**：不裁切任何文本或图片
 
-```css
-/* DocxPageEditor.css - 稳定实现（单一文档 + 纯视觉分页） */
-
-/* 滚动容器：唯一的 overflow-y: auto，灰色背景模拟页面外 */
-.t-docx-scroll-container {
-  flex: 1;
-  overflow-y: auto;
-  overflow-x: hidden;
-  background: #e5e7eb;  /* 或 dark:bg-gray-700 */
-}
-
-/* 内容区：固定宽度、居中，用背景渐变模拟分页线（不裁切内容） */
-.t-docx-content-area {
-  width: 794px;           /* A4 @ 96dpi */
-  max-width: 100%;
-  margin: 0 auto;
-  padding: 40px;
-  min-height: 100%;
-  background: white;      /* 或 dark:bg-gray-800 */
-  box-shadow: 0 0 10px rgba(0,0,0,0.1);
-  /* 分页线：每 1122px 一条浅灰分隔，页间隙 24px */
-  background-image: repeating-linear-gradient(
-    to bottom,
-    transparent 0,
-    transparent 1122px,
-    #e5e7eb 1122px,
-    #e5e7eb 1146px
-  );
-  background-color: white; /* 覆盖渐变中的透明部分 */
-}
-
-/* 确保图片不撑破容器 */
-.t-docx-content-area .editor-image {
-  max-width: 100%;
-  height: auto;
-}
-```
-
-**关键点**：
-- 无 `.t-docx-editor-page` 分块，无 `overflow: hidden`
-- EditorContent 直接放在 `.t-docx-content-area` 内，内容连续流动
+当前实现由 tiptap-pagination-plus 负责分页渲染，布局详见 `分页布局逻辑梳理.md`。
 
 ### 6.3 与现有组件的集成点
 
@@ -518,7 +411,7 @@ div.page → EditorContent (实例 2)
 | 光标换页 | ✅ 安全：单文档、单滚动、无多实例 |
 | 图片展示 | ✅ 安全：同一文档流，仅限制宽度、不裁切 |
 | 性能 | ✅ 可接受：无非必要 DOM，仅背景/装饰 |
-| Inline Assist / Diff 高亮 | ⚠️ 需验证：依赖 `getBoundingClientRect` 等，在固定宽度+背景布局下应仍然可用，建议单独回归 |
+| 局部修改 / Diff 高亮 | ⚠️ 需验证：依赖 `getBoundingClientRect` 等，在固定宽度+背景布局下应仍然可用，建议单独回归 |
 
 **总结**：方案 A 的稳定性取决于是否**严格保持 ProseMirror 单文档、单实例、单一滚动**，分页只做视觉装饰、不参与内容布局。原文档中的 `.t-docx-editor-page` 分块结构容易导致错误模式，应弃用；改用**背景/装饰层**实现分页线更稳妥。
 

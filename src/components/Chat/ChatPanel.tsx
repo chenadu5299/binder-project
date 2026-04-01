@@ -5,7 +5,7 @@ import { useChatStore } from '../../stores/chatStore';
 import { ChatTabs } from './ChatTabs';
 import { ChatMessages } from './ChatMessages';
 import { InlineChatInput } from './InlineChatInput';
-import { ModelSelector } from './ModelSelector';
+import { DiffAllActionsBar } from './DiffAllActionsBar';
 import { PlusIcon } from '@heroicons/react/24/outline';
 import { parseToolCalls, removeToolCalls } from '../../utils/toolCallParser';
 import { ToolCall, MessageContentBlock } from '../../types/tool';
@@ -13,6 +13,10 @@ import { aggressiveJSONRepair } from '../../utils/jsonRepair';
 import { buildContentBlocks } from '../../utils/contentBlockBuilder';
 import { useFileStore } from '../../stores/fileStore';
 import { useEditorStore } from '../../stores/editorStore';
+import { useDiffStore } from '../../stores/diffStore';
+import { convertLegacyDiffsToEntriesWithFallback } from '../../utils/diffFormatAdapter';
+import { resolveEditorTabForEditResultWithRequestContext, inferPositioningPath } from '../../utils/editToolTabResolve';
+import { sha256HexUtf8, blockOrderSnapshotHashFromHtml } from '../../utils/contentSnapshotHash';
 import { needsAuthorization } from '../../utils/toolDescription';
 
 /** 计算累积文本末尾与 chunk 开头的最大重叠长度，用于流式去重（避免「我我理解理解」式重复） */
@@ -64,6 +68,8 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                         tab_id: string;
                         chunk: string;
                         done: boolean;
+                        /** 后端流状态机：cancelled 时不应再写入 assistant / 不提前构建 summary 块 */
+                        stream_state?: 'streaming' | 'completed' | 'cancelled';
                         error?: string;
                         tool_call?: {
                             id: string;
@@ -132,9 +138,12 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                     // ⚠️ 关键修复：先检查 done，再检查 error
                     // 因为取消时会同时有 done: true 和 error
                     if (payload.done) {
-                        // 完成（包括正常完成和取消）
-                        const isCancelled = payload.error && payload.error.includes('取消');
-                        console.log('✅ 聊天流式响应完成', isCancelled ? '(已取消)' : '');
+                        const isCancelled =
+                            payload.stream_state === 'cancelled' ||
+                            (!!payload.error && payload.error.includes('取消'));
+                        console.log('✅ 聊天流式响应完成', isCancelled ? '(已取消)' : '', {
+                            stream_state: payload.stream_state,
+                        });
                         if (lastMessage) {
                             // ⚠️ 关键修复：无论是否取消，都要更新 isLoading 状态
                             // 同时更新所有正在加载的消息（防止遗漏）
@@ -151,42 +160,43 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                                 // 如果找不到 tab，至少更新最后一条消息
                                 setMessageLoading(payload.tab_id, lastMessage.id, false);
                             }
-                            
-                            // 如果是取消，更新消息内容
-                            if (isCancelled) {
-                                if (lastMessage.content && !lastMessage.content.includes('[已取消]')) {
-                                    updateMessage(payload.tab_id, lastMessage.id, 
-                                        lastMessage.content + '\n\n[已取消]');
-                                }
-                            }
-                            
-                            // 按照文档：流式响应完成，同步累积文本
+
                             const tabId = payload.tab_id;
                             const messageId = lastMessage.id;
                             const cacheKey = `${tabId}:${messageId}`;
+
+                            // 取消：仅标记 [已取消]，不把累积文本写入 assistant，不构建 summary 内容块
+                            if (isCancelled) {
+                                if (lastMessage.content && !lastMessage.content.includes('[已取消]')) {
+                                    updateMessage(
+                                        payload.tab_id,
+                                        lastMessage.id,
+                                        lastMessage.content + '\n\n[已取消]'
+                                    );
+                                }
+                                setTimeout(() => {
+                                    textChunksRef.current.delete(cacheKey);
+                                    toolCallsRef.current.delete(cacheKey);
+                                    accumulatedTextRef.current.delete(cacheKey);
+                                }, 1000);
+                                return;
+                            }
+
+                            // 按照文档：流式响应完成，同步累积文本
                             const accumulated = accumulatedTextRef.current.get(cacheKey) || '';
                             if (accumulated && lastMessage.content !== accumulated) {
                                 updateMessage(payload.tab_id, lastMessage.id, accumulated);
                             }
-                            
-                            // ⚠️ 关键修复：如果消息包含工具调用，AI可能会继续对话
-                            // 在继续对话时，应该保留累积文本用于去重，但不要清理
-                            // 因为继续对话时，AI可能会重复输出之前的内容
-                            // 累积文本应该保留，直到消息真正完成（不再有工具调用）
-                            
+
                             // 检查并补充缺失的内容块
-                            // 如果已经有 contentBlocks，说明已经实时构建了，只需要确保完整性
                             const { tabs: currentTabs } = useChatStore.getState();
                             const currentTab = currentTabs.find(t => t.id === tabId);
                             const currentMessage = currentTab?.messages.find(m => m.id === messageId);
-                            
+
                             if (currentMessage) {
-                                // 如果已经有内容块，确保所有文本和工具调用都已包含
                                 if (currentMessage.contentBlocks && currentMessage.contentBlocks.length > 0) {
-                                    // 已经有内容块，检查是否有遗漏的文本
                                     const hasTextBlock = currentMessage.contentBlocks.some(b => b.type === 'text');
                                     if (!hasTextBlock && accumulated) {
-                                        // 有累积文本但没有文本块，添加它
                                         const textBlock: MessageContentBlock = {
                                             id: `text-${currentMessage.timestamp}`,
                                             type: 'text',
@@ -196,12 +206,10 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                                         addContentBlock(tabId, messageId, textBlock);
                                     }
                                 } else {
-                                    // 没有内容块，需要构建
                                     const textChunks = textChunksRef.current.get(cacheKey) || [];
                                     const toolCalls = toolCallsRef.current.get(cacheKey) || [];
-                                    
+
                                     if (textChunks.length > 0 || toolCalls.length > 0 || accumulated) {
-                                        // 如果有累积文本但不在 textChunks 中，添加它
                                         const finalTextChunks = [...textChunks];
                                         if (accumulated && textChunks.length === 0) {
                                             finalTextChunks.push({
@@ -209,25 +217,24 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                                                 timestamp: currentMessage.timestamp,
                                             });
                                         }
-                                        
+
                                         const contentBlocks = buildContentBlocks(
                                             finalTextChunks,
                                             toolCalls,
                                             currentWorkspace || undefined
                                         );
-                                        
-                                        // 添加所有内容块
+
                                         contentBlocks.forEach(block => {
                                             addContentBlock(tabId, messageId, block);
                                         });
                                     }
                                 }
                             }
-                            
-                            // 清理临时数据（延迟清理，确保内容块已构建）
+
                             setTimeout(() => {
                                 textChunksRef.current.delete(cacheKey);
                                 toolCallsRef.current.delete(cacheKey);
+                                accumulatedTextRef.current.delete(cacheKey);
                             }, 1000);
                         }
                         return;
@@ -458,14 +465,49 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                                                     const normalizedWorkspacePath = normalizeWorkspacePath(currentWorkspace);
                                                     const filePath = getAbsolutePath(normalizedPath, normalizedWorkspacePath);
                                                     await recordBinderFile(filePath, 'ai_generated', normalizedWorkspacePath, 3);
-                                                    console.log('[ChatPanel] AI 创建/更新文件已记录元数据，从文件树打开将进入编辑:', pathForRecord);
                                                 } catch (e) {
                                                     console.warn('[ChatPanel] 记录 AI 文件元数据失败:', e);
                                                 }
                                             })();
                                         }
                                     }
-                                    // 文档编辑工具：收到结果时同步到编辑器 store，使编辑器内也能显示 diff 高亮
+                                    // Phase 3：update_file 返回 pending_diffs 时写入 byFilePath
+                                    if (
+                                        toolCallObj.name === 'update_file' &&
+                                        toolCall.result?.success &&
+                                        currentWorkspace
+                                    ) {
+                                        const rawData = toolCall.result.data;
+                                        const data = typeof rawData === 'object' && rawData !== null
+                                            ? rawData
+                                            : typeof rawData === 'string'
+                                                ? (() => { try { return JSON.parse(rawData); } catch { return {}; } })()
+                                                : {};
+                                        const pendingDiffs = data.pending_diffs;
+                                        const pathFromResult = data.path;
+                                        if (Array.isArray(pendingDiffs) && pendingDiffs.length > 0 && pathFromResult) {
+                                            (async () => {
+                                                try {
+                                                    const { normalizePath, normalizeWorkspacePath, getAbsolutePath } = await import('../../utils/pathUtils');
+                                                    const normalizedPath = normalizePath(pathFromResult);
+                                                    const normalizedWorkspacePath = normalizeWorkspacePath(currentWorkspace);
+                                                    const filePath = getAbsolutePath(normalizedPath, normalizedWorkspacePath);
+                                                    useDiffStore.getState().setFilePathDiffs(filePath, pendingDiffs, {
+                                                        chatTabId: payload.tab_id,
+                                                        sourceToolCallId: toolCallObj.id,
+                                                        messageId: lastMessage.id,
+                                                    });
+                                                    const tab = useEditorStore.getState().tabs.find((t) => t.filePath === filePath);
+                                                    if (tab?.editor?.state?.doc) {
+                                                        useDiffStore.getState().resolveFilePathDiffs(filePath, tab.editor.state.doc);
+                                                    }
+                                                } catch (e) {
+                                                    console.warn('[ChatPanel] 处理 update_file pending_diffs 失败:', e);
+                                                }
+                                            })();
+                                        }
+                                    }
+                                    // 文档编辑工具：收到结果时同步到编辑器 store 与 diffStore（Phase 2a）
                                     if (toolCallObj.name === 'edit_current_editor_document' && toolCall.result?.success) {
                                         const resultData = typeof toolCall.result?.data === 'object' && toolCall.result?.data != null
                                             ? toolCall.result.data
@@ -477,10 +519,41 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                                         const oldContent = resultData.old_content ?? resultData.oldContent ?? '';
                                         const newContent = resultData.new_content ?? resultData.newContent ?? '';
                                         if (diffAreaId && Array.isArray(diffs) && diffs.length > 0 && oldContent !== undefined && newContent !== undefined) {
-                                            const { getActiveTab, setTabDiff } = useEditorStore.getState();
-                                            const activeTab = getActiveTab();
-                                            if (activeTab) {
-                                                setTabDiff(activeTab.id, diffAreaId, diffs, oldContent, newContent);
+                                            const targetTab = resolveEditorTabForEditResultWithRequestContext(
+                                                resultData.file_path,
+                                                payload.tab_id
+                                            );
+                                            if (targetTab && toolCallObj.id) {
+                                                const entries = convertLegacyDiffsToEntriesWithFallback(diffs, targetTab.editor ?? null);
+                                                if (entries.length > 0) {
+                                                    void (async () => {
+                                                        const docRev =
+                                                            typeof resultData.document_revision === 'number'
+                                                                ? resultData.document_revision
+                                                                : typeof resultData.documentRevision === 'number'
+                                                                  ? resultData.documentRevision
+                                                                  : undefined;
+                                                        const curRev = targetTab.documentRevision ?? 1;
+                                                        const contentSnapshotHash = await sha256HexUtf8(String(oldContent));
+                                                        const blockOrderSnapshotHash = await blockOrderSnapshotHashFromHtml(String(oldContent));
+                                                        useDiffStore.getState().setDiffsForToolCall(
+                                                            targetTab.filePath,
+                                                            toolCallObj.id,
+                                                            entries,
+                                                            oldContent,
+                                                            payload.tab_id,
+                                                            lastMessage.id,
+                                                            {
+                                                                sourceLabel: `助手消息 · ${toolCallObj.name}`,
+                                                                documentRevision: docRev,
+                                                                currentTabRevision: curRev,
+                                                                positioningPath: inferPositioningPath(toolCallObj),
+                                                                contentSnapshotHash,
+                                                                blockOrderSnapshotHash,
+                                                            }
+                                                        );
+                                                    })();
+                                                }
                                             }
                                         }
                                     }
@@ -688,13 +761,20 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
             }
         };
         
+        let cancelled = false;
         let unlistenFn: (() => void) | null = null;
-        
+
         setupListener().then(unlisten => {
-            unlistenFn = unlisten;
+            if (cancelled) {
+                // Strict Mode / HMR cleanup already ran before .then() resolved — immediately release
+                unlisten?.();
+            } else {
+                unlistenFn = unlisten;
+            }
         });
-        
+
         return () => {
+            cancelled = true;
             if (unlistenFn) {
                 console.log('🔧 清理聊天事件监听');
                 unlistenFn();
@@ -871,7 +951,7 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                                 messages={activeTab.messages}
                                 onCopy={handleCopy}
                                 tabId={activeTab.id}
-                                mode={activeTab.mode}
+                                mode={activeTab.mode === 'edit' ? 'agent' : activeTab.mode}
                                 onRegenerate={() => {
                                     const { regenerate } = useChatStore.getState();
                                     regenerate(activeTab.id);
@@ -881,6 +961,8 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                                     deleteMessage(activeTab.id, messageId);
                                 }}
                             />
+                            {/* 问题3：全部接受/拒绝操作栏，紧贴输入框上方、吸底 */}
+                            <DiffAllActionsBar />
                             {/* 使用内联引用输入框 */}
                             <InlineChatInput tabId={activeTab.id} />
                         </>
@@ -890,7 +972,7 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                             <div className="flex-1 flex items-center justify-center">
                                 <p className="text-gray-500 dark:text-gray-400">开始新的对话</p>
                             </div>
-                            {/* 使用内联引用输入框 */}
+                            <DiffAllActionsBar />
                             <InlineChatInput 
                                 tabId={null} 
                                 pendingMode={pendingMode}

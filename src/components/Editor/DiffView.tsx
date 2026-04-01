@@ -1,6 +1,6 @@
 import React from 'react';
 import { CheckIcon, XMarkIcon } from '@heroicons/react/24/outline';
-import { DiffResult } from '../../hooks/useInlineAssist';
+import type { DiffResult } from '../../hooks/useInlineAssist';
 
 interface DiffViewProps {
     diff: DiffResult;

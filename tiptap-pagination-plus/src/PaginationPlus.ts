@@ -235,13 +235,28 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions, Pagination
       .rm-with-pagination table tbody > tr{
         display: table-row !important;
       }
-      .rm-with-pagination *:has(>br.ProseMirror-trailingBreak:only-child) {
-        display: table;
+      /* Bug 4：空段落与正常段落保持相同行高，避免回车新建空行时行高偏矮 */
+      .rm-with-pagination *:has(>br.ProseMirror-trailingBreak:only-child),
+      .rm-with-pagination *:has(>br:only-child) {
+        display: block;
+        min-height: 1.5em !important;
+        line-height: 1.5 !important;
+        margin: 0 !important;
+        padding: 0 !important;
         width: 100%;
       }
+      /* 非空段落/块中的 trailingBreak 应隐藏，避免多出一行空白（Enter 后输入时可能出现） */
+      .rm-with-pagination *:has(>br.ProseMirror-trailingBreak):not(:has(>br.ProseMirror-trailingBreak:only-child)) br.ProseMirror-trailingBreak {
+        display: none !important;
+      }
+      /* 方案1：收缩 rm-br-decoration 视觉高度，避免 hardBreak 后多出一行空白（仅分页模式有，保存后不持久化） */
       .rm-with-pagination .rm-br-decoration {
-        display: table;
+        display: block;
         width: 100%;
+        height: 0;
+        min-height: 0;
+        line-height: 0;
+        overflow: hidden;
       }
       .rm-with-pagination .table-row-group {
         max-height: var(--rm-max-content-child-height);

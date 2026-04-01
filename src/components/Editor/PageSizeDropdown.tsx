@@ -65,7 +65,7 @@ const PageSizeDropdown: React.FC<PageSizeDropdownProps> = ({ editor }) => {
   const selected = PAGE_OPTIONS.find((o) => o.key === currentKey) || PAGE_OPTIONS[0];
 
   const handleSelect = (opt: (typeof PAGE_OPTIONS)[0]) => {
-    editor?.chain().focus().updatePageSize(opt.size).run();
+    (editor?.chain().focus() as any).updatePageSize(opt.size).run();
     editor?.view?.dispatch(editor.state.tr);
     setCurrentKey(opt.key);
     setIsOpen(false);

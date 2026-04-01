@@ -20,7 +20,7 @@ const TitleBar: React.FC = () => {
     <div 
       className="fixed top-0 right-0 flex items-center gap-1.5 px-3 py-1 z-[9999]"
       style={{
-        WebkitAppRegion: 'no-drag',
+        ['WebkitAppRegion' as string]: 'no-drag',
         // macOS 标题栏高度，按钮垂直居中
         height: '28px',
       }}

@@ -689,6 +689,15 @@ pub async fn open_docx_for_edit(path: String) -> Result<String, String> {
     }
 
     eprintln!("✅ [open_docx_for_edit] 完成，返回 HTML ({} 字节)", html.len());
+    // [Bug1-Debug] 返回前：body 开头字节（用于定位空白行根因）
+    if let Some(pos) = html.find("<body") {
+        let body_open = html[pos..].find('>').map(|i| pos + i + 1).unwrap_or(pos + 6);
+        let after_body = html.get(body_open..body_open.saturating_add(80)).unwrap_or("");
+        let first_30_hex: String = after_body.bytes().take(30).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+        let first_200_repr: String = after_body.chars().take(200).map(|c| if c == '\n' { '↵' } else if c == '\r' { '␍' } else { c }).collect();
+        eprintln!("[Bug1-Debug] open_docx_for_edit 返回前: body>后首30字节(hex)={}", first_30_hex);
+        eprintln!("[Bug1-Debug] open_docx_for_edit 返回前: body>后首200字符(repr)={}", first_200_repr);
+    }
     Ok(html)
 }
 
@@ -1032,6 +1041,16 @@ pub async fn clear_preview_cache() -> Result<String, String> {
 
 #[tauri::command]
 pub async fn save_docx(path: String, html_content: String, app: tauri::AppHandle) -> Result<(), String> {
+    // [BlankLineDebug] Rust 端保存日志：用于与前端、重开后对比
+    let first = html_content.chars().take(300).collect::<String>();
+    let last = html_content.chars().rev().take(300).collect::<String>().chars().rev().collect::<String>();
+    let empty_p_count = html_content.matches("<p></p>").count()
+        + html_content.matches("<p><br></p>").count()
+        + html_content.matches("<p><br/></p>").count();
+    eprintln!("[BlankLineDebug] Rust save_docx 收到请求: path={}, htmlLen={}, emptyPCount≈{}, first300=[...], last300=[...]", path, html_content.len(), empty_p_count);
+    eprintln!("[BlankLineDebug] first300: {}", first);
+    eprintln!("[BlankLineDebug] last300: {}", last);
+
     let pandoc_service = PandocService::new();
     
     if !pandoc_service.is_available() {
@@ -1055,7 +1074,8 @@ pub async fn save_docx(path: String, html_content: String, app: tauri::AppHandle
     })).map_err(|e| format!("发送进度事件失败: {}", e))?;
     
     pandoc_service.convert_html_to_docx(&html_content, &docx_path)?;
-    
+    eprintln!("[BlankLineDebug] Rust save_docx 转换完成: path={}", path);
+
     // 触发完成事件
     app.emit("fs-save-progress", serde_json::json!({
         "file_path": path,

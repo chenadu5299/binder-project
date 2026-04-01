@@ -29,7 +29,7 @@ const applyTheme = (theme: Theme) => {
 // 监听系统主题变化
 if (typeof window !== 'undefined') {
   const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
-  mediaQuery.addEventListener('change', (e) => {
+  mediaQuery.addEventListener('change', (_e) => {
     const theme = useThemeStore.getState().theme;
     if (theme === 'auto') {
       applyTheme('auto');

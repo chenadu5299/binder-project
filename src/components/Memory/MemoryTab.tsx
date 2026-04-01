@@ -263,6 +263,17 @@ const MemoryTab: React.FC = () => {
                             <div
                                 key={memory.id}
                                 data-memory-id={memory.id}
+                                draggable
+                                onDragStart={(e) => {
+                                    e.dataTransfer.effectAllowed = 'copy';
+                                    e.dataTransfer.setData('application/binder-reference-memory', JSON.stringify({
+                                        type: 'memory',
+                                        entityName: memory.entity_name,
+                                        memoryId: memory.id,
+                                        content: memory.content,
+                                    }));
+                                    e.dataTransfer.setData('text/plain', `@${memory.entity_name}`);
+                                }}
                                 onClick={() => setSelectedMemory(memory)}
                                 className={`p-4 border rounded-lg cursor-pointer transition-colors ${
                                     selectedMemory?.id === memory.id

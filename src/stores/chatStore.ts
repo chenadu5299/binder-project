@@ -2,14 +2,20 @@ import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
 import { useFileStore } from './fileStore';
 import { useEditorStore } from './editorStore';
+import { useDiffStore } from './diffStore';
 
-import { ToolCall, MessageContentBlock, AuthorizationRequest } from '../types/tool';
+import { ToolCall, MessageContentBlock } from '../types/tool';
+import type { DisplayNode } from '../utils/inlineContentParser';
 
 export interface ChatMessage {
     id: string;
     role: 'user' | 'assistant' | 'system';
-    content: string; // 保留用于兼容
+    content: string; // 发给 AI 的完整内容（含展开的引用）
     timestamp: number;
+    /** 消息记录展示用：结构化节点，引用以标签形式渲染（设计文档 2.6） */
+    displayNodes?: DisplayNode[];
+    /** @deprecated 兼容旧版，优先用 displayNodes */
+    displayContent?: string;
     isLoading?: boolean;
     toolCalls?: ToolCall[];  // 工具调用列表（保留用于兼容）
     // 新增：内容块列表（按时间顺序）
@@ -57,13 +63,16 @@ interface ChatState {
     deleteMessage: (tabId: string, messageId: string) => void;
     
     // AI 交互
-    sendMessage: (tabId: string, content: string) => Promise<void>;
+    sendMessage: (tabId: string, content: string, options?: { validRefIds?: string[]; displayNodes?: DisplayNode[]; displayContent?: string }) => Promise<void>;
     regenerate: (tabId: string) => Promise<void>;
     
     // 临时聊天管理（v1.4.0 新增）
     getTemporaryTabs: () => ChatTab[];
     bindToWorkspace: (tabId: string, workspacePath: string) => void;
     clearTemporaryTabs: () => void;
+
+    /** diff 接受后刷新对应 filePath 的 positioningCtx.L，使下一轮工具调用拿到最新内容 */
+    refreshPositioningContextForEditor: (filePath: string) => void;
 }
 
 export const useChatStore = create<ChatState>((set, get) => {
@@ -117,6 +126,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         
         deleteTab: (tabId: string) => {
             const { tabs, activeTabId } = get();
+            useDiffStore.getState().cleanupDiffsForChatTab(tabId);
             const newTabs = tabs.filter(t => t.id !== tabId);
             
             set({
@@ -347,6 +357,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         },
         
         clearMessages: (tabId: string) => {
+            useDiffStore.getState().cleanupDiffsForChatTab(tabId);
             const { tabs } = get();
             set({
                 tabs: tabs.map(t =>
@@ -358,6 +369,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         },
         
         deleteMessage: (tabId: string, messageId: string) => {
+            useDiffStore.getState().cleanupDiffsForMessage(tabId, messageId);
             const { tabs } = get();
             set({
                 tabs: tabs.map(t =>
@@ -371,7 +383,7 @@ export const useChatStore = create<ChatState>((set, get) => {
                 ),
             });
         },
-        
+
         setTabMode: (tabId: string, mode: 'chat' | 'edit') => {
             const { tabs } = get();
             set({
@@ -400,15 +412,17 @@ export const useChatStore = create<ChatState>((set, get) => {
             });
         },
         
-        sendMessage: async (tabId: string, content: string) => {
+        sendMessage: async (tabId: string, content: string, options?: { validRefIds?: string[]; displayNodes?: DisplayNode[]; displayContent?: string }) => {
             const { tabs, addMessage, setMessageLoading } = get();
             const tab = tabs.find(t => t.id === tabId);
             if (!tab) return;
             
-            // 添加用户消息
+            // 添加用户消息（displayNodes 用于消息记录以标签形式展示）
             addMessage(tabId, {
                 role: 'user',
                 content,
+                ...(options?.displayNodes != null && options.displayNodes.length > 0 && { displayNodes: options.displayNodes }),
+                ...(options?.displayNodes == null && options?.displayContent != null && { displayContent: options.displayContent }),
             });
             
             // 添加助手消息（占位符）
@@ -445,54 +459,119 @@ export const useChatStore = create<ChatState>((set, get) => {
                 // 获取当前工作区路径（用于判断是否启用工具）
                 const { currentWorkspace } = (await import('./fileStore')).useFileStore.getState();
                 
-                // ⚠️ 关键修复：获取当前编辑器打开的文件和选中的文本
-                const { getActiveTab } = useEditorStore.getState();
+                // P3 + §十三：注入 tab 与 RequestContext 同源（determineInjectionEditorTab）
+                const { getActiveTab, getTabByFilePath } = useEditorStore.getState();
                 const activeEditorTab = getActiveTab();
-                const currentFile = activeEditorTab?.filePath || null;
-                
-                // 获取选中的文本（如果有编辑器实例）
+                const { getReferences } = (await import('./referenceStore')).useReferenceStore.getState();
+                const refs = getReferences(tabId);
+                const validRefIdSet = options?.validRefIds?.length
+                    ? new Set(options.validRefIds)
+                    : undefined;
+                const effectiveRefs = validRefIdSet
+                    ? refs.filter((r) => validRefIdSet.has(r.id))
+                    : refs;
+                const { determineInjectionEditorTab, buildPositioningRequestContext, setPositioningRequestContextForChat } =
+                    await import('../utils/requestContext');
+                const { injectionTab, fileRefsForInjection } = determineInjectionEditorTab(
+                    currentWorkspace,
+                    activeEditorTab,
+                    refs,
+                    getTabByFilePath
+                );
+
+                const selectionSameAsInjectionTab =
+                    !!activeEditorTab &&
+                    !!injectionTab &&
+                    activeEditorTab.id === injectionTab.id;
+
+                const currentFile = injectionTab?.filePath ?? activeEditorTab?.filePath ?? null;
+
+                // 选区锚点仅当活动 tab 即注入 tab 时采用（否则活动 tab 选区与目标 L 无关）
                 let selectedText: string | null = null;
-                let editTarget: { anchor: { block_id: string; start_offset: number; end_offset: number } } | null = null;
-                if (activeEditorTab?.editor) {
+                // §7.1 选区坐标（选区场景）
+                let selectionStartBlockId: string | null = null;
+                let selectionStartOffset: number | null = null;
+                let selectionEndBlockId: string | null = null;
+                let selectionEndOffset: number | null = null;
+                // §7.1 光标坐标（无选区场景）
+                let cursorBlockId: string | null = null;
+                let cursorOffset: number | null = null;
+                if (selectionSameAsInjectionTab && activeEditorTab?.editor) {
                     const { from, to } = activeEditorTab.editor.state.selection;
+                    const { createAnchorFromSelection } = await import('../utils/anchorFromSelection');
                     if (from !== to) {
                         selectedText = activeEditorTab.editor.state.doc.textBetween(from, to);
-                        // 精确定位：选区 → edit_target
-                        const { createAnchorFromSelection } = await import('../utils/anchorFromSelection');
                         const anchor = createAnchorFromSelection(activeEditorTab.editor.state.doc, from, to);
                         if (anchor && currentFile) {
-                            editTarget = { anchor: { block_id: anchor.blockId, start_offset: anchor.startOffset, end_offset: anchor.endOffset } };
+                            // §7.1：同步填入选区完整坐标字段
+                            selectionStartBlockId = anchor.startBlockId;
+                            selectionStartOffset = anchor.startOffset;
+                            selectionEndBlockId = anchor.endBlockId;
+                            selectionEndOffset = anchor.endOffset;
+                        }
+                    } else {
+                        // §7.2：无选区时捕获光标位置（cursor-only mode）
+                        const cursorAnchor = createAnchorFromSelection(activeEditorTab.editor.state.doc, from, from);
+                        if (cursorAnchor) {
+                            cursorBlockId = cursorAnchor.startBlockId;
+                            cursorOffset = cursorAnchor.startOffset;
                         }
                     }
                 }
-                // 若无选区 edit_target，检查引用：TextRef 含 blockId 且 pathMatch → edit_target
-                if (!editTarget && currentFile) {
-                    const { getReferences } = (await import('./referenceStore')).useReferenceStore.getState();
-                    const refs = getReferences(tabId);
-                    const { isSameDocumentForEdit } = await import('../utils/pathUtils');
+                // 12.5：无显式选区时，@ 文本引用四元组作为一级定位输入（route_source=reference）
+                if (
+                    selectionStartBlockId == null ||
+                    selectionStartOffset == null ||
+                    selectionEndBlockId == null ||
+                    selectionEndOffset == null
+                ) {
                     const { ReferenceType } = await import('../types/reference');
-                    const textRefWithBlock = refs.find(
-                        (r): r is import('../types/reference').TextReference =>
-                            r.type === ReferenceType.TEXT &&
-                            'blockId' in r &&
-                            r.blockId != null &&
-                            r.startOffset != null &&
-                            r.endOffset != null &&
-                            isSameDocumentForEdit(r.sourceFile, currentFile)
-                    );
-                    if (textRefWithBlock) {
-                        editTarget = {
-                            anchor: {
-                                block_id: textRefWithBlock.blockId!,
-                                start_offset: textRefWithBlock.startOffset!,
-                                end_offset: textRefWithBlock.endOffset!,
-                            },
-                        };
+                    const { extractTextReferenceAnchor } = await import('../utils/referenceProtocolAdapter');
+                    const { isSameDocumentForEdit } = await import('../utils/pathUtils');
+                    const preciseTextRef = effectiveRefs.find((ref) => {
+                        if (ref.type !== ReferenceType.TEXT) return false;
+                        const tr = ref as import('../types/reference').TextReference;
+                        if (!extractTextReferenceAnchor(tr)) return false;
+                        if (!currentFile) return true;
+                        return isSameDocumentForEdit(tr.sourceFile, currentFile);
+                    }) as import('../types/reference').TextReference | undefined;
+
+                    if (preciseTextRef) {
+                        const anchor = extractTextReferenceAnchor(preciseTextRef);
+                        if (anchor) {
+                            selectionStartBlockId = anchor.startBlockId;
+                            selectionStartOffset = anchor.startOffset;
+                            selectionEndBlockId = anchor.endBlockId;
+                            selectionEndOffset = anchor.endOffset;
+                            // 关键：reference 路径强制不注入 selectedText，Resolver 才会稳定标 route_source=reference
+                            selectedText = null;
+                            console.debug('[chatStore] 使用 TextReference 四元组作为零搜索输入', {
+                                sourceFile: preciseTextRef.sourceFile,
+                                startBlockId: anchor.startBlockId,
+                                endBlockId: anchor.endBlockId,
+                            });
+                        }
                     }
                 }
+                // 旧的 editTarget 构造链已禁用。
+                // 选区/引用定位统一走 selectedText + selectionStart/EndBlockId + selectionStart/EndOffset。
                 
-                // 获取当前编辑器内容（用于文档编辑功能）
-                const currentEditorContent = activeEditorTab?.content || null;
+                // P1 + §十三：L/revision 与 RequestContext 一致；baseline 仅用于 diff 卡 UI（首送写入）
+                const positioningCtx = await buildPositioningRequestContext(injectionTab);
+                setPositioningRequestContextForChat(tabId, positioningCtx);
+
+                let currentEditorContent: string | null = injectionTab?.content ?? activeEditorTab?.content ?? null;
+                let documentRevision: number | undefined;
+                if (positioningCtx && injectionTab?.id) {
+                    const { useDiffStore } = await import('./diffStore');
+                    // 每轮发送消息时更新 baseline 为当前文档状态（positioningCtx.L），
+                    // getLogicalContent 只应用 baselineSetAt 之后接受的 diffs，避免跨轮偏移错误
+                    useDiffStore.getState().setBaseline(injectionTab.filePath, positioningCtx.L);
+                    currentEditorContent = positioningCtx.L;
+                    documentRevision = positioningCtx.revision;
+                } else if (injectionTab) {
+                    documentRevision = injectionTab.documentRevision ?? 1;
+                }
                 
                 // ⚠️ 关键修复：确保 tabId 正确传递
                 console.log('📤 发送消息到后端:', { 
@@ -504,11 +583,33 @@ export const useChatStore = create<ChatState>((set, get) => {
                     isTemporary: currentTab.isTemporary,
                     currentFile: currentFile,
                     hasSelectedText: !!selectedText,
+                    baselineId: positioningCtx?.baselineId,
                 });
                 
                 // 调用后端流式聊天（根据模式决定是否启用工具）
                 // 注意：如果没有工作区，工具调用应该禁用（临时聊天模式，只能是 chat 模式）
+                // Phase 0/1.1：引用功能 - 转为协议格式（refs 已在上方取过）
+                const { buildReferencesForProtocol } = await import('../utils/referenceProtocolAdapter');
+                const references = await buildReferencesForProtocol(refs, currentFile, validRefIdSet);
+
                 const enableTools = currentTab.mode === 'agent' && !!currentWorkspace;
+
+                // primaryEditTarget：仅自动推导（§6.9），不由用户点选；意图识别交给模型与提示词在后续优化
+                // 规则：恰好一个文件引用且与当前活动编辑器文档不是同一文件 → 传工作区相对路径，后端跳过向 edit_current_editor_document 注入当前编辑器内容
+                // primaryEditTarget：与**活动**编辑器文档比较（非注入后 currentFile），供后端在「仅引用、目标未打开」时跳过错误注入
+                let primaryEditTarget: string | undefined;
+                if (currentWorkspace && activeEditorTab?.filePath) {
+                    if (fileRefsForInjection.length === 1) {
+                        const { normalizePath, normalizeWorkspacePath, getAbsolutePath, getRelativePath, isSameDocumentForEdit } =
+                            await import('../utils/pathUtils');
+                        const refPath = fileRefsForInjection[0].path;
+                        if (!isSameDocumentForEdit(refPath, activeEditorTab.filePath)) {
+                            const wsNorm = normalizeWorkspacePath(currentWorkspace);
+                            const absRef = getAbsolutePath(normalizePath(refPath), wsNorm);
+                            primaryEditTarget = getRelativePath(absRef, wsNorm);
+                        }
+                    }
+                }
                 
                 await invoke('ai_chat_stream', {
                     tabId, // Tauri 会自动转换为 tab_id
@@ -523,7 +624,19 @@ export const useChatStore = create<ChatState>((set, get) => {
                     currentFile: currentFile, // ⚠️ 关键修复：传递当前编辑器打开的文件路径
                     selectedText: selectedText, // ⚠️ 关键修复：传递当前选中的文本
                     currentEditorContent: currentEditorContent, // ⚠️ 文档编辑功能：传递当前编辑器内容
-                    editTarget: editTarget ?? undefined, // 精确定位：blockId+offset，用于 edit_current_editor_document
+                    references: references.length > 0 ? references : undefined, // Phase 0：引用协议
+                    ...(primaryEditTarget != null ? { primaryEditTarget } : {}),
+                    ...(documentRevision != null ? { documentRevision } : {}),
+                    ...(positioningCtx?.baselineId ? { baselineId: positioningCtx.baselineId } : {}),
+                    ...(positioningCtx ? { editorTabId: positioningCtx.editorTabId } : {}),
+                    // §7.1：选区完整坐标
+                    ...(selectionStartBlockId != null ? { selectionStartBlockId } : {}),
+                    ...(selectionStartOffset != null ? { selectionStartOffset } : {}),
+                    ...(selectionEndBlockId != null ? { selectionEndBlockId } : {}),
+                    ...(selectionEndOffset != null ? { selectionEndOffset } : {}),
+                    // §7.1：光标坐标
+                    ...(cursorBlockId != null ? { cursorBlockId } : {}),
+                    ...(cursorOffset != null ? { cursorOffset } : {}),
                 });
             } catch (error) {
                 console.error('发送消息失败:', error);
@@ -584,6 +697,17 @@ export const useChatStore = create<ChatState>((set, get) => {
                     : (nonTemporaryTabs.length > 0 ? nonTemporaryTabs[0].id : null),
             });
         },
+
+        refreshPositioningContextForEditor: (filePath: string) => {
+            const tab = useEditorStore.getState().getTabByFilePath(filePath);
+            if (!tab?.editor) return;
+            const newHtml = tab.editor.getHTML();
+            // 更新 positioningContextByChatTab Map（requestContext 模块级变量）
+            import('../utils/requestContext').then(({ updatePositioningLForFilePath }) => {
+                updatePositioningLForFilePath(filePath, newHtml);
+            });
+            useDiffStore.getState().setBaseline(filePath, newHtml);
+        },
         
         regenerate: async (tabId: string) => {
             const { tabs, sendMessage } = get();
@@ -606,6 +730,10 @@ export const useChatStore = create<ChatState>((set, get) => {
             }
             
             if (lastAssistantIndex !== -1) {
+                const removedAssistant = tab.messages[lastAssistantIndex];
+                if (removedAssistant?.id) {
+                    useDiffStore.getState().cleanupDiffsForMessage(tabId, removedAssistant.id);
+                }
                 const newMessages = tab.messages.slice(0, lastAssistantIndex);
                 set({
                     tabs: tabs.map(t =>
@@ -616,9 +744,11 @@ export const useChatStore = create<ChatState>((set, get) => {
                 });
             }
             
-            // 重新发送最后一条用户消息
-            await sendMessage(tabId, lastUserMessage.content);
+            // 重新发送最后一条用户消息（保留 displayNodes/displayContent）
+            await sendMessage(tabId, lastUserMessage.content, {
+                displayNodes: lastUserMessage.displayNodes,
+                displayContent: lastUserMessage.displayContent,
+            });
         },
     };
 });
-

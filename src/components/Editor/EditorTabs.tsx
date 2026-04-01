@@ -11,7 +11,7 @@ const EditorTabs: React.FC = () => {
   const handleCloseTab = (tabId: string, e: React.MouseEvent) => {
     e.stopPropagation();
     const tab = tabs.find((t) => t.id === tabId);
-    
+
     // ⚠️ 关键：关闭前检查未保存更改
     if (tab && tab.isDirty) {
       const confirmed = window.confirm(
@@ -19,7 +19,7 @@ const EditorTabs: React.FC = () => {
       );
       if (!confirmed) return;
     }
-    
+
     removeTab(tabId);
   };
   

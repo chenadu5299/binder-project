@@ -1,7 +1,55 @@
 import { invoke } from '@tauri-apps/api/core';
 import { useEditorStore } from '../stores/editorStore';
+import { useFileStore } from '../stores/fileStore';
+import { useDiffStore } from '../stores/diffStore';
+import { getRelativePath, normalizeWorkspacePath } from '../utils/pathUtils';
 import { FileType, FileSource, FileOpenStrategy } from '../types/file';
-import { enhanceHTMLContent } from './htmlStyleProcessor';
+
+/** Phase 2：open_file_with_cache / open_docx_with_cache 返回结构 */
+interface OpenFileResult {
+  content: string;
+  pending_diffs?: Array<{
+    id: number;
+    file_path: string;
+    diff_index: number;
+    original_text: string;
+    new_text: string;
+    para_index: number;
+    diff_type: string;
+    status: string;
+  }>;
+  gates?: {
+    target_file_resolved: boolean;
+    canonical_loaded: boolean;
+    block_map_ready: boolean;
+    context_injected: boolean;
+  };
+  route_scene?: string;
+  injected_block_ws?: boolean;
+}
+
+function assertNonCurrentFileGates(filePath: string, result: OpenFileResult, sourceCmd: 'open_file_with_cache' | 'open_docx_with_cache'): void {
+  const gates = result.gates;
+  if (!gates) {
+    throw new Error(`E_TARGET_NOT_READY:GATE_MISSING: ${sourceCmd} 响应缺少四态门禁（file=${filePath}）`);
+  }
+  const missing: string[] = [];
+  if (!gates.target_file_resolved) missing.push('targetFileResolved');
+  if (!gates.canonical_loaded) missing.push('canonicalLoaded');
+  if (!gates.block_map_ready) missing.push('blockMapReady');
+  if (!gates.context_injected) missing.push('contextInjected');
+  if (missing.length > 0) {
+    throw new Error(
+      `E_TARGET_NOT_READY:${missing.join('+')}: 非当前文档门禁未通过（file=${filePath}, scene=${result.route_scene || '-'}）`
+    );
+  }
+  console.debug('[documentService] 非当前文档门禁通过', {
+    filePath,
+    sourceCmd,
+    routeScene: result.route_scene,
+    injectedBlockWs: !!result.injected_block_ws,
+  });
+}
 
 // 文件打开策略表
 const FILE_OPEN_STRATEGIES: Record<FileType, Record<FileSource, FileOpenStrategy>> = {
@@ -363,24 +411,36 @@ export const documentService = {
       switch (fileType) {
         case 'markdown':
         case 'text': {
-          // Markdown 和 TXT：直接读取文本
+          // Markdown 和 TXT：优先 open_file_with_cache（Phase 2），无工作区时 fallback
           let content = '';
+          let pendingDiffs: OpenFileResult['pending_diffs'];
+          const workspacePath = useFileStore.getState().currentWorkspace;
           try {
-            content = await invoke<string>('read_file_content', { path: filePath });
+            if (workspacePath) {
+              const ws = normalizeWorkspacePath(workspacePath);
+              const relPath = getRelativePath(filePath, ws);
+              const result = await invoke<OpenFileResult>('open_file_with_cache', {
+                workspacePath: ws,
+                filePath: relPath,
+              });
+              assertNonCurrentFileGates(filePath, result, 'open_file_with_cache');
+              content = result.content;
+              pendingDiffs = result.pending_diffs ?? undefined;
+            } else {
+              content = await invoke<string>('read_file_content', { path: filePath });
+            }
           } catch (error) {
             console.error('[documentService.openFileWithStrategy] 读取文件内容失败:', error);
             throw new Error(`读取文件内容失败: ${error instanceof Error ? error.message : String(error)}`);
           }
-          
           try {
-            // ⚠️ 关键修复：文本文件始终可编辑，不受 source 或 previewMode 影响
-            // 只有 DOCX 等需要转换的文件才需要考虑 previewMode
-            const isReadOnly = false; // 文本文件始终可编辑
+            const isReadOnly = false;
             console.log('[documentService.openFileWithStrategy] 添加文本文件标签页:', {
               filePath,
               fileName,
               isReadOnly,
               contentLength: content.length,
+              hasPendingDiffs: !!pendingDiffs?.length,
             });
             useEditorStore.getState().addTab(
               filePath,
@@ -390,6 +450,9 @@ export const documentService = {
               isDraft,
               lastModifiedTime
             );
+            if (pendingDiffs?.length) {
+              useDiffStore.getState().setFilePathDiffs(filePath, pendingDiffs);
+            }
           } catch (error) {
             console.error('[documentService.openFileWithStrategy] 添加标签页失败:', error);
             throw new Error(`添加标签页失败: ${error instanceof Error ? error.message : String(error)}`);
@@ -398,27 +461,36 @@ export const documentService = {
         }
       
         case 'html': {
-          // HTML：读取内容
-          // ⚠️ 关键修复：HTML 文件应该可以编辑（与文本文件相同）
+          // HTML：优先 open_file_with_cache（Phase 2），无工作区时 fallback
           let content = '';
+          let pendingDiffs: OpenFileResult['pending_diffs'];
+          const workspacePath = useFileStore.getState().currentWorkspace;
           try {
-            content = await invoke<string>('read_file_content', { path: filePath });
+            if (workspacePath) {
+              const ws = normalizeWorkspacePath(workspacePath);
+              const relPath = getRelativePath(filePath, ws);
+              const result = await invoke<OpenFileResult>('open_file_with_cache', {
+                workspacePath: ws,
+                filePath: relPath,
+              });
+              assertNonCurrentFileGates(filePath, result, 'open_file_with_cache');
+              content = result.content;
+              pendingDiffs = result.pending_diffs ?? undefined;
+            } else {
+              content = await invoke<string>('read_file_content', { path: filePath });
+            }
           } catch (error) {
             console.error('[documentService.openFileWithStrategy] 读取文件内容失败:', error);
             throw new Error(`读取文件内容失败: ${error instanceof Error ? error.message : String(error)}`);
           }
-          
           try {
-            // ⚠️ 关键修复：HTML 文件始终可编辑，与文本文件相同
-            // 无论策略如何，HTML 文件都应该可以编辑
-            const isReadOnly = false; // HTML 文件始终可编辑
+            const isReadOnly = false;
             console.log('[documentService.openFileWithStrategy] 添加 HTML 文件标签页:', {
               filePath,
               fileName,
               isReadOnly,
               contentLength: content.length,
-              strategyCanEdit: canEdit,
-              strategyPreviewMode: previewMode,
+              hasPendingDiffs: !!pendingDiffs?.length,
             });
             useEditorStore.getState().addTab(
               filePath,
@@ -428,6 +500,9 @@ export const documentService = {
               isDraft,
               lastModifiedTime
             );
+            if (pendingDiffs?.length) {
+              useDiffStore.getState().setFilePathDiffs(filePath, pendingDiffs);
+            }
           } catch (error) {
             console.error('[documentService.openFileWithStrategy] 添加标签页失败:', error);
             throw new Error(`添加标签页失败: ${error instanceof Error ? error.message : String(error)}`);
@@ -461,20 +536,54 @@ export const documentService = {
               lastModifiedTime
             );
           } else {
-            // ✅ 编辑模式：使用新的 LibreOffice + ODT 方案
+            // ✅ 编辑模式：优先 open_docx_with_cache（Phase 2），无工作区时 fallback
             try {
-              // 使用新的 open_docx_for_edit 命令（LibreOffice + ODT 解析）
-              // 新方案已经返回完整的 HTML，不需要额外的样式增强
-              const htmlContent = await invoke<string>('open_docx_for_edit', { path: filePath });
-              
+              let htmlContent: string;
+              let pendingDiffs: OpenFileResult['pending_diffs'];
+              const workspacePath = useFileStore.getState().currentWorkspace;
+              if (workspacePath) {
+                const ws = normalizeWorkspacePath(workspacePath);
+                const relPath = getRelativePath(filePath, ws);
+                const result = await invoke<OpenFileResult>('open_docx_with_cache', {
+                  workspacePath: ws,
+                  filePath: relPath,
+                });
+                assertNonCurrentFileGates(filePath, result, 'open_docx_with_cache');
+                htmlContent = result.content;
+                pendingDiffs = result.pending_diffs ?? undefined;
+              } else {
+                htmlContent = await invoke<string>('open_docx_for_edit', { path: filePath });
+              }
+              const first5Codes = Array.from({ length: 5 }, (_, i) => htmlContent.charCodeAt(i));
+              const bodyIdx = htmlContent.indexOf('<body');
+              let bodyContentStart = '';
+              let bodyFirst30Hex = '';
+              if (bodyIdx >= 0) {
+                const bodyOpen = htmlContent.indexOf('>', bodyIdx) + 1;
+                bodyContentStart = htmlContent.slice(bodyOpen, bodyOpen + 200).replace(/\n/g, '↵').replace(/\r/g, '␍');
+                bodyFirst30Hex = Array.from(htmlContent.slice(bodyOpen, bodyOpen + 30))
+                  .map((c) => c.charCodeAt(0).toString(16).padStart(2, '0'))
+                  .join(' ');
+              }
+              console.log('[Bug1-Debug] documentService invoke 返回后:', {
+                len: htmlContent.length,
+                first5CharCodes: first5Codes,
+                bodyIdx,
+                bodyContentFirst200: bodyContentStart,
+                bodyFirst30Hex,
+                startsWithNewline: htmlContent.charCodeAt(0) === 0x0a || htmlContent.charCodeAt(0) === 0x0d,
+              });
               useEditorStore.getState().addTab(
                 filePath,
                 fileName,
                 htmlContent,
-                false, // isReadOnly
+                false,
                 isDraft,
                 lastModifiedTime
               );
+              if (pendingDiffs?.length) {
+                useDiffStore.getState().setFilePathDiffs(filePath, pendingDiffs);
+              }
             } catch (error) {
               // LibreOffice + ODT 转换失败，显示错误提示
               const errorMessage = error instanceof Error ? error.message : String(error);
@@ -600,13 +709,34 @@ export const documentService = {
   async saveFile(filePath: string, content: string): Promise<void> {
     try {
       const ext = filePath.split('.').pop()?.toLowerCase();
-      
+
+      let htmlForWorkspaceCache = content;
       if (ext === 'docx') {
-        // DOCX 文件需要转换 HTML 到 DOCX
-        await invoke('save_docx', { path: filePath, htmlContent: content });
+        // Bug1 修复：tiptap-pagination-plus 会在文档开头插入占位空段落（含换行/空格），
+        // 保存前移除开头的纯空白段落，避免往返后出现顶部空白行
+        const contentToSave = content.replace(
+          /^(\s*<p[^>]*>(?:[\s\u00A0\u200B\uFEFF]|<br\s*\/?>)*<\/p>\s*)+/i,
+          ''
+        );
+        htmlForWorkspaceCache = contentToSave;
+        await invoke('save_docx', { path: filePath, htmlContent: contentToSave });
       } else {
-        // 直接保存文本内容
         await invoke('write_file', { path: filePath, content });
+      }
+
+      // P4：与工作区 file_cache 对齐（所有可编辑文件类型，含 md/txt）
+      const { useFileStore } = await import('../stores/fileStore');
+      const ws = useFileStore.getState().currentWorkspace;
+      if (ws) {
+        try {
+          await invoke('sync_workspace_file_cache_after_save', {
+            workspacePath: ws,
+            fileAbsolutePath: filePath,
+            htmlContent: htmlForWorkspaceCache,
+          });
+        } catch (e) {
+          console.warn('[documentService] 保存后同步 workspace 缓存失败（可忽略）:', e);
+        }
       }
     } catch (error) {
       console.error('保存文件失败:', error);
@@ -614,4 +744,3 @@ export const documentService = {
     }
   },
 };
-

@@ -25,7 +25,7 @@ import MarginsModal from './MarginsModal';
 
 interface EditorToolbarProps {
   editor: Editor | null;
-  fileType: 'docx' | 'md' | 'html' | 'txt' | 'pdf' | 'image';
+  fileType: 'docx' | 'md' | 'html' | 'txt' | 'pdf' | 'image' | 'excel' | 'presentation' | 'audio' | 'video';
   documentPath?: string;
 }
 
@@ -39,11 +39,14 @@ const EditorToolbar: React.FC<EditorToolbarProps> = ({ editor, fileType, documen
   const pagination = usePaginationFromEditor(editor, fileType === 'docx');
   
   // 监听编辑器状态变化，更新标题等级
+  // ⚠️ cleanup 时 editor 可能已销毁（关闭标签/面板），需防护
   React.useEffect(() => {
-    if (!editor) return;
+    if (!editor || (editor as any).isDestroyed) return;
     
     const updateHeadingLevel = () => {
-      if (editor.isActive('heading', { level: 1 })) {
+      try {
+        if ((editor as any).isDestroyed) return;
+        if (editor.isActive('heading', { level: 1 })) {
         setHeadingLevel(1);
       } else if (editor.isActive('heading', { level: 2 })) {
         setHeadingLevel(2);
@@ -58,6 +61,9 @@ const EditorToolbar: React.FC<EditorToolbarProps> = ({ editor, fileType, documen
       } else {
         setHeadingLevel('paragraph');
       }
+      } catch {
+        // editor 已销毁
+      }
     };
 
     updateHeadingLevel();
@@ -65,17 +71,25 @@ const EditorToolbar: React.FC<EditorToolbarProps> = ({ editor, fileType, documen
     editor.on('selectionUpdate', updateHeadingLevel);
 
     return () => {
-      editor.off('update', updateHeadingLevel);
-      editor.off('selectionUpdate', updateHeadingLevel);
+      try {
+        if (!(editor as any).isDestroyed) {
+          editor.off('update', updateHeadingLevel);
+          editor.off('selectionUpdate', updateHeadingLevel);
+        }
+      } catch {
+        // editor 已销毁，忽略
+      }
     };
   }, [editor]);
 
   // 监听文本对齐状态变化
   React.useEffect(() => {
-    if (!editor) return;
+    if (!editor || (editor as any).isDestroyed) return;
     
     const updateTextAlign = () => {
-      if (editor.isActive({ textAlign: 'left' })) {
+      try {
+        if ((editor as any).isDestroyed) return;
+        if (editor.isActive({ textAlign: 'left' })) {
         setTextAlign('left');
       } else if (editor.isActive({ textAlign: 'center' })) {
         setTextAlign('center');
@@ -86,6 +100,9 @@ const EditorToolbar: React.FC<EditorToolbarProps> = ({ editor, fileType, documen
       } else {
         setTextAlign('left');
       }
+      } catch {
+        // editor 已销毁
+      }
     };
 
     updateTextAlign();
@@ -93,8 +110,14 @@ const EditorToolbar: React.FC<EditorToolbarProps> = ({ editor, fileType, documen
     editor.on('selectionUpdate', updateTextAlign);
 
     return () => {
-      editor.off('update', updateTextAlign);
-      editor.off('selectionUpdate', updateTextAlign);
+      try {
+        if (!(editor as any).isDestroyed) {
+          editor.off('update', updateTextAlign);
+          editor.off('selectionUpdate', updateTextAlign);
+        }
+      } catch {
+        // editor 已销毁，忽略
+      }
     };
   }, [editor]);
   

@@ -8,6 +8,7 @@ mod commands;
 mod models;
 mod services;
 mod utils;
+mod workspace;
 
 use tauri::Manager;
 use services::file_watcher::FileWatcherService;
@@ -41,11 +42,7 @@ fn main() {
                     eprintln!("聚焦窗口失败: {}", e);
                 });
                 
-                // 在开发模式下打开开发者工具
-                #[cfg(debug_assertions)]
-                {
-                    window.open_devtools();
-                }
+                // 默认不自动打开开发者工具，需要时可手动打开（如 F12 或右键）
             } else {
                 eprintln!("警告: 无法获取主窗口");
             }
@@ -93,6 +90,7 @@ fn main() {
             commands::ai_commands::ai_autocomplete,
             commands::ai_commands::ai_inline_assist,
             commands::ai_commands::ai_chat_stream,
+            commands::positioning_snapshot::positioning_submit_editor_snapshot,
             commands::ai_commands::ai_save_api_key,
             commands::ai_commands::ai_get_api_key,
             commands::ai_commands::ai_cancel_request,
@@ -112,6 +110,14 @@ fn main() {
             commands::classifier_commands::organize_files,
             commands::tool_commands::execute_tool,
             commands::tool_commands::execute_tool_with_retry,
+            workspace::workspace_commands::open_file_with_cache,
+            workspace::workspace_commands::open_docx_with_cache,
+            workspace::workspace_commands::ai_edit_file_with_diff,
+            workspace::workspace_commands::accept_file_diffs,
+            workspace::workspace_commands::reject_file_diffs,
+            workspace::workspace_commands::sync_workspace_file_cache_after_save,
+            workspace::workspace_commands::get_file_dependencies,
+            workspace::workspace_commands::save_file_dependency,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

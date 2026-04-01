@@ -11,7 +11,7 @@ const WelcomeChatInput: React.FC<WelcomeChatInputProps> = ({ onStartChat }) => {
   const { createTab, setActiveTab } = useChatStore();
   const { setFileTreeVisible, setEditorVisible, setChatVisible } = useLayoutStore();
   
-  const handleCreateTab = useCallback((mode: 'agent' | 'chat') => {
+  const handleCreateTab = useCallback((_mode: 'agent' | 'chat') => {
     // 固定为 chat 模式
     const tabId = createTab(undefined, 'chat');
     if (!tabId) {

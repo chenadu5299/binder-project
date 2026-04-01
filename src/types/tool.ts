@@ -15,6 +15,14 @@ export interface ToolResult {
     data?: any;
     error?: string;
     message?: string;
+    display_error?: string;        // 新增：用户可读的中文错误文案
+    error_kind?: 'Retryable' | 'Skippable' | 'Fatal';  // 新增：与后端对齐
+    // 文档编辑工具返回（与后端 tool_service 一致）
+    diff_area_id?: string;
+    old_content?: string;
+    new_content?: string;
+    oldContent?: string;
+    newContent?: string;
 }
 
 export interface ToolDefinition {

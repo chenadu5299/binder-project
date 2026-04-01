@@ -1,1 +1,1 @@
-{"main":{"identifier":"main","description":"Main window capabilities","local":true,"windows":["main"],"permissions":["core:default","dialog:allow-open","dialog:allow-save","dialog:default"]}}
+{"main":{"identifier":"main","description":"Main window capabilities","local":true,"windows":["main"],"permissions":["core:default","core:window:allow-destroy","dialog:allow-open","dialog:allow-save","dialog:default"]}}

@@ -172,7 +172,7 @@ const DocxPdfPreview: React.FC<DocxPdfPreviewProps> = ({ filePath }) => {
         // 步骤 3：使用 Tauri 读取 PDF 文件为 base64
         // ⚠️ 必须使用 read_file_as_base64，不要改用其他方式
         // 添加重试机制：如果读取失败，可能是文件还未完全写入
-        let base64: string;
+        let base64: string = '';
         let readAttempts = 0;
         const maxReadAttempts = 3;
         const readRetryDelay = 300; // 300ms

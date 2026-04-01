@@ -7,16 +7,21 @@ use crate::services::file_watcher::FileWatcherService;
 use crate::services::conversation_manager::ConversationManager;
 use crate::services::streaming_response_handler::StreamingResponseHandler;
 use crate::services::tool_call_handler::ToolCallHandler;
-use crate::services::context_manager::{ContextManager, ContextInfo, EditorState as ContextEditorState, ReferenceInfo, ReferenceType};
+use crate::services::context_manager::{ContextManager, ContextInfo, EditorState as ContextEditorState, ReferenceInfo, ReferenceType, TruncationStrategy};
+use serde::Deserialize;
 use crate::services::exception_handler::{ExceptionHandler, ConversationError, ErrorContext};
 use crate::services::loop_detector::LoopDetector;
 use crate::services::reply_completeness_checker::ReplyCompletenessChecker;
 use crate::services::confirmation_manager::ConfirmationManager;
 use crate::services::task_progress_analyzer::TaskProgressAnalyzer;
+use crate::services::stream_state::{
+    begin_next_stream_round, finalize_stream, stream_state_label, StreamContext, StreamState,
+};
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
 use std::collections::HashMap;
-use tauri::{State, Emitter};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tauri::{Emitter, Runtime, State};
 use tokio::sync::oneshot;
 use once_cell::sync::Lazy;
 
@@ -40,6 +45,176 @@ fn safe_truncate(s: &str, max_bytes: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// OpenAI/DeepSeek 兼容：assistant 消息中的 `tool_calls` 数组（元素为 JSON 对象）。
+fn build_openai_tool_calls_json(specs: &[(String, String, String)]) -> Vec<serde_json::Value> {
+    specs
+        .iter()
+        .map(|(id, name, args)| {
+            serde_json::json!({
+                "id": id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": args
+                }
+            })
+        })
+        .collect()
+}
+
+/// 单条 `role: "tool"` 消息的 `content`（与原先聚合块中单条工具的格式一致）。
+fn emit_ai_chat_stream_done<R: Runtime>(
+    app: &impl Emitter<R>,
+    tab_id: &str,
+    stream_ctx: &StreamContext,
+    error: Option<&str>,
+) {
+    let execution_layer_completed = matches!(
+        stream_ctx.state,
+        StreamState::Completed | StreamState::Cancelled
+    );
+    let business_layer_completed =
+        stream_ctx.state == StreamState::Completed && error.is_none();
+    let mut v = serde_json::json!({
+        "tab_id": tab_id,
+        "chunk": "",
+        "done": true,
+        "stream_state": stream_state_label(stream_ctx.state),
+        "completion": {
+            "execution_layer_completed": execution_layer_completed,
+            "business_layer_completed": business_layer_completed,
+        }
+    });
+    if let Some(e) = error {
+        v["error"] = serde_json::Value::String(e.to_string());
+    }
+    let _ = app.emit("ai-chat-stream", v);
+}
+
+/// 强约束：仅当 `state == Completed` 时允许写入 assistant（对话历史），避免取消后仍持久化模型回复。
+fn push_chat_message_if_allowed(stream_ctx: &StreamContext, current_messages: &mut Vec<ChatMessage>, msg: ChatMessage) {
+    if msg.role == "assistant" && stream_ctx.state != StreamState::Completed {
+        eprintln!(
+            "⚠️ 跳过 assistant 对话历史写入（流状态非 Completed: {:?}）",
+            stream_ctx.state
+        );
+        return;
+    }
+    current_messages.push(msg);
+}
+
+fn format_single_tool_result_content(
+    tool_name: &str,
+    tool_result: &crate::services::tool_service::ToolResult,
+) -> String {
+    if tool_result.success {
+        if let Some(data) = &tool_result.data {
+            format!(
+                "【{}】执行成功，结果数据：\n{}",
+                tool_name,
+                serde_json::to_string_pretty(data).unwrap_or_default()
+            )
+        } else if let Some(message) = &tool_result.message {
+            format!("【{}】执行成功：{}", tool_name, message)
+        } else {
+            format!("【{}】执行成功", tool_name)
+        }
+    } else if let Some(error) = &tool_result.error {
+        format!("【{}】执行失败：{}", tool_name, error)
+    } else {
+        format!("【{}】执行失败", tool_name)
+    }
+}
+
+fn now_unix_millis() -> u64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_millis() as u64,
+        Err(_) => 0,
+    }
+}
+
+fn with_execution_observability(
+    mut tool_result: crate::services::tool_service::ToolResult,
+    tool_name: &str,
+    parsed_arguments: Option<&serde_json::Value>,
+    skip_continue: bool,
+) -> crate::services::tool_service::ToolResult {
+    let mut data_obj = match tool_result.data.take() {
+        Some(serde_json::Value::Object(map)) => map,
+        Some(other) => {
+            let mut map = serde_json::Map::new();
+            map.insert("payload".to_string(), other);
+            map
+        }
+        None => serde_json::Map::new(),
+    };
+
+    let has_exposure = data_obj.get("execution_exposure").is_some()
+        || data_obj
+            .get("execution_exposures")
+            .and_then(|v| v.as_array())
+            .map(|arr| !arr.is_empty())
+            .unwrap_or(false);
+
+    if !tool_result.success && !has_exposure {
+        let code = data_obj
+            .get("error_code")
+            .and_then(|v| v.as_str())
+            .unwrap_or(crate::services::tool_service::E_REFRESH_FAILED);
+        let target_file = data_obj
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .or_else(|| parsed_arguments.and_then(|a| a.get("current_file")).and_then(|v| v.as_str()))
+            .or_else(|| parsed_arguments.and_then(|a| a.get("path")).and_then(|v| v.as_str()))
+            .unwrap_or("<unknown>");
+        let route_source = data_obj
+            .get("route_source")
+            .and_then(|v| v.as_str())
+            .or_else(|| parsed_arguments.and_then(|a| a.get("route_source")).and_then(|v| v.as_str()));
+        let message = tool_result
+            .error
+            .clone()
+            .unwrap_or_else(|| "tool execution failed".to_string());
+        let mut exposure = serde_json::json!({
+            "exposureId": format!("exp-{}", uuid::Uuid::new_v4()),
+            "level": "error",
+            "phase": "refresh",
+            "code": code,
+            "message": message,
+            "targetFile": target_file,
+            "timestamp": now_unix_millis(),
+        });
+        if let Some(route) = route_source {
+            exposure["routeSource"] = serde_json::json!(route);
+        }
+        data_obj.insert("error_code".to_string(), serde_json::json!(code));
+        data_obj.insert("execution_exposure".to_string(), exposure.clone());
+        let mut exposure_list = data_obj
+            .get("execution_exposures")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        exposure_list.push(exposure);
+        data_obj.insert(
+            "execution_exposures".to_string(),
+            serde_json::Value::Array(exposure_list),
+        );
+    }
+
+    data_obj.insert(
+        "execution_completion".to_string(),
+        serde_json::json!({
+            "execution_layer_completed": true,
+            "business_layer_completed": false,
+            "policy": if skip_continue { "skip_and_continue" } else { "normal" },
+            "skip_continue": skip_continue,
+            "tool_name": tool_name,
+        }),
+    );
+    tool_result.data = Some(serde_json::Value::Object(data_obj));
+    tool_result
 }
 
 // 注意：analyze_task_progress 函数已废弃，统一使用 TaskProgressAnalyzer::analyze
@@ -239,7 +414,7 @@ pub async fn ai_autocomplete(
     document_format: Option<String>,
     document_overview: Option<DocumentOverview>,
     service: State<'_, AIServiceState>,
-) -> Result<Option<String>, String> {
+) -> Result<Option<Vec<String>>, String> {
     // 尝试获取已配置的提供商（优先 DeepSeek，然后是 OpenAI）
     let provider = {
         let service_guard = service.lock()
@@ -284,6 +459,7 @@ pub async fn ai_autocomplete(
     });
     
     // 调用自动补全（使用增强的提示词）
+    // Phase 1a：解析 3 条建议（用 --- 分隔），返回 Vec<String>
     match provider.autocomplete_enhanced(
         &context_before,
         context_after.as_deref(),
@@ -294,9 +470,14 @@ pub async fn ai_autocomplete(
         max_length,
     ).await {
         Ok(result) => {
-            // 记录结果用于调试
-            eprintln!("✅ [ai_autocomplete] 成功返回，内容长度: {} 字符", result.len());
-            Ok(Some(result))
+            let suggestions: Vec<String> = result
+                .split("---")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .take(3)
+                .collect();
+            eprintln!("✅ [ai_autocomplete] 成功返回，{} 条建议", suggestions.len());
+            Ok(if suggestions.is_empty() { None } else { Some(suggestions) })
         }
         Err(e) => {
             eprintln!("❌ [ai_autocomplete] 错误: {}", e);
@@ -305,20 +486,47 @@ pub async fn ai_autocomplete(
     }
 }
 
+/// Phase 0.4：Inline Assist 历史消息
+#[derive(serde::Deserialize)]
+pub struct InlineAssistMessage {
+    role: String,
+    text: String,
+}
+
 #[tauri::command]
 pub async fn ai_inline_assist(
     instruction: String,
     text: String,
     context: String,
+    messages: Option<Vec<InlineAssistMessage>>,
     service: State<'_, AIServiceState>,
 ) -> Result<String, String> {
     // 记录请求用于调试（不打印完整正文，避免泄露内容）
+    let messages_len = messages.as_ref().map(|m| m.len()).unwrap_or(0);
     eprintln!(
-        "📥 [ai_inline_assist] 收到请求: instruction_len={} text_len={} context_len={}",
+        "📥 [ai_inline_assist] 收到请求: instruction_len={} text_len={} context_len={} messages_count={}",
         instruction.chars().count(),
         text.chars().count(),
         context.chars().count(),
+        messages_len,
     );
+
+    // Phase 0.4：将历史 messages 拼接到 context 前
+    let context_with_history = if let Some(ref msgs) = messages {
+        if msgs.is_empty() {
+            context.clone()
+        } else {
+            let history: String = msgs
+                .iter()
+                .filter(|m| m.role == "user" || m.role == "assistant")
+                .map(|m| format!("{}: {}", m.role, m.text))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("【历史对话】\n{}\n\n{}", history, context)
+        }
+    } else {
+        context
+    };
     
     // 尝试获取已配置的提供商（优先 DeepSeek，然后是 OpenAI）
     let provider = {
@@ -333,8 +541,8 @@ pub async fn ai_inline_assist(
         "未配置任何 AI 提供商，请先配置 DeepSeek 或 OpenAI API key".to_string()
     })?;
     
-    // 调用 Inline Assist
-    match provider.inline_assist(&instruction, &text, &context).await {
+    // 调用 Inline Assist（使用含历史对话的 context）
+    match provider.inline_assist(&instruction, &text, &context_with_history).await {
         Ok(result) => {
             eprintln!(
                 "✅ [ai_inline_assist] 成功返回，结果长度: {} 字符",
@@ -349,6 +557,220 @@ pub async fn ai_inline_assist(
     }
 }
 
+/// 前端引用协议（设计文档 6.1）
+/// edit_target 必须为 Option，非 Text 类型引用无此字段，反序列化时避免 panic
+#[derive(Debug, Deserialize)]
+pub struct ReferenceFromFrontend {
+    #[serde(rename = "type")]
+    reference_type: String,
+    source: String,
+    content: String,
+    #[serde(rename = "textReference")]
+    text_reference: Option<TextReferenceInfo>,
+    #[serde(rename = "editTarget")]
+    edit_target: Option<EditTargetInfo>,
+    #[serde(rename = "templateType")]
+    _template_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct TextReferenceInfo {
+    #[serde(rename = "startBlockId")]
+    start_block_id: String,
+    #[serde(rename = "startOffset")]
+    start_offset: u32,
+    #[serde(rename = "endBlockId")]
+    end_block_id: String,
+    #[serde(rename = "endOffset")]
+    end_offset: u32,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct EditTargetInfo {
+    #[serde(rename = "blockId")]
+    block_id: String,
+    #[serde(rename = "startOffset")]
+    start_offset: u32,
+    #[serde(rename = "endOffset")]
+    end_offset: u32,
+}
+
+#[derive(Debug, Clone)]
+struct ReferenceAnchorSelection {
+    start_block_id: String,
+    start_offset: usize,
+    end_block_id: String,
+    end_offset: usize,
+    source: String,
+}
+
+fn normalize_path_for_reference_compare(raw: &str, workspace: &std::path::Path) -> String {
+    let raw_norm = raw.replace('\\', "/");
+    let as_path = std::path::PathBuf::from(&raw_norm);
+    let rel = as_path
+        .strip_prefix(workspace)
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or(raw_norm);
+    rel.trim_start_matches('/').to_string()
+}
+
+fn same_source_file_for_reference(
+    source: &str,
+    current_file: &Option<String>,
+    workspace: &std::path::Path,
+) -> bool {
+    let Some(current) = current_file.as_ref() else {
+        return true;
+    };
+    let source_norm = normalize_path_for_reference_compare(source, workspace);
+    let current_norm = normalize_path_for_reference_compare(current, workspace);
+    source_norm == current_norm
+        || source_norm.ends_with(&current_norm)
+        || current_norm.ends_with(&source_norm)
+}
+
+fn extract_reference_anchor_for_zero_search(
+    refs: Option<&Vec<ReferenceFromFrontend>>,
+    current_file: &Option<String>,
+    workspace: &std::path::Path,
+) -> Option<ReferenceAnchorSelection> {
+    let refs = refs?;
+    for r in refs {
+        if r.reference_type != "text" {
+            continue;
+        }
+        if !same_source_file_for_reference(&r.source, current_file, workspace) {
+            continue;
+        }
+        if let Some(tr) = &r.text_reference {
+            return Some(ReferenceAnchorSelection {
+                start_block_id: tr.start_block_id.clone(),
+                start_offset: tr.start_offset as usize,
+                end_block_id: tr.end_block_id.clone(),
+                end_offset: tr.end_offset as usize,
+                source: r.source.clone(),
+            });
+        }
+        if let Some(et) = &r.edit_target {
+            // 兼容旧字段：单块定位
+            return Some(ReferenceAnchorSelection {
+                start_block_id: et.block_id.clone(),
+                start_offset: et.start_offset as usize,
+                end_block_id: et.block_id.clone(),
+                end_offset: et.end_offset as usize,
+                source: r.source.clone(),
+            });
+        }
+    }
+    None
+}
+
+/// 当用户显式 primary_edit_target（工作区相对路径）与当前编辑器文件不一致时，禁止注入当前编辑器内容，避免改错文件。
+/// §十三：仅参数契约含编辑器 L/revision 快照的工具在分发前走 IPC 重采（显式白名单扩展）
+fn tool_call_needs_editor_snapshot_ipc(tool_name: &str) -> bool {
+    matches!(tool_name, "edit_current_editor_document")
+}
+
+async fn merge_editor_snapshot_ipc_for_tool(
+    app: &tauri::AppHandle,
+    tool_name: &str,
+    current_file_for_ipc: Option<String>,
+    parsed_arguments: &mut serde_json::Value,
+) {
+    if !tool_call_needs_editor_snapshot_ipc(tool_name) {
+        return;
+    }
+    if let serde_json::Value::Object(ref mut map) = parsed_arguments {
+        if let Some(snap) = crate::commands::positioning_snapshot::request_editor_snapshot_ipc(
+            app,
+            current_file_for_ipc,
+            3000,
+        )
+        .await
+        {
+            crate::commands::positioning_snapshot::merge_editor_snapshot_into_arguments(map, snap);
+        }
+    }
+}
+
+fn should_skip_edit_current_editor_injection(
+    primary_edit_target: &Option<String>,
+    current_file: &Option<String>,
+    workspace: &std::path::Path,
+) -> bool {
+    let Some(primary_raw) = primary_edit_target.as_ref() else {
+        return false;
+    };
+    let Some(current_raw) = current_file.as_ref() else {
+        return false;
+    };
+    let primary_norm = primary_raw.replace('\\', "/").trim_start_matches('/').to_string();
+    if primary_norm.is_empty() {
+        return false;
+    }
+    let current_path = std::path::PathBuf::from(current_raw);
+    let current_norm = current_path
+        .strip_prefix(workspace)
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| current_raw.replace('\\', "/"));
+    let current_trim = current_norm.trim_start_matches('/').to_string();
+    if current_trim.is_empty() {
+        return false;
+    }
+    primary_norm != current_trim
+}
+
+fn is_edit_tool_model_protocol_field(key: &str) -> bool {
+    matches!(key, "edit_mode" | "block_index" | "target" | "content" | "occurrence_index")
+}
+
+/// 协议白名单固化：
+/// - 保留模型协议字段
+/// - 丢弃其他未知字段，避免协议漂移
+fn sanitize_edit_current_editor_document_arguments(arguments: &mut serde_json::Value) {
+    let Some(map) = arguments.as_object_mut() else {
+        *arguments = serde_json::json!({});
+        return;
+    };
+
+    let keys: Vec<String> = map.keys().cloned().collect();
+    let mut removed: Vec<String> = Vec::new();
+    for key in keys {
+        let keep = is_edit_tool_model_protocol_field(&key);
+        if !keep {
+            map.remove(&key);
+            removed.push(key);
+        }
+    }
+    if !removed.is_empty() {
+        eprintln!(
+            "🧹 [edit_current_editor_document] dropped non-whitelisted fields: {:?}",
+            removed
+        );
+    }
+}
+
+fn frontend_ref_to_reference_info(r: &ReferenceFromFrontend) -> Option<ReferenceInfo> {
+    let ref_type = match r.reference_type.as_str() {
+        "text" => ReferenceType::Text,
+        "file" => ReferenceType::File,
+        "folder" => ReferenceType::Folder,
+        "image" => ReferenceType::Image,
+        "table" => ReferenceType::Table,
+        "memory" => ReferenceType::Memory,
+        "link" => ReferenceType::Link,
+        "chat" => ReferenceType::Chat,
+        "kb" => ReferenceType::KnowledgeBase,
+        "template" => ReferenceType::Template,
+        _ => return None,
+    };
+    Some(ReferenceInfo {
+        ref_type,
+        source: r.source.clone(),
+        content: r.content.clone(),
+    })
+}
+
 #[tauri::command]
 pub async fn ai_chat_stream(
     tab_id: String, // 注意：前端发送的是 tabId (camelCase)，Tauri 会自动转换为 tab_id (snake_case)
@@ -358,13 +780,32 @@ pub async fn ai_chat_stream(
     current_file: Option<String>, // 当前打开的文档路径（第二层上下文）
     selected_text: Option<String>, // 当前选中的文本（第二层上下文）
     current_editor_content: Option<String>, // 当前编辑器内容（用于文档编辑功能）
-    edit_target: Option<serde_json::Value>, // 精确定位：{ anchor: { block_id, start_offset, end_offset } }
+    references: Option<Vec<ReferenceFromFrontend>>, // Phase 0：前端引用协议
+    primary_edit_target: Option<String>, // 工作区相对路径：与 current_file 不一致时不注入编辑器内容
+    document_revision: Option<u64>,       // 前端文档版本戳，注入工具参数并回显于 diff 结果（§2.1.1）
+    baseline_id: Option<String>,          // 前端 RequestContext.baselineId（透传到工具参数）
+    // §十三：前端编辑器 tab id，仅日志/可观测；不参与 Rust 注入逻辑
+    editor_tab_id: Option<String>,
+    // §7.1：选区完整坐标（前端选区场景）
+    selection_start_block_id: Option<String>,
+    selection_start_offset: Option<usize>,
+    selection_end_block_id: Option<String>,
+    selection_end_offset: Option<usize>,
+    // §7.1：光标所在块（无选区场景）
+    cursor_block_id: Option<String>,
+    cursor_offset: Option<usize>,
     app: tauri::AppHandle,
     service: State<'_, AIServiceState>,
     watcher: State<'_, Mutex<FileWatcherService>>,
 ) -> Result<(), String> {
     // ⚠️ 关键修复：记录 tab_id 以便调试
     eprintln!("📥 收到流式聊天请求: tab_id={}, messages_count={}", tab_id, messages.len());
+    if let Some(ref eid) = editor_tab_id {
+        eprintln!("📎 RequestContext editor_tab_id={} (frontend positioning bucket)", eid);
+    }
+    if let Some(ref bid) = baseline_id {
+        eprintln!("📎 RequestContext baseline_id={}", bid);
+    }
     // 根据模型选择提供商（优先 DeepSeek）
     let provider_name = if model_config.model.contains("deepseek") {
         "deepseek"
@@ -431,17 +872,16 @@ pub async fn ai_chat_stream(
     // 使用 ContextManager 统一构建多层提示词（方案A）
     let context_manager = ContextManager::new(model_config.max_tokens);
     
-    // 从消息中提取引用信息（第三层）
-    let mut references: Vec<ReferenceInfo> = Vec::new();
-    if let Some(last_user_msg) = messages.iter().rev().find(|m| m.role == "user") {
-        let _content = &last_user_msg.content;
-        // 简单的引用检测：查找 @file: 或文件路径模式
-        // 这里可以根据实际需求扩展引用检测逻辑
-        // 暂时留空，等待前端传递引用信息或扩展检测逻辑
-    }
+    // Phase 0：从前端 references 构建引用列表（设计文档为准）
+    let mut final_references: Vec<ReferenceInfo> = if let Some(ref refs) = references {
+        refs.iter()
+            .filter_map(|r| frontend_ref_to_reference_info(r))
+            .collect()
+    } else {
+        Vec::new()
+    };
     
-    // ⚠️ 关键修复：将当前打开的文件作为引用项添加到引用列表
-    let mut final_references = references.clone();
+    // 若前端 references 为空，仅将 current_file 作为引用；若非空，补充 current_file（不重复）
     if let Some(current_file_path) = &current_file {
         // 将绝对路径转换为相对于工作区的路径（与工具调用格式保持一致）
         let normalized_path = if current_file_path.starts_with('/') || current_file_path.contains(':') {
@@ -482,7 +922,57 @@ pub async fn ai_chat_stream(
             });
         }
     }
+
+    // 12.5：无显式选区时，TextReference 四元组作为一级定位输入（reference 零搜索）
+    let mut effective_selection_start_block_id = selection_start_block_id.clone();
+    let mut effective_selection_start_offset = selection_start_offset;
+    let mut effective_selection_end_block_id = selection_end_block_id.clone();
+    let mut effective_selection_end_offset = selection_end_offset;
+    let mut effective_selected_text = selected_text.clone();
+    let mut selection_source = "selection";
+    let need_reference_fallback = effective_selection_start_block_id.is_none()
+        || effective_selection_start_offset.is_none()
+        || effective_selection_end_block_id.is_none()
+        || effective_selection_end_offset.is_none();
+    if need_reference_fallback {
+        if let Some(anchor) = extract_reference_anchor_for_zero_search(
+            references.as_ref(),
+            &current_file,
+            &workspace_path,
+        ) {
+            effective_selection_start_block_id = Some(anchor.start_block_id);
+            effective_selection_start_offset = Some(anchor.start_offset);
+            effective_selection_end_block_id = Some(anchor.end_block_id);
+            effective_selection_end_offset = Some(anchor.end_offset);
+            // 关键：reference 路径强制不注入 _sel_text，Resolver 才会稳定输出 route_source=reference
+            effective_selected_text = None;
+            selection_source = "reference";
+            eprintln!(
+                "📎 使用 TextReference 四元组回填零搜索坐标: source={} start=({:?}:{:?}) end=({:?}:{:?})",
+                anchor.source,
+                effective_selection_start_block_id,
+                effective_selection_start_offset,
+                effective_selection_end_block_id,
+                effective_selection_end_offset
+            );
+        }
+    }
+    // 后续流程统一使用“有效选区”变量（显式选区优先，其次引用四元组）
+    let selected_text = effective_selected_text;
+    let selection_start_block_id = effective_selection_start_block_id;
+    let selection_start_offset = effective_selection_start_offset;
+    let selection_end_block_id = effective_selection_end_block_id;
+    let selection_end_offset = effective_selection_end_offset;
+    eprintln!("📌 zero-search selection source={}", selection_source);
     
+    // §7.1：先 clone 选区坐标，再移入 context_info（clone 供后续 spawn 闭包使用）
+    let selection_start_block_id_for_spawn = selection_start_block_id.clone();
+    let selection_end_block_id_for_spawn = selection_end_block_id.clone();
+    let selection_start_offset_for_spawn = selection_start_offset;
+    let selection_end_offset_for_spawn = selection_end_offset;
+    let cursor_block_id_for_spawn = cursor_block_id.clone();
+    let cursor_offset_for_spawn = cursor_offset;
+
     // 构建上下文信息
     let context_info = ContextInfo {
         current_file: current_file.clone(),
@@ -499,6 +989,20 @@ pub async fn ai_chat_stream(
             is_saved: true, // 默认已保存，可根据实际情况调整
         },
         references: final_references,
+        current_content: current_editor_content.clone(),
+        edit_target_present: selection_start_block_id_for_spawn.is_some(),
+        selection_start_block_id,
+        selection_start_offset,
+        selection_end_block_id,
+        selection_end_offset,
+        cursor_block_id,
+        cursor_offset,
+        baseline_id: baseline_id.clone(),
+        document_revision,
+        user_message: messages.iter().rev()
+            .find(|m| m.role == "user")
+            .map(|m| m.content.clone().unwrap_or_default())
+            .unwrap_or_default(),
     };
     
     // 使用 build_multi_layer_prompt() 统一构建所有层（第一、二、三层）
@@ -512,13 +1016,16 @@ pub async fn ai_chat_stream(
     if !has_system_message {
         enhanced_messages.insert(0, ChatMessage {
             role: "system".to_string(),
-            content: system_prompt,
+            content: Some(system_prompt),
+            tool_call_id: None,
+            name: None,
+            tool_calls: None,
         });
     } else {
         // 如果已有系统消息，使用统一构建的提示词替换，确保提示词一致性
         if let Some(first_msg) = enhanced_messages.first_mut() {
             if first_msg.role == "system" {
-                first_msg.content = system_prompt;
+                first_msg.content = Some(system_prompt);
             }
         }
     }
@@ -538,8 +1045,17 @@ pub async fn ai_chat_stream(
             // ⚠️ 保存编辑器信息，以便在继续对话中使用
             let current_file_clone = current_file.clone();
             let current_editor_content_clone = current_editor_content.clone();
+            let document_revision_clone = document_revision;
+            let baseline_id_clone = baseline_id.clone();
             let selected_text_clone = selected_text.clone();
-            let edit_target_clone = edit_target.clone();
+            let primary_edit_target_clone = primary_edit_target.clone();
+            // §7.1：选区坐标（已在 context_info 构建前 clone）
+            let selection_start_block_id_clone = selection_start_block_id_for_spawn;
+            let selection_start_offset_clone = selection_start_offset_for_spawn;
+            let selection_end_block_id_clone = selection_end_block_id_for_spawn;
+            let selection_end_offset_clone = selection_end_offset_for_spawn;
+            let cursor_block_id_clone = cursor_block_id_for_spawn;
+            let cursor_offset_clone = cursor_offset_for_spawn;
             
             // ⚠️ 关键修复：使用已注册的取消标志（已在上面创建并注册到 CANCEL_FLAGS）
             // cancel_flag 已经在上面注册到 CANCEL_FLAGS 中，这里直接使用
@@ -557,6 +1073,7 @@ pub async fn ai_chat_stream(
             });
             
             tokio::spawn(async move {
+                let mut stream_ctx = StreamContext::default();
                 // ⚠️ 关键修复：将 cancel_flag 传递到流处理任务中
                 let cancel_flag = cancel_flag_for_stream;
                 use tokio_stream::StreamExt;
@@ -586,6 +1103,8 @@ pub async fn ai_chat_stream(
                 use std::collections::HashMap;
                 let mut tool_calls: HashMap<String, (String, String)> = HashMap::new(); // (id -> (name, arguments))
                 let mut tool_results: Vec<(String, String, crate::services::tool_service::ToolResult)> = Vec::new(); // 收集工具调用结果
+                // 与 tool_results 顺序一致：id, name，模型侧原始 arguments 字符串（用于 assistant tool_calls）
+                let mut tool_call_specs: Vec<(String, String, String)> = Vec::new();
                 let mut has_tool_calls = false; // 标记是否有工具调用
                 
                 // ⚠️ 关键修复：使用循环处理流，并在每次迭代前检查取消标志
@@ -619,16 +1138,13 @@ pub async fn ai_chat_stream(
                         _ = cancel_check => {
                             // 取消信号已触发
                             eprintln!("🛑 通过 select! 检测到取消标志，停止流式处理: tab_id={}", tab_id);
-                            // 发送完成事件，标记为已取消
-                            let payload = serde_json::json!({
-                                "tab_id": tab_id,
-                                "chunk": "",
-                                "done": true,
-                                "error": "用户取消了请求",
-                            });
-                            if let Err(e) = app_handle.emit("ai-chat-stream", payload) {
-                                eprintln!("发送取消事件失败: {}", e);
-                            }
+                            finalize_stream(&mut stream_ctx, StreamState::Cancelled);
+                            emit_ai_chat_stream_done(
+                                &app_handle,
+                                &tab_id,
+                                &stream_ctx,
+                                Some("用户取消了请求"),
+                            );
                             // ⚠️ 关键修复：清理取消通道和标志
                             {
                                 let mut channels = CANCEL_CHANNELS.lock().unwrap();
@@ -702,6 +1218,18 @@ pub async fn ai_chat_stream(
                                     
                                     // ⚠️ 文档编辑功能：如果是 edit_current_editor_document，自动增强参数
                                     if name == "edit_current_editor_document" {
+                                        sanitize_edit_current_editor_document_arguments(&mut parsed_arguments);
+                                        let skip = should_skip_edit_current_editor_injection(
+                                            &primary_edit_target,
+                                            &current_file,
+                                            &workspace_path,
+                                        );
+                                        if skip {
+                                            eprintln!(
+                                                "📝 跳过 edit_current_editor_document 自动注入: primary_edit_target={:?} 与 current_file 不一致",
+                                                primary_edit_target
+                                            );
+                                        } else {
                                         // 自动添加 current_file 和 current_content 参数
                                         if let Some(ref file_path) = current_file {
                                             parsed_arguments["current_file"] = serde_json::Value::String(file_path.clone());
@@ -709,20 +1237,49 @@ pub async fn ai_chat_stream(
                                         if let Some(ref content) = current_editor_content {
                                             parsed_arguments["current_content"] = serde_json::Value::String(content.clone());
                                         }
-                                        // 精确定位：若有 edit_target，注入 anchor，优先于 target_content
-                                        if let Some(ref et) = edit_target {
-                                            parsed_arguments["edit_target"] = et.clone();
-                                            eprintln!("📝 已增强 edit_current_editor_document 参数: edit_target (精确定位)");
-                                        } else if let Some(ref sel) = selected_text {
-                                            // 若有选中文本，作为 target_content 传入（降级）
-                                            if !sel.trim().is_empty() && parsed_arguments.get("target_content").is_none() {
-                                                parsed_arguments["target_content"] = serde_json::Value::String(sel.trim().to_string());
-                                                eprintln!("📝 已增强 edit_current_editor_document 参数: target_content 来自选中文本 (长度: {})", sel.trim().len());
+                                        if let Some(rev) = document_revision {
+                                            parsed_arguments["document_revision"] = serde_json::json!(rev);
+                                        }
+                                        if let Some(ref bid) = baseline_id {
+                                            parsed_arguments["baseline_id"] = serde_json::Value::String(bid.clone());
+                                        }
+                                        // 旧的 edit_target / target_content 自动注入已禁用。
+                                        // 新路径仅保留 _sel_* 零搜索坐标与 block_index + edit_mode。
+                                        // §7.1：注入选区坐标（零搜索路径，供 Resolver 使用）
+                                        if let Some(ref sbid) = selection_start_block_id_clone {
+                                            parsed_arguments["_sel_start_block_id"] = serde_json::Value::String(sbid.clone());
+                                        }
+                                        if let Some(so) = selection_start_offset_clone {
+                                            parsed_arguments["_sel_start_offset"] = serde_json::json!(so);
+                                        }
+                                        if let Some(ref ebid) = selection_end_block_id_clone {
+                                            parsed_arguments["_sel_end_block_id"] = serde_json::Value::String(ebid.clone());
+                                        }
+                                        if let Some(eo) = selection_end_offset_clone {
+                                            parsed_arguments["_sel_end_offset"] = serde_json::json!(eo);
+                                        }
+                                        if let Some(ref sel) = selected_text {
+                                            if !sel.is_empty() {
+                                                parsed_arguments["_sel_text"] = serde_json::Value::String(sel.clone());
                                             }
+                                        }
+                                        if let Some(ref cbid) = cursor_block_id_clone {
+                                            parsed_arguments["cursor_block_id"] = serde_json::Value::String(cbid.clone());
+                                        }
+                                        if let Some(co) = cursor_offset_clone {
+                                            parsed_arguments["cursor_offset"] = serde_json::json!(co);
                                         }
                                         eprintln!("📝 已增强 edit_current_editor_document 参数: current_file={:?}, current_content_len={}", 
                                             current_file.as_ref().map(|s| s.as_str()), 
                                             current_editor_content.as_ref().map(|s| s.len()).unwrap_or(0));
+                                        merge_editor_snapshot_ipc_for_tool(
+                                            &app_handle,
+                                            &name,
+                                            current_file.clone(),
+                                            &mut parsed_arguments,
+                                        )
+                                        .await;
+                                        }
                                     }
                                     
                                     // 发送工具调用事件到前端（使用解析后的 arguments）
@@ -756,16 +1313,13 @@ pub async fn ai_chat_stream(
                                         let flag = cancel_flag.lock().unwrap();
                                         if *flag {
                                             eprintln!("🛑 工具调用执行前检测到取消标志，停止执行: tab_id={}", tab_id);
-                                            // 发送取消事件
-                                            let payload = serde_json::json!({
-                                                "tab_id": tab_id,
-                                                "chunk": "",
-                                                "done": true,
-                                                "error": "用户取消了请求",
-                                            });
-                                            if let Err(e) = app_handle.emit("ai-chat-stream", payload) {
-                                                eprintln!("发送取消事件失败: {}", e);
-                                            }
+                                            finalize_stream(&mut stream_ctx, StreamState::Cancelled);
+                                            emit_ai_chat_stream_done(
+                                                &app_handle,
+                                                &tab_id,
+                                                &stream_ctx,
+                                                Some("用户取消了请求"),
+                                            );
                                             // ⚠️ 关键修复：清理取消通道和标志
                                             {
                                                 let mut channels = CANCEL_CHANNELS.lock().unwrap();
@@ -785,27 +1339,31 @@ pub async fn ai_chat_stream(
                                     conversation_manager.update_tool_call_status(&tab_id, crate::services::conversation_manager::ToolCallStatus::Executing);
                                     
                                     // 使用 ToolCallHandler 执行工具调用（带重试机制）
-                                    let (tool_result, retry_count) = tool_call_handler.execute_tool_with_retry(
+                                    let (raw_tool_result, _retry_count) = tool_call_handler.execute_tool_with_retry(
                                         &tool_call,
                                         &workspace_path,
                                         3, // max_retries
                                     ).await;
+                                    let skip_continue = !raw_tool_result.success;
+                                    let tool_result = with_execution_observability(
+                                        raw_tool_result,
+                                        &name,
+                                        Some(&parsed_args_for_result),
+                                        skip_continue,
+                                    );
                                     
                                     // ⚠️ 关键修复：在工具调用执行后检查取消标志
                                     {
                                         let flag = cancel_flag.lock().unwrap();
                                         if *flag {
                                             eprintln!("🛑 工具调用执行后检测到取消标志，停止处理: tab_id={}", tab_id);
-                                            // 发送取消事件
-                                            let payload = serde_json::json!({
-                                                "tab_id": tab_id,
-                                                "chunk": "",
-                                                "done": true,
-                                                "error": "用户取消了请求",
-                                            });
-                                            if let Err(e) = app_handle.emit("ai-chat-stream", payload) {
-                                                eprintln!("发送取消事件失败: {}", e);
-                                            }
+                                            finalize_stream(&mut stream_ctx, StreamState::Cancelled);
+                                            emit_ai_chat_stream_done(
+                                                &app_handle,
+                                                &tab_id,
+                                                &stream_ctx,
+                                                Some("用户取消了请求"),
+                                            );
                                             // ⚠️ 关键修复：清理取消通道和标志
                                             {
                                                 let mut channels = CANCEL_CHANNELS.lock().unwrap();
@@ -849,6 +1407,7 @@ pub async fn ai_chat_stream(
                                             }
                                             
                                             // 保存工具调用结果，用于后续继续对话
+                                            tool_call_specs.push((id.clone(), name.clone(), arguments.clone()));
                                             tool_results.push((id.clone(), name.clone(), tool_result.clone()));
                                             
                                             // 将工具结果添加到消息中，继续对话
@@ -879,6 +1438,7 @@ pub async fn ai_chat_stream(
                                         eprintln!("⚠️ 工具执行失败: {} - {}", name, tool_result.error.as_ref().unwrap_or(&"未知错误".to_string()));
                                         
                                         // 保存工具调用结果，用于后续继续对话
+                                        tool_call_specs.push((id.clone(), name.clone(), arguments.clone()));
                                         tool_results.push((id.clone(), name.clone(), tool_result.clone()));
                                         
                                         // 工具执行失败
@@ -911,17 +1471,22 @@ pub async fn ai_chat_stream(
                             }
                         }
                         Err(e) => {
-                            // 发送错误
-                            let payload = serde_json::json!({
-                                "tab_id": tab_id,
-                                "chunk": "",
-                                "done": true,
-                                "error": e.to_string(),
-                            });
-                            if let Err(e) = app_handle.emit("ai-chat-stream", payload) {
-                                eprintln!("发送事件失败: {}", e);
+                            finalize_stream(&mut stream_ctx, StreamState::Completed);
+                            emit_ai_chat_stream_done(
+                                &app_handle,
+                                &tab_id,
+                                &stream_ctx,
+                                Some(&e.to_string()),
+                            );
+                            {
+                                let mut channels = CANCEL_CHANNELS.lock().unwrap();
+                                channels.remove(&tab_id);
                             }
-                            break;
+                            {
+                                let mut flags = CANCEL_FLAGS.lock().unwrap();
+                                flags.remove(&tab_id);
+                            }
+                            return;
                         }
                     }
                 }
@@ -931,16 +1496,13 @@ pub async fn ai_chat_stream(
                     let flag = cancel_flag.lock().unwrap();
                     if *flag {
                         eprintln!("🛑 流结束后检测到取消标志，停止处理: tab_id={}", tab_id);
-                        // 发送取消事件
-                        let payload = serde_json::json!({
-                            "tab_id": tab_id,
-                            "chunk": "",
-                            "done": true,
-                            "error": "用户取消了请求",
-                        });
-                        if let Err(e) = app_handle.emit("ai-chat-stream", payload) {
-                            eprintln!("发送取消事件失败: {}", e);
-                        }
+                        finalize_stream(&mut stream_ctx, StreamState::Cancelled);
+                        emit_ai_chat_stream_done(
+                            &app_handle,
+                            &tab_id,
+                            &stream_ctx,
+                            Some("用户取消了请求"),
+                        );
                         // ⚠️ 关键修复：清理取消通道和标志
                         {
                             let mut channels = CANCEL_CHANNELS.lock().unwrap();
@@ -953,6 +1515,11 @@ pub async fn ai_chat_stream(
                         return;
                     }
                 }
+
+                // 第一段流正常结束（非取消）：进入 Completed，允许后续 assistant 对话历史写入
+                if stream_ctx.state == StreamState::Streaming {
+                    finalize_stream(&mut stream_ctx, StreamState::Completed);
+                }
                 
                 // 流结束时，检查是否有未完成的工具调用
                 if !tool_calls.is_empty() {
@@ -963,7 +1530,7 @@ pub async fn ai_chat_stream(
                         eprintln!("🔧 工具调用 arguments 内容: {}", arguments);
                         
                         // 解析工具调用参数（简化修复逻辑）
-                        let parsed_arguments = match serde_json::from_str::<serde_json::Value>(arguments) {
+                        let mut parsed_arguments = match serde_json::from_str::<serde_json::Value>(arguments) {
                             Ok(args) => {
                                 eprintln!("✅ 成功解析工具调用参数");
                                 args
@@ -995,6 +1562,59 @@ pub async fn ai_chat_stream(
                                 }
                             }
                         };
+
+                        if name == "edit_current_editor_document" {
+                            sanitize_edit_current_editor_document_arguments(&mut parsed_arguments);
+                            let skip = should_skip_edit_current_editor_injection(
+                                &primary_edit_target_clone,
+                                &current_file_clone,
+                                &workspace_path,
+                            );
+                            if !skip {
+                                if let Some(ref file_path) = current_file_clone {
+                                    parsed_arguments["current_file"] = serde_json::Value::String(file_path.clone());
+                                }
+                                if let Some(ref content) = current_editor_content_clone {
+                                    parsed_arguments["current_content"] = serde_json::Value::String(content.clone());
+                                }
+                                if let Some(rev) = document_revision_clone {
+                                    parsed_arguments["document_revision"] = serde_json::json!(rev);
+                                }
+                                if let Some(ref bid) = baseline_id_clone {
+                                    parsed_arguments["baseline_id"] = serde_json::Value::String(bid.clone());
+                                }
+                                if let Some(ref sbid) = selection_start_block_id_clone {
+                                    parsed_arguments["_sel_start_block_id"] = serde_json::Value::String(sbid.clone());
+                                }
+                                if let Some(so) = selection_start_offset_clone {
+                                    parsed_arguments["_sel_start_offset"] = serde_json::json!(so);
+                                }
+                                if let Some(ref ebid) = selection_end_block_id_clone {
+                                    parsed_arguments["_sel_end_block_id"] = serde_json::Value::String(ebid.clone());
+                                }
+                                if let Some(eo) = selection_end_offset_clone {
+                                    parsed_arguments["_sel_end_offset"] = serde_json::json!(eo);
+                                }
+                                if let Some(ref sel) = selected_text_clone {
+                                    if !sel.is_empty() {
+                                        parsed_arguments["_sel_text"] = serde_json::Value::String(sel.clone());
+                                    }
+                                }
+                                if let Some(ref cbid) = cursor_block_id_clone {
+                                    parsed_arguments["cursor_block_id"] = serde_json::Value::String(cbid.clone());
+                                }
+                                if let Some(co) = cursor_offset_clone {
+                                    parsed_arguments["cursor_offset"] = serde_json::json!(co);
+                                }
+                            }
+                            merge_editor_snapshot_ipc_for_tool(
+                                &app_handle,
+                                name,
+                                current_file_clone.clone(),
+                                &mut parsed_arguments,
+                            )
+                            .await;
+                        }
                         
                         // 保存解析后的参数，用于后续发送结果事件
                         let parsed_args_for_result = parsed_arguments.clone();
@@ -1020,16 +1640,13 @@ pub async fn ai_chat_stream(
                             let flag = cancel_flag.lock().unwrap();
                             if *flag {
                                 eprintln!("🛑 流结束后的工具调用执行前检测到取消标志，停止处理: tab_id={}", tab_id);
-                                // 发送取消事件
-                                let payload = serde_json::json!({
-                                    "tab_id": tab_id,
-                                    "chunk": "",
-                                    "done": true,
-                                    "error": "用户取消了请求",
-                                });
-                                if let Err(e) = app_handle.emit("ai-chat-stream", payload) {
-                                    eprintln!("发送取消事件失败: {}", e);
-                                }
+                                finalize_stream(&mut stream_ctx, StreamState::Cancelled);
+                                emit_ai_chat_stream_done(
+                                    &app_handle,
+                                    &tab_id,
+                                    &stream_ctx,
+                                    Some("用户取消了请求"),
+                                );
                                 // ⚠️ 关键修复：清理取消通道和标志
                                 {
                                     let mut channels = CANCEL_CHANNELS.lock().unwrap();
@@ -1085,7 +1702,7 @@ pub async fn ai_chat_stream(
                                     }
                                 }
                                 
-                                let tool_result = match tool_result {
+                                let raw_tool_result = match tool_result {
                                     Some(result) => result,
                                     None => {
                                         // 所有重试都失败了
@@ -1096,9 +1713,18 @@ pub async fn ai_chat_stream(
                                             data: None,
                                             error: Some(format!("执行失败（已重试 {} 次）: {}", max_retries, error_msg)),
                                             message: None,
+                                            error_kind: None,
+                                display_error: None,
                                         }
                                     }
                                 };
+                                let skip_continue = !raw_tool_result.success;
+                                let tool_result = with_execution_observability(
+                                    raw_tool_result,
+                                    &name,
+                                    Some(&parsed_args_for_result),
+                                    skip_continue,
+                                );
                                 
                                 if tool_result.success {
                                     eprintln!("✅ 工具执行成功: {}", name);
@@ -1122,6 +1748,7 @@ pub async fn ai_chat_stream(
                                         }
                                         
                                         // 保存工具调用结果，用于后续继续对话
+                                        tool_call_specs.push((id.clone(), name.clone(), arguments.clone()));
                                         tool_results.push((id.clone(), name.clone(), tool_result.clone()));
                                         
                                         // 将工具结果添加到消息中
@@ -1152,6 +1779,7 @@ pub async fn ai_chat_stream(
                                     eprintln!("⚠️ 工具执行失败: {} - {}", name, tool_result.error.as_ref().unwrap_or(&"未知错误".to_string()));
                                     
                                     // 保存工具调用结果，用于后续继续对话
+                                    tool_call_specs.push((id.clone(), name.clone(), arguments.clone()));
                                     tool_results.push((id.clone(), name.clone(), tool_result.clone()));
                                     
                                     // 工具执行失败
@@ -1183,51 +1811,27 @@ pub async fn ai_chat_stream(
                 if has_tool_calls && !tool_results.is_empty() {
                     eprintln!("🔄 检测到工具调用，准备继续对话: 工具调用数量={}", tool_results.len());
                     
-                    // 构建工具调用结果消息
-                    // 将 assistant 的回复（包含工具调用）添加到消息历史
+                    // 将 assistant 的回复（含 tool_calls）写入历史；工具执行结果见后续 role=tool 消息（OpenAI 兼容）
                     let accumulated_text = streaming_handler.get_accumulated(&tab_id);
-                    if !accumulated_text.is_empty() {
-                        current_messages.push(ChatMessage {
+                    let assistant_tool_calls = if !tool_call_specs.is_empty() {
+                        Some(build_openai_tool_calls_json(&tool_call_specs))
+                    } else {
+                        None
+                    };
+                    if !accumulated_text.is_empty() || assistant_tool_calls.is_some() {
+                        push_chat_message_if_allowed(&stream_ctx, &mut current_messages, ChatMessage {
                             role: "assistant".to_string(),
-                            content: accumulated_text.clone(),
+                            content: if assistant_tool_calls.is_some() {
+                                None
+                            } else if accumulated_text.is_empty() {
+                                None
+                            } else {
+                                Some(accumulated_text.clone())
+                            },
+                            tool_call_id: None,
+                            name: None,
+                            tool_calls: assistant_tool_calls,
                         });
-                    }
-                    
-                    // 构建工具调用结果消息
-                    // 优化格式：直接提供工具调用的数据结果，让 AI 能够清晰理解并继续执行
-                    let mut tool_results_content = String::new();
-                    for (_tool_id, tool_name, tool_result) in &tool_results {
-                        if tool_result.success {
-                            if let Some(data) = &tool_result.data {
-                                // 直接提供数据内容，让 AI 能够理解并继续操作
-                                tool_results_content.push_str(&format!(
-                                    "【{}】执行成功，结果数据：\n{}\n\n",
-                                    tool_name, serde_json::to_string_pretty(data).unwrap_or_default()
-                                ));
-                            } else if let Some(message) = &tool_result.message {
-                                tool_results_content.push_str(&format!(
-                                    "【{}】执行成功：{}\n\n",
-                                    tool_name, message
-                                ));
-                            } else {
-                                tool_results_content.push_str(&format!(
-                                    "【{}】执行成功\n\n",
-                                    tool_name
-                                ));
-                            }
-                        } else {
-                            if let Some(error) = &tool_result.error {
-                                tool_results_content.push_str(&format!(
-                                    "【{}】执行失败：{}\n\n",
-                                    tool_name, error
-                                ));
-                            } else {
-                                tool_results_content.push_str(&format!(
-                                    "【{}】执行失败\n\n",
-                                    tool_name
-                                ));
-                            }
-                        }
                     }
                     
                     // 分析任务完成度，生成任务进度提示
@@ -1243,7 +1847,11 @@ pub async fn ai_chat_stream(
                     
                     // 添加工具调用结果到消息历史
                     // 格式：清晰简洁，直接提供结果数据，明确指导 AI 继续执行
-                    let continue_instruction = if check_folders_incomplete {
+                    let is_doc_edit_task = task_progress_info.task_type == crate::services::task_progress_analyzer::TaskType::DocumentEdit
+                        || task_progress_info.task_type == crate::services::task_progress_analyzer::TaskType::MultiDocumentEdit;
+                    let continue_instruction = if is_doc_edit_task {
+                        "The edit has been applied to the document. Review the result and determine if the task is complete. If further edits are needed, call edit_current_editor_document again. Otherwise, provide a concise summary of what was changed.".to_string()
+                    } else if check_folders_incomplete {
                         // 检查所有文件夹任务未完成，强制要求继续调用list_files工具
                         format!(
                             "{}\n\n任务未完成，必须继续执行：\n\n重要指令：\n1. 必须立即调用 list_files 工具检查所有剩余的文件夹\n2. 不要只回复文本说明，必须调用工具\n3. 不要停止，不要结束回复\n4. 必须检查完所有文件夹才能结束\n5. 立即执行：现在就开始调用 list_files 工具检查下一个文件夹\n\n执行要求：必须调用工具继续检查，不要只回复文本。",
@@ -1266,7 +1874,7 @@ pub async fn ai_chat_stream(
                         let last_user_message = messages.iter().rev().find(|m| m.role == "user");
                         let user_asks_for_summary = last_user_message
                             .map(|m| {
-                                let content_lower = m.content.to_lowercase();
+                                let content_lower = m.text().to_lowercase();
                                 content_lower.contains("写了什么") || 
                                 content_lower.contains("内容是什么") || 
                                 content_lower.contains("内容") && (content_lower.contains("总结") || content_lower.contains("概述") || content_lower.contains("介绍")) ||
@@ -1286,7 +1894,7 @@ pub async fn ai_chat_stream(
                         let last_user_message = messages.iter().rev().find(|m| m.role == "user");
                         let user_asks_to_check_or_list_files = last_user_message
                             .map(|m| {
-                                let content_lower = m.content.to_lowercase();
+                                let content_lower = m.text().to_lowercase();
                                 content_lower.contains("检查") && (content_lower.contains("文件") || content_lower.contains("文件夹")) ||
                                 content_lower.contains("列出") && (content_lower.contains("文件") || content_lower.contains("文件夹")) ||
                                 content_lower.contains("查看") && (content_lower.contains("文件") || content_lower.contains("文件夹")) ||
@@ -1300,7 +1908,7 @@ pub async fn ai_chat_stream(
                         // 检查用户是否要求检查"每一个"文件夹
                         let user_asks_check_every_folder = last_user_message
                             .map(|m| {
-                                let content_lower = m.content.to_lowercase();
+                                let content_lower = m.text().to_lowercase();
                                 content_lower.contains("每一个") && (content_lower.contains("文件夹") || content_lower.contains("文件")) ||
                                 content_lower.contains("每个") && (content_lower.contains("文件夹") || content_lower.contains("文件"))
                             })
@@ -1325,28 +1933,46 @@ pub async fn ai_chat_stream(
                         "请基于以上结果继续执行用户的任务。如果任务还未完成，请继续调用相应的工具完成剩余步骤。".to_string()
                     };
                     
-                    // 如果有任务进度提示，添加到消息中
-                    let final_content = if !task_progress.is_empty() {
-                        format!("工具调用执行完成，结果如下：\n\n{}{}\n\n{}", tool_results_content, task_progress, continue_instruction)
-                    } else {
-                        format!("工具调用执行完成，结果如下：\n\n{}{}", tool_results_content, continue_instruction)
-                    };
-                    
                     // 如果任务未完成，添加调试日志
                     if task_incomplete {
                         eprintln!("⚠️ 任务未完成，强制要求 AI 继续：{}", task_progress);
                     }
-                    
-                    current_messages.push(ChatMessage {
+
+                    // 每条工具结果一条 role=tool；随后单独一条 user 承载 [NEXT_ACTION]（不再拼接 [TOOL_RESULTS]）
+                    let followup_user_content = if !task_progress.is_empty() {
+                        format!(
+                            "[NEXT_ACTION]\n\n[TASK_STATUS]\n{}\n\n{}",
+                            task_progress, continue_instruction
+                        )
+                    } else {
+                        format!("[NEXT_ACTION]\n{}", continue_instruction)
+                    };
+                    for (tool_id, tool_name, tool_result) in &tool_results {
+                        let mut tool_content = format_single_tool_result_content(tool_name, tool_result);
+                        if tool_name == "create_folder" && tool_result.success {
+                            tool_content.push_str("\n\n下一步操作：文件夹已创建，现在必须立即调用 move_file 工具移动文件到这个文件夹。不要停止，不要创建更多文件夹，必须开始移动文件。");
+                        }
+                        push_chat_message_if_allowed(&stream_ctx, &mut current_messages, ChatMessage {
+                            role: "tool".to_string(),
+                            content: Some(tool_content),
+                            tool_call_id: Some(tool_id.clone()),
+                            name: None,
+                            tool_calls: None,
+                        });
+                    }
+                    push_chat_message_if_allowed(&stream_ctx, &mut current_messages, ChatMessage {
                         role: "user".to_string(),
-                        content: final_content,
+                        content: Some(followup_user_content),
+                        tool_call_id: None,
+                        name: None,
+                        tool_calls: None,
                     });
-                    
+
                     eprintln!("📝 构建新的消息列表，消息数量: {}", current_messages.len());
                     
                     // 估算消息历史长度，如果过长则截断（防止Token超限）
                     // 简单估算：1 token ≈ 4 字符，保留约80%的token预算给响应
-                    let total_chars: usize = current_messages.iter().map(|m| m.content.len()).sum();
+                    let total_chars: usize = current_messages.iter().map(|m| m.text().len()).sum();
                     let estimated_tokens = total_chars / 4;
                     let max_context_tokens = (model_config_clone.max_tokens * 10).min(30000); // 假设上下文窗口为32K，保留一些给响应
                     
@@ -1354,12 +1980,7 @@ pub async fn ai_chat_stream(
                         eprintln!("⚠️ 消息历史过长（估算 {} tokens），截断以预防Token超限", estimated_tokens);
                         // 保留系统消息（第一条）和最后10条消息
                         if current_messages.len() > 11 {
-                            let system_msg = current_messages.remove(0);
-                            let recent_count = 10.min(current_messages.len());
-                            let recent_msgs: Vec<ChatMessage> = current_messages.drain(current_messages.len().saturating_sub(recent_count)..).collect();
-                            current_messages.clear();
-                            current_messages.push(system_msg);
-                            current_messages.extend(recent_msgs);
+                            ContextManager::default().truncate_with_strategy(&mut current_messages, TruncationStrategy::KeepRecent(10));
                             eprintln!("📝 截断后消息数量: {}", current_messages.len());
                         }
                     }
@@ -1378,16 +1999,13 @@ pub async fn ai_chat_stream(
                         
                         if should_cancel {
                             eprintln!("🛑 继续对话前检测到取消标志，停止处理: tab_id={}", tab_id);
-                            // 发送取消事件
-                            let payload = serde_json::json!({
-                                "tab_id": tab_id,
-                                "chunk": "",
-                                "done": true,
-                                "error": "用户取消了请求",
-                            });
-                            if let Err(e) = app_handle.emit("ai-chat-stream", payload) {
-                                eprintln!("发送取消事件失败: {}", e);
-                            }
+                            finalize_stream(&mut stream_ctx, StreamState::Cancelled);
+                            emit_ai_chat_stream_done(
+                                &app_handle,
+                                &tab_id,
+                                &stream_ctx,
+                                Some("用户取消了请求"),
+                            );
                             // ⚠️ 关键修复：清理取消通道和标志
                             {
                                 let mut channels = CANCEL_CHANNELS.lock().unwrap();
@@ -1439,6 +2057,7 @@ pub async fn ai_chat_stream(
                             }
                         }
                         
+                        begin_next_stream_round(&mut stream_ctx);
                         match provider_clone.chat_stream(&current_messages, &model_config_clone, &mut new_cancel_rx, tool_definitions_clone.as_deref()).await {
                         Ok(mut new_stream) => {
                             break Ok(new_stream);
@@ -1454,12 +2073,7 @@ pub async fn ai_chat_stream(
                                     eprintln!("⚠️ Token超限，尝试截断消息历史（第 {} 次重试）", retry_count);
                                     // 更激进的截断：只保留系统消息和最后5条消息
                                     if current_messages.len() > 6 {
-                                        let system_msg = current_messages.remove(0);
-                                        let recent_count = 5.min(current_messages.len());
-                                        let recent_msgs: Vec<ChatMessage> = current_messages.drain(current_messages.len().saturating_sub(recent_count)..).collect();
-                                        current_messages.clear();
-                                        current_messages.push(system_msg);
-                                        current_messages.extend(recent_msgs);
+                                        ContextManager::default().truncate_with_strategy(&mut current_messages, TruncationStrategy::KeepRecent(5));
                                         eprintln!("📝 截断后消息数量: {}", current_messages.len());
                                     }
                                     // ⚠️ 关键修复：重新创建cancel channel并注册
@@ -1491,6 +2105,7 @@ pub async fn ai_chat_stream(
                             // 继续处理新的流式响应（支持多轮工具调用）
                             let mut continue_loop = true;
                             let mut new_tool_results: Vec<(String, String, crate::services::tool_service::ToolResult)> = Vec::new();
+                            let mut new_tool_call_specs: Vec<(String, String, String)> = Vec::new();
                             // 使用新的流式响应处理器
                             let mut new_streaming_handler = StreamingResponseHandler::new();
                             
@@ -1506,7 +2121,11 @@ pub async fn ai_chat_stream(
                             let mut force_continue_count = 0; // 强制继续的次数
                             const MAX_FORCE_CONTINUE_RETRIES: usize = 5; // 最大强制继续重试次数
                             let mut last_force_continue_content: Option<String> = None; // 上次强制继续时的回复内容
-                            
+
+                            // 工具调用轮次限制（防止无限工具链）
+                            let mut tool_round_count = 0usize;
+                            const MAX_TOOL_ROUNDS: usize = 10;
+
                             while continue_loop {
                                 continue_loop = false; // 默认不继续循环，除非有工具调用
                                 
@@ -1539,16 +2158,13 @@ pub async fn ai_chat_stream(
                                         _ = continue_cancel_check => {
                                             // 取消信号已触发
                                             eprintln!("🛑 继续对话中通过 select! 检测到取消标志，停止处理: tab_id={}", tab_id);
-                                            // 发送取消事件
-                                            let payload = serde_json::json!({
-                                                "tab_id": tab_id,
-                                                "chunk": "",
-                                                "done": true,
-                                                "error": "用户取消了请求",
-                                            });
-                                            if let Err(e) = app_handle.emit("ai-chat-stream", payload) {
-                                                eprintln!("发送取消事件失败: {}", e);
-                                            }
+                                            finalize_stream(&mut stream_ctx, StreamState::Cancelled);
+                                            emit_ai_chat_stream_done(
+                                                &app_handle,
+                                                &tab_id,
+                                                &stream_ctx,
+                                                Some("用户取消了请求"),
+                                            );
                                             // ⚠️ 关键修复：清理取消通道和标志
                                             {
                                                 let mut channels = CANCEL_CHANNELS.lock().unwrap();
@@ -1589,6 +2205,7 @@ pub async fn ai_chat_stream(
                                                     if !is_complete {
                                                         continue;
                                                     }
+                                                    let arguments_for_api_continue = arguments.clone();
                                                     
                                                     eprintln!("🔧 继续对话中检测到工具调用: id={}, name={}", id, name);
                                                     
@@ -1597,8 +2214,19 @@ pub async fn ai_chat_stream(
                                                     
                                                     // ⚠️ 文档编辑功能：如果是 edit_current_editor_document，自动增强参数
                                                     if name == "edit_current_editor_document" {
-                                                        // 在继续对话中，从保存的原始参数中获取编辑器信息
-                                                        if let serde_json::Value::Object(ref mut map) = parsed_arguments {
+                                                        sanitize_edit_current_editor_document_arguments(&mut parsed_arguments);
+                                                        let skip = should_skip_edit_current_editor_injection(
+                                                            &primary_edit_target_clone,
+                                                            &current_file_clone,
+                                                            &workspace_path,
+                                                        );
+                                                        if skip {
+                                                            eprintln!(
+                                                                "📝 [继续对话] 跳过 edit_current_editor_document 自动注入: primary_edit_target={:?}",
+                                                                primary_edit_target_clone
+                                                            );
+                                                        } else if let serde_json::Value::Object(ref mut map) = parsed_arguments {
+                                                            // 在继续对话中，从保存的原始参数中获取编辑器信息
                                                             // 自动添加 current_file 和 current_content 参数（如果缺少）
                                                             if !map.contains_key("current_file") {
                                                                 if let Some(ref file_path) = current_file_clone {
@@ -1612,16 +2240,56 @@ pub async fn ai_chat_stream(
                                                                     eprintln!("📝 [继续对话] 已添加 current_content (长度: {})", content.len());
                                                                 }
                                                             }
-                                                            if !map.contains_key("edit_target") && edit_target_clone.is_some() {
-                                                                map.insert("edit_target".to_string(), edit_target_clone.clone().unwrap());
-                                                                eprintln!("📝 [继续对话] 已添加 edit_target (精确定位)");
+                                                            if !map.contains_key("document_revision") {
+                                                                if let Some(rev) = document_revision_clone {
+                                                                    map.insert("document_revision".to_string(), serde_json::json!(rev));
+                                                                    eprintln!("📝 [继续对话] 已添加 document_revision: {}", rev);
+                                                                }
                                                             }
-                                                            if !map.contains_key("target_content") && !map.contains_key("edit_target") {
+                                                            if !map.contains_key("baseline_id") {
+                                                                if let Some(ref bid) = baseline_id_clone {
+                                                                    map.insert("baseline_id".to_string(), serde_json::Value::String(bid.clone()));
+                                                                    eprintln!("📝 [继续对话] 已添加 baseline_id: {}", bid);
+                                                                }
+                                                            }
+                                                            // 旧的 edit_target / target_content 自动补参与继续对话兼容已禁用。
+                                                            // 新路径仅保留 _sel_* 零搜索坐标与 block_index + edit_mode。
+                                                            // §7.1：注入选区坐标（零搜索路径，供 Resolver 使用）
+                                                            if !map.contains_key("_sel_start_block_id") {
+                                                                if let Some(ref sbid) = selection_start_block_id_clone {
+                                                                    map.insert("_sel_start_block_id".to_string(), serde_json::Value::String(sbid.clone()));
+                                                                }
+                                                            }
+                                                            if !map.contains_key("_sel_start_offset") {
+                                                                if let Some(so) = selection_start_offset_clone {
+                                                                    map.insert("_sel_start_offset".to_string(), serde_json::json!(so));
+                                                                }
+                                                            }
+                                                            if !map.contains_key("_sel_end_block_id") {
+                                                                if let Some(ref ebid) = selection_end_block_id_clone {
+                                                                    map.insert("_sel_end_block_id".to_string(), serde_json::Value::String(ebid.clone()));
+                                                                }
+                                                            }
+                                                            if !map.contains_key("_sel_end_offset") {
+                                                                if let Some(eo) = selection_end_offset_clone {
+                                                                    map.insert("_sel_end_offset".to_string(), serde_json::json!(eo));
+                                                                }
+                                                            }
+                                                            if !map.contains_key("_sel_text") {
                                                                 if let Some(ref sel) = selected_text_clone {
-                                                                    if !sel.trim().is_empty() {
-                                                                        map.insert("target_content".to_string(), serde_json::Value::String(sel.trim().to_string()));
-                                                                        eprintln!("📝 [继续对话] 已添加 target_content 来自选中文本 (长度: {})", sel.trim().len());
+                                                                    if !sel.is_empty() {
+                                                                        map.insert("_sel_text".to_string(), serde_json::Value::String(sel.clone()));
                                                                     }
+                                                                }
+                                                            }
+                                                            if !map.contains_key("cursor_block_id") {
+                                                                if let Some(ref cbid) = cursor_block_id_clone {
+                                                                    map.insert("cursor_block_id".to_string(), serde_json::Value::String(cbid.clone()));
+                                                                }
+                                                            }
+                                                            if !map.contains_key("cursor_offset") {
+                                                                if let Some(co) = cursor_offset_clone {
+                                                                    map.insert("cursor_offset".to_string(), serde_json::json!(co));
                                                                 }
                                                             }
                                                             if map.contains_key("current_file") && map.contains_key("current_content") {
@@ -1630,6 +2298,13 @@ pub async fn ai_chat_stream(
                                                                 eprintln!("⚠️ [继续对话] edit_current_editor_document 仍然缺少参数");
                                                             }
                                                         }
+                                                        merge_editor_snapshot_ipc_for_tool(
+                                                            &app_handle,
+                                                            &name,
+                                                            current_file_clone.clone(),
+                                                            &mut parsed_arguments,
+                                                        )
+                                                        .await;
                                                     }
                                                     
                                                     // 保存解析后的参数，用于后续发送结果事件
@@ -1663,16 +2338,13 @@ pub async fn ai_chat_stream(
                                                         let flag = continue_cancel_flag_for_stream.lock().unwrap();
                                                         if *flag {
                                                             eprintln!("🛑 继续对话中工具调用执行前检测到取消标志，停止执行: tab_id={}", tab_id);
-                                                            // 发送取消事件
-                                                            let payload = serde_json::json!({
-                                                                "tab_id": tab_id,
-                                                                "chunk": "",
-                                                                "done": true,
-                                                                "error": "用户取消了请求",
-                                                            });
-                                                            if let Err(e) = app_handle.emit("ai-chat-stream", payload) {
-                                                                eprintln!("发送取消事件失败: {}", e);
-                                                            }
+                                                            finalize_stream(&mut stream_ctx, StreamState::Cancelled);
+                                                            emit_ai_chat_stream_done(
+                                                                &app_handle,
+                                                                &tab_id,
+                                                                &stream_ctx,
+                                                                Some("用户取消了请求"),
+                                                            );
                                                             // ⚠️ 关键修复：清理取消通道和标志
                                                             {
                                                                 let mut channels = CANCEL_CHANNELS.lock().unwrap();
@@ -1722,7 +2394,7 @@ pub async fn ai_chat_stream(
                                                         }
                                                     }
                                                     
-                                                    let tool_result = match tool_result {
+                                                    let raw_tool_result = match tool_result {
                                                         Some(result) => result,
                                                         None => {
                                                             // 所有重试都失败了
@@ -1733,25 +2405,31 @@ pub async fn ai_chat_stream(
                                                                 data: None,
                                                                 error: Some(format!("执行失败（已重试 {} 次）: {}", max_retries, error_msg)),
                                                                 message: None,
+                                                                error_kind: None,
+                                display_error: None,
                                                             }
                                                         }
                                                     };
+                                                    let skip_continue = !raw_tool_result.success;
+                                                    let tool_result = with_execution_observability(
+                                                        raw_tool_result,
+                                                        &name,
+                                                        Some(&parsed_args_for_result_continue),
+                                                        skip_continue,
+                                                    );
                                                     
                                                     // ⚠️ 关键修复：在继续对话的工具调用执行后检查取消标志
                                                     {
                                                         let flag = continue_cancel_flag_for_stream.lock().unwrap();
                                                         if *flag {
                                                             eprintln!("🛑 继续对话中工具调用执行后检测到取消标志，停止处理: tab_id={}", tab_id);
-                                                            // 发送取消事件
-                                                            let payload = serde_json::json!({
-                                                                "tab_id": tab_id,
-                                                                "chunk": "",
-                                                                "done": true,
-                                                                "error": "用户取消了请求",
-                                                            });
-                                                            if let Err(e) = app_handle.emit("ai-chat-stream", payload) {
-                                                                eprintln!("发送取消事件失败: {}", e);
-                                                            }
+                                                            finalize_stream(&mut stream_ctx, StreamState::Cancelled);
+                                                            emit_ai_chat_stream_done(
+                                                                &app_handle,
+                                                                &tab_id,
+                                                                &stream_ctx,
+                                                                Some("用户取消了请求"),
+                                                            );
                                                             // ⚠️ 关键修复：清理取消通道和标志
                                                             {
                                                                 let mut channels = CANCEL_CHANNELS.lock().unwrap();
@@ -1769,6 +2447,7 @@ pub async fn ai_chat_stream(
                                                         eprintln!("✅ 继续对话中工具执行成功: {}", name);
                                                             
                                                             // 保存工具调用结果
+                                                            new_tool_call_specs.push((id.clone(), name.clone(), arguments_for_api_continue.clone()));
                                                             new_tool_results.push((id.clone(), name.clone(), tool_result.clone()));
                                                             
                                                             // 立即更新累积结果，用于任务进度分析
@@ -1802,17 +2481,11 @@ pub async fn ai_chat_stream(
                                                     } else {
                                                         // 工具执行失败（工具层面的失败，如文件不存在）
                                                         eprintln!("⚠️ 继续对话中工具执行失败: {} - {}", name, tool_result.error.as_ref().unwrap_or(&"未知错误".to_string()));
-                                                        
-                                                        let error_result = crate::services::tool_service::ToolResult {
-                                                            success: false,
-                                                            data: None,
-                                                            error: tool_result.error.clone(),
-                                                            message: None,
-                                                        };
-                                                        new_tool_results.push((id.clone(), name.clone(), error_result.clone()));
+                                                        new_tool_call_specs.push((id.clone(), name.clone(), arguments_for_api_continue.clone()));
+                                                        new_tool_results.push((id.clone(), name.clone(), tool_result.clone()));
                                                         
                                                         // 立即更新累积结果
-                                                        all_tool_results.push((id.clone(), name.clone(), error_result));
+                                                        all_tool_results.push((id.clone(), name.clone(), tool_result.clone()));
                                                         
                                                         let error_message = format!(
                                                             "\n\n[工具调用失败: {}]\n错误: {}",
@@ -1859,6 +2532,14 @@ pub async fn ai_chat_stream(
                                         }
                                     }
                                 }
+
+                                // 继续对话子流：本轮 new_stream 读取结束（非取消路径下收口为 Completed，允许后续 assistant 写入）
+                                {
+                                    let cancelled = *continue_cancel_flag_for_stream.lock().unwrap();
+                                    if !cancelled && stream_ctx.state == StreamState::Streaming {
+                                        finalize_stream(&mut stream_ctx, StreamState::Completed);
+                                    }
+                                }
                                 
                                 // 如果流正常结束且没有工具调用，但有文本内容，需要保存到消息历史
                                 // 但是，如果任务未完成，必须强制继续
@@ -1875,7 +2556,7 @@ pub async fn ai_chat_stream(
                                     // 检查用户是否要求递归检查所有文件（使用 TaskProgressAnalyzer 的辅助方法）
                                     let last_user_message = current_messages.iter().rev().find(|m| m.role == "user");
                                     let user_asks_for_all_files_recursive = last_user_message
-                                        .map(|m| TaskProgressAnalyzer::user_asks_for_recursive_check(&m.content))
+                                        .map(|m| TaskProgressAnalyzer::user_asks_for_recursive_check(m.text()))
                                         .unwrap_or(false);
                                     
                                     // 如果用户要求递归检查，使用 TaskProgressAnalyzer 的结果判断是否完成
@@ -1979,9 +2660,12 @@ pub async fn ai_chat_stream(
                                                 
                                                 // 将 assistant 的回复添加到消息历史
                                                 if !new_accumulated_text_clone.is_empty() {
-                                                    current_messages.push(ChatMessage {
+                                                    push_chat_message_if_allowed(&stream_ctx, &mut current_messages, ChatMessage {
                                                         role: "assistant".to_string(),
-                                                        content: new_accumulated_text_clone.clone(),
+                                                        content: Some(new_accumulated_text_clone.clone()),
+                                                        tool_call_id: None,
+                                                        name: None,
+                                                        tool_calls: None,
                                                     });
                                                 }
                                             }
@@ -1995,7 +2679,11 @@ pub async fn ai_chat_stream(
                                     if task_incomplete && continue_loop {
                                         
                                         // 根据任务类型生成不同的强制继续提示
-                                        let force_continue_message = if recursive_check_incomplete {
+                                        let is_doc_edit_force = task_progress_info.task_type == crate::services::task_progress_analyzer::TaskType::DocumentEdit
+                                            || task_progress_info.task_type == crate::services::task_progress_analyzer::TaskType::MultiDocumentEdit;
+                                        let force_continue_message = if is_doc_edit_force {
+                                            "The document edit is in progress. If more changes are needed, call edit_current_editor_document again. Otherwise, reply with a summary of what was changed.".to_string()
+                                        } else if recursive_check_incomplete {
                                             // 递归检查任务未完成
                                             format!(
                                                 "{}\n\n任务未完成警告：你还没有完成对所有文件夹的检查。\n\n重要指令：\n1. 必须使用 list_files 工具检查所有子文件夹\n2. 不要停止，不要结束回复\n3. 必须检查完所有文件夹才能结束\n4. 立即调用 list_files 工具检查剩余的文件夹\n\n执行要求：必须调用工具继续检查，不要只回复文本。",
@@ -2008,10 +2696,13 @@ pub async fn ai_chat_stream(
                                                 task_progress
                                             )
                                         };
-                                        
-                                        current_messages.push(ChatMessage {
+
+                                        push_chat_message_if_allowed(&stream_ctx, &mut current_messages, ChatMessage {
                                             role: "user".to_string(),
-                                            content: force_continue_message,
+                                            content: Some(format!("[NEXT_ACTION]\n{}", force_continue_message)),
+                                            tool_call_id: None,
+                                            name: None,
+                                            tool_calls: None,
                                         });
                                         
                                         // 清空文本，准备下一轮
@@ -2029,6 +2720,7 @@ pub async fn ai_chat_stream(
                                         let mut force_retry_count = 0;
                                         let max_force_retries = 2;
                                         let mut force_stream_result = loop {
+                                            begin_next_stream_round(&mut stream_ctx);
                                             match provider_clone.chat_stream(&current_messages, &model_config_clone, &mut force_continue_cancel_rx, tool_definitions_clone.as_deref()).await {
                                                 Ok(force_stream) => {
                                                     break Ok(force_stream);
@@ -2044,12 +2736,7 @@ pub async fn ai_chat_stream(
                                                             eprintln!("⚠️ Token超限，尝试截断消息历史（第 {} 次重试）", force_retry_count);
                                                             // 更激进的截断：只保留系统消息和最后5条消息
                                                             if current_messages.len() > 6 {
-                                                                let system_msg = current_messages.remove(0);
-                                                                let recent_count = 5.min(current_messages.len());
-                                                                let recent_msgs: Vec<ChatMessage> = current_messages.drain(current_messages.len().saturating_sub(recent_count)..).collect();
-                                                                current_messages.clear();
-                                                                current_messages.push(system_msg);
-                                                                current_messages.extend(recent_msgs);
+                                                                ContextManager::default().truncate_with_strategy(&mut current_messages, TruncationStrategy::KeepRecent(5));
                                                                 eprintln!("📝 截断后消息数量: {}", current_messages.len());
                                                             }
                                                             // ⚠️ 关键修复：重新创建cancel channel并注册
@@ -2093,7 +2780,7 @@ pub async fn ai_chat_stream(
                                         let last_user_message = current_messages.iter().rev().find(|m| m.role == "user");
                                         let user_asks_for_summary = last_user_message
                                             .map(|m| {
-                                                let content_lower = m.content.to_lowercase();
+                                                let content_lower = m.text().to_lowercase();
                                                 content_lower.contains("写了什么") || 
                                                 content_lower.contains("内容是什么") || 
                                                 (content_lower.contains("内容") && (content_lower.contains("总结") || content_lower.contains("概述") || content_lower.contains("介绍"))) ||
@@ -2121,12 +2808,15 @@ pub async fn ai_chat_stream(
                                             
                                             // 将 assistant 的回复添加到消息历史
                                             if !new_accumulated_text_clone.is_empty() {
-                                                current_messages.push(ChatMessage {
+                                                push_chat_message_if_allowed(&stream_ctx, &mut current_messages, ChatMessage {
                                                     role: "assistant".to_string(),
-                                                    content: new_accumulated_text_clone.clone(),
+                                                    content: Some(new_accumulated_text_clone.clone()),
+                                                    tool_call_id: None,
+                                                    name: None,
+                                                    tool_calls: None,
                                                 });
                                             }
-                                            
+
                                             // 添加总结要求
                                             let summary_request = if needs_summary_for_read {
                                                 // 用户要求总结文件内容
@@ -2138,10 +2828,13 @@ pub async fn ai_chat_stream(
                                                     task_progress
                                                 )
                                             };
-                                            
-                                            current_messages.push(ChatMessage {
+
+                                            push_chat_message_if_allowed(&stream_ctx, &mut current_messages, ChatMessage {
                                                 role: "user".to_string(),
-                                                content: summary_request,
+                                                content: Some(format!("[NEXT_ACTION]\n{}", summary_request)),
+                                                tool_call_id: None,
+                                                name: None,
+                                                tool_calls: None,
                                             });
                                             
                                             // 清空文本，准备下一轮
@@ -2152,16 +2845,13 @@ pub async fn ai_chat_stream(
                                                 let flag = continue_cancel_flag_for_stream.lock().unwrap();
                                                 if *flag {
                                                     eprintln!("🛑 获取总结前检测到取消标志，停止处理: tab_id={}", tab_id);
-                                                    // 发送取消事件
-                                                    let payload = serde_json::json!({
-                                                        "tab_id": tab_id,
-                                                        "chunk": "",
-                                                        "done": true,
-                                                        "error": "用户取消了请求",
-                                                    });
-                                                    if let Err(e) = app_handle.emit("ai-chat-stream", payload) {
-                                                        eprintln!("发送取消事件失败: {}", e);
-                                                    }
+                                                    finalize_stream(&mut stream_ctx, StreamState::Cancelled);
+                                                    emit_ai_chat_stream_done(
+                                                        &app_handle,
+                                                        &tab_id,
+                                                        &stream_ctx,
+                                                        Some("用户取消了请求"),
+                                                    );
                                                     // ⚠️ 关键修复：清理取消通道和标志
                                                     {
                                                         let mut channels = CANCEL_CHANNELS.lock().unwrap();
@@ -2187,6 +2877,7 @@ pub async fn ai_chat_stream(
                                             let mut summary_retry_count = 0;
                                             let max_summary_retries = 2;
                                             let mut summary_stream_result = loop {
+                                                begin_next_stream_round(&mut stream_ctx);
                                                 match provider_clone.chat_stream(&current_messages, &model_config_clone, &mut summary_cancel_rx, tool_definitions_clone.as_deref()).await {
                                                     Ok(summary_stream) => {
                                                         break Ok(summary_stream);
@@ -2202,12 +2893,7 @@ pub async fn ai_chat_stream(
                                                                 eprintln!("⚠️ Token超限，尝试截断消息历史（第 {} 次重试）", summary_retry_count);
                                                                 // 更激进的截断：只保留系统消息和最后5条消息
                                                                 if current_messages.len() > 6 {
-                                                                    let system_msg = current_messages.remove(0);
-                                                                    let recent_count = 5.min(current_messages.len());
-                                                                    let recent_msgs: Vec<ChatMessage> = current_messages.drain(current_messages.len().saturating_sub(recent_count)..).collect();
-                                                                    current_messages.clear();
-                                                                    current_messages.push(system_msg);
-                                                                    current_messages.extend(recent_msgs);
+                                                                    ContextManager::default().truncate_with_strategy(&mut current_messages, TruncationStrategy::KeepRecent(5));
                                                                     eprintln!("📝 截断后消息数量: {}", current_messages.len());
                                                                 }
                                                                 // ⚠️ 关键修复：重新创建cancel channel并注册
@@ -2335,12 +3021,15 @@ pub async fn ai_chat_stream(
                                                     
                                                     // 将当前不完整的回复添加到消息历史
                                                     if !new_accumulated_text_clone.is_empty() {
-                                                        current_messages.push(ChatMessage {
+                                                        push_chat_message_if_allowed(&stream_ctx, &mut current_messages, ChatMessage {
                                                             role: "assistant".to_string(),
-                                                            content: new_accumulated_text_clone.clone(),
+                                                            content: Some(new_accumulated_text_clone.clone()),
+                                                            tool_call_id: None,
+                                                            name: None,
+                                                            tool_calls: None,
                                                         });
                                                     }
-                                                    
+
                                                     // 请求AI继续完成回复（明确告诉AI需要做什么）
                                                     // 检查是否有工具调用结果需要总结
                                                     let has_tool_results = !all_tool_results.is_empty();
@@ -2349,7 +3038,7 @@ pub async fn ai_chat_stream(
                                                     let last_user_message = current_messages.iter().rev().find(|m| m.role == "user");
                                                     let user_asks_to_check_or_list_files = last_user_message
                                                         .map(|m| {
-                                                            let content_lower = m.content.to_lowercase();
+                                                            let content_lower = m.text().to_lowercase();
                                                             content_lower.contains("检查") && (content_lower.contains("文件") || content_lower.contains("文件夹")) ||
                                                             content_lower.contains("列出") && (content_lower.contains("文件") || content_lower.contains("文件夹")) ||
                                                             content_lower.contains("查看") && (content_lower.contains("文件") || content_lower.contains("文件夹")) ||
@@ -2376,9 +3065,12 @@ pub async fn ai_chat_stream(
                                                         "你的回复似乎不完整，请继续完成你的回答。确保回复完整、清晰，并以适当的标点符号结尾。".to_string()
                                                     };
                                                     
-                                                    current_messages.push(ChatMessage {
+                                                    push_chat_message_if_allowed(&stream_ctx, &mut current_messages, ChatMessage {
                                                         role: "user".to_string(),
-                                                        content: continue_prompt,
+                                                        content: Some(format!("[NEXT_ACTION]\n{}", continue_prompt)),
+                                                        tool_call_id: None,
+                                                        name: None,
+                                                        tool_calls: None,
                                                     });
                                                     
                                                     // 清空文本，准备下一轮
@@ -2393,6 +3085,7 @@ pub async fn ai_chat_stream(
                                                         channels.insert(tab_id.clone(), continue_reply_cancel_tx);
                                                         eprintln!("✅ 继续回复时注册新的取消通道: tab_id={}", tab_id);
                                                     }
+                                                    begin_next_stream_round(&mut stream_ctx);
                                                     match provider_clone.chat_stream(&current_messages, &model_config_clone, &mut continue_reply_cancel_rx, tool_definitions_clone.as_deref()).await {
                                                         Ok(continue_stream) => {
                                                             eprintln!("✅ 成功请求AI继续完成回复");
@@ -2417,7 +3110,7 @@ pub async fn ai_chat_stream(
                                                 let last_user_message = current_messages.iter().rev().find(|m| m.role == "user");
                                                 let user_asks_for_all_files_recursive = last_user_message
                                                     .map(|m| {
-                                                        let content_lower = m.content.to_lowercase();
+                                                        let content_lower = m.text().to_lowercase();
                                                         // 明确要求递归检查的关键词（与流结束检查逻辑保持一致）
                                                         ((content_lower.contains("所有文件") || 
                                                           content_lower.contains("所有文件夹") || 
@@ -2527,19 +3220,27 @@ pub async fn ai_chat_stream(
                                                         
                                                         // 将当前回复添加到消息历史
                                                         if !new_accumulated_text_clone.is_empty() {
-                                                            current_messages.push(ChatMessage {
+                                                            push_chat_message_if_allowed(&stream_ctx, &mut current_messages, ChatMessage {
                                                                 role: "assistant".to_string(),
-                                                                content: new_accumulated_text_clone.clone(),
+                                                                content: Some(new_accumulated_text_clone.clone()),
+                                                                tool_call_id: None,
+                                                                name: None,
+                                                                tool_calls: None,
                                                             });
                                                         }
-                                                        
+
                                                         // 明确提示AI需要继续检查所有子文件夹
-                                                        current_messages.push(ChatMessage {
+                                                        push_chat_message_if_allowed(&stream_ctx, &mut current_messages, ChatMessage {
                                                             role: "user".to_string(),
-                                                            content: format!(
+                                                            content: Some(format!(
+                                                                "[NEXT_ACTION]\n\n{}",
+                                                                format!(
                                                                 "任务未完成警告：你还没有检查完所有子文件夹。\n\n根目录下有 {} 个文件夹，但你只检查了部分文件夹。\n\n重要指令：\n1. 必须使用 list_files 工具检查剩余的每个子文件夹\n2. 不要停止，不要结束回复\n3. 必须检查完所有文件夹才能结束\n4. 立即调用 list_files 工具检查剩余的文件夹\n\n执行要求：必须调用工具继续检查，不要只回复文本。",
                                                                 root_dirs
-                                                            ),
+                                                            ))),
+                                                            tool_call_id: None,
+                                                            name: None,
+                                                            tool_calls: None,
                                                         });
                                                         
                                                         // 清空文本，准备下一轮
@@ -2548,6 +3249,7 @@ pub async fn ai_chat_stream(
                                                         // 重新调用 chat_stream 继续完成
                                                         eprintln!("🔄 请求AI继续完成所有子文件夹的检查");
                                                         let (_, mut continue_check_cancel_rx) = tokio::sync::oneshot::channel();
+                                                        begin_next_stream_round(&mut stream_ctx);
                                                         match provider_clone.chat_stream(&current_messages, &model_config_clone, &mut continue_check_cancel_rx, tool_definitions_clone.as_deref()).await {
                                                             Ok(continue_stream) => {
                                                                 eprintln!("✅ 成功请求AI继续完成文件检查");
@@ -2565,9 +3267,12 @@ pub async fn ai_chat_stream(
                                                     } else {
                                                         // 无法获取根目录信息，正常保存
                                                         eprintln!("📝 流正常结束，保存 assistant 回复到消息历史（长度={}，完整={}）", new_accumulated_text_clone.len(), reply_complete);
-                                                        current_messages.push(ChatMessage {
+                                                        push_chat_message_if_allowed(&stream_ctx, &mut current_messages, ChatMessage {
                                                             role: "assistant".to_string(),
-                                                            content: new_accumulated_text_clone.clone(),
+                                                            content: Some(new_accumulated_text_clone.clone()),
+                                                            tool_call_id: None,
+                                                            name: None,
+                                                            tool_calls: None,
                                                         });
                                                     }
                                                 } else {
@@ -2575,7 +3280,7 @@ pub async fn ai_chat_stream(
                                                     let last_user_message = current_messages.iter().rev().find(|m| m.role == "user");
                                                     let user_asks_to_check_or_list_files = last_user_message
                                                         .map(|m| {
-                                                            let content_lower = m.content.to_lowercase();
+                                                            let content_lower = m.text().to_lowercase();
                                                             content_lower.contains("检查") && (content_lower.contains("文件") || content_lower.contains("文件夹")) ||
                                                             content_lower.contains("列出") && (content_lower.contains("文件") || content_lower.contains("文件夹")) ||
                                                             content_lower.contains("查看") && (content_lower.contains("文件") || content_lower.contains("文件夹")) ||
@@ -2617,18 +3322,25 @@ pub async fn ai_chat_stream(
                                                         
                                                         // 将当前回复添加到消息历史
                                                         if !new_accumulated_text_clone.is_empty() {
-                                                            current_messages.push(ChatMessage {
+                                                            push_chat_message_if_allowed(&stream_ctx, &mut current_messages, ChatMessage {
                                                                 role: "assistant".to_string(),
-                                                                content: new_accumulated_text_clone.clone(),
+                                                                content: Some(new_accumulated_text_clone.clone()),
+                                                                tool_call_id: None,
+                                                                name: None,
+                                                                tool_calls: None,
                                                             });
                                                         }
-                                                        
+
                                                         // 明确要求AI给出完整的文件列表总结
-                                                        current_messages.push(ChatMessage {
+                                                        push_chat_message_if_allowed(&stream_ctx, &mut current_messages, ChatMessage {
                                                             role: "user".to_string(),
-                                                            content: format!(
+                                                            content: Some(format!(
+                                                                "[NEXT_ACTION]\n\n{}",
                                                                 "重要：你已经调用了 list_files 工具检查了所有文件夹，但你的回复中没有完整列出所有文件。现在必须基于工具调用结果给出完整、详细的文件列表总结。\n\n必须包含的内容：\n1. 完整列出所有检查到的文件：详细列出每个文件夹中的所有文件（包括文件名、路径等）\n2. 按文件夹分类组织：清晰地按文件夹分组展示文件列表\n3. 提供统计信息：总文件数、文件夹数、每个文件夹的文件数等\n4. 使用清晰的格式：使用列表、分类等方式，确保用户能够清楚了解所有文件的情况\n\n重要：不要只给出简短回复，必须完整呈现所有文件信息。基于你调用的 list_files 工具结果，提供一份详细、完整的文件列表总结。"
-                                                            ),
+                                                            )),
+                                                            tool_call_id: None,
+                                                            name: None,
+                                                            tool_calls: None,
                                                         });
                                                         
                                                         // 清空文本，准备下一轮
@@ -2637,6 +3349,7 @@ pub async fn ai_chat_stream(
                                                         // 重新调用 chat_stream 继续完成
                                                         eprintln!("🔄 要求AI给出完整的文件列表总结");
                                                         let (_, mut file_list_cancel_rx) = tokio::sync::oneshot::channel();
+                                                        begin_next_stream_round(&mut stream_ctx);
                                                         match provider_clone.chat_stream(&current_messages, &model_config_clone, &mut file_list_cancel_rx, tool_definitions_clone.as_deref()).await {
                                                             Ok(file_list_stream) => {
                                                                 eprintln!("✅ 成功要求AI给出完整的文件列表总结");
@@ -2654,9 +3367,12 @@ pub async fn ai_chat_stream(
                                                     } else {
                                                         // 正常保存
                                                         eprintln!("📝 流正常结束，保存 assistant 回复到消息历史（长度={}，完整={}）", new_accumulated_text_clone.len(), reply_complete);
-                                                        current_messages.push(ChatMessage {
+                                                        push_chat_message_if_allowed(&stream_ctx, &mut current_messages, ChatMessage {
                                                             role: "assistant".to_string(),
-                                                            content: new_accumulated_text_clone.clone(),
+                                                            content: Some(new_accumulated_text_clone.clone()),
+                                                            tool_call_id: None,
+                                                            name: None,
+                                                            tool_calls: None,
                                                         });
                                                     }
                                                 }
@@ -2667,59 +3383,39 @@ pub async fn ai_chat_stream(
                                 
                                 // 如果有新的工具调用，需要继续对话
                                 if continue_loop && !new_tool_results.is_empty() {
+                                    tool_round_count += 1;
+                                    if tool_round_count > MAX_TOOL_ROUNDS {
+                                        eprintln!("🚫 工具调用轮次超过上限 ({})，终止循环", MAX_TOOL_ROUNDS);
+                                        let _ = app_handle.emit("ai-stream-error", serde_json::json!({
+                                            "tab_id": tab_id,
+                                            "error": format!("工具调用轮次超过上限（{}轮），已自动终止。", MAX_TOOL_ROUNDS)
+                                        }));
+                                        continue_loop = false;
+                                    } else {
                                     eprintln!("🔄 检测到继续对话中的工具调用，准备再次继续对话: 工具调用数量={}", new_tool_results.len());
                                     
-                                    // 将 assistant 的回复添加到消息历史
-                                    if !new_accumulated_text_clone.is_empty() {
-                                        current_messages.push(ChatMessage {
+                                    // 将 assistant 的回复（含 tool_calls）写入消息历史
+                                    let assistant_tool_calls = if !new_tool_call_specs.is_empty() {
+                                        Some(build_openai_tool_calls_json(&new_tool_call_specs))
+                                    } else {
+                                        None
+                                    };
+                                    if !new_accumulated_text_clone.is_empty() || assistant_tool_calls.is_some() {
+                                        push_chat_message_if_allowed(&stream_ctx, &mut current_messages, ChatMessage {
                                             role: "assistant".to_string(),
-                                            content: new_accumulated_text_clone.clone(),
+                                            content: if assistant_tool_calls.is_some() {
+                                                None
+                                            } else if new_accumulated_text_clone.is_empty() {
+                                                None
+                                            } else {
+                                                Some(new_accumulated_text_clone.clone())
+                                            },
+                                            tool_call_id: None,
+                                            name: None,
+                                            tool_calls: assistant_tool_calls,
                                         });
                                     }
-                                    
-                                    // 构建工具调用结果消息
-                                    let mut tool_results_content = String::new();
-                                    for (_tool_id, tool_name, tool_result) in &new_tool_results {
-                                        if tool_result.success {
-                                            if let Some(data) = &tool_result.data {
-                                                tool_results_content.push_str(&format!(
-                                                    "【{}】执行成功，结果数据：\n{}\n\n",
-                                                    tool_name, serde_json::to_string_pretty(data).unwrap_or_default()
-                                                ));
-                                            } else if let Some(message) = &tool_result.message {
-                                                tool_results_content.push_str(&format!(
-                                                    "【{}】执行成功：{}\n\n",
-                                                    tool_name, message
-                                                ));
-                                            } else {
-                                                tool_results_content.push_str(&format!(
-                                                    "【{}】执行成功\n\n",
-                                                    tool_name
-                                                ));
-                                            }
-                                            
-                                            // 为 create_folder 添加明确的下一步操作指导
-                                            if tool_name == "create_folder" {
-                                                tool_results_content.push_str("下一步操作：文件夹已创建，现在必须立即调用 move_file 工具移动文件到这个文件夹。不要停止，不要创建更多文件夹，必须开始移动文件。\n\n");
-                                            }
-                                        } else {
-                                            if let Some(error) = &tool_result.error {
-                                                tool_results_content.push_str(&format!(
-                                                    "【{}】执行失败：{}\n\n",
-                                                    tool_name, error
-                                                ));
-                                            } else {
-                                                tool_results_content.push_str(&format!(
-                                                    "【{}】执行失败\n\n",
-                                                    tool_name
-                                                ));
-                                            }
-                                        }
-                                    }
-                                    
-                                    // 累积所有工具调用结果（注意：all_tool_results 已经在工具调用时更新，这里不需要再次 extend）
-                                    // all_tool_results.extend(new_tool_results.clone()); // 已在上面的工具调用处理中更新
-                                    
+
                                     // 分析任务完成度，生成任务进度提示（使用所有累积的工具调用结果）
                                     let task_progress_info = TaskProgressAnalyzer::analyze(&all_tool_results);
                                     let task_progress = task_progress_info.progress_hint.clone();
@@ -2731,7 +3427,11 @@ pub async fn ai_chat_stream(
                                     let task_completed = task_progress_info.is_completed;
                                     
                                     // 添加工具调用结果到消息历史
-                                    let continue_instruction = if task_incomplete {
+                                    let is_doc_edit_task = task_progress_info.task_type == crate::services::task_progress_analyzer::TaskType::DocumentEdit
+                                        || task_progress_info.task_type == crate::services::task_progress_analyzer::TaskType::MultiDocumentEdit;
+                                    let continue_instruction = if is_doc_edit_task {
+                                        "The edit has been applied to the document. Review the result and determine if the task is complete. If further edits are needed, call edit_current_editor_document again. Otherwise, provide a concise summary of what was changed.".to_string()
+                                    } else if task_incomplete {
                                         // 任务未完成，强制要求继续
                                         format!("{}\n\n重要：任务尚未完成！请立即继续调用 move_file 工具处理剩余文件，不要停止或结束回复。必须处理完所有文件才能结束。", 
                                             // 优先检查 create_folder，明确要求调用 move_file
@@ -2742,7 +3442,7 @@ pub async fn ai_chat_stream(
                                                 let last_user_message = current_messages.iter().rev().find(|m| m.role == "user");
                                                 let user_asks_to_check_or_list_files = last_user_message
                                                     .map(|m| {
-                                                        let content_lower = m.content.to_lowercase();
+                                                        let content_lower = m.text().to_lowercase();
                                                         content_lower.contains("检查") && (content_lower.contains("文件") || content_lower.contains("文件夹")) ||
                                                         content_lower.contains("列出") && (content_lower.contains("文件") || content_lower.contains("文件夹")) ||
                                                         content_lower.contains("查看") && (content_lower.contains("文件") || content_lower.contains("文件夹")) ||
@@ -2776,7 +3476,7 @@ pub async fn ai_chat_stream(
                                         let last_user_message = current_messages.iter().rev().find(|m| m.role == "user");
                                         let user_asks_to_check_or_list_files = last_user_message
                                             .map(|m| {
-                                                let content_lower = m.content.to_lowercase();
+                                                let content_lower = m.text().to_lowercase();
                                                 content_lower.contains("检查") && (content_lower.contains("文件") || content_lower.contains("文件夹")) ||
                                                 content_lower.contains("列出") && (content_lower.contains("文件") || content_lower.contains("文件夹")) ||
                                                 content_lower.contains("查看") && (content_lower.contains("文件") || content_lower.contains("文件夹")) ||
@@ -2799,21 +3499,40 @@ pub async fn ai_chat_stream(
                                         "请基于以上结果继续执行用户的任务。如果任务还未完成，请继续调用相应的工具完成剩余步骤。".to_string()
                                     };
                                     
-                                    // 如果有任务进度提示，添加到消息中
-                                    let final_content = if !task_progress.is_empty() {
-                                        format!("工具调用执行完成，结果如下：\n\n{}{}\n\n{}", tool_results_content, task_progress, continue_instruction)
+                                    // 每条工具结果一条 role=tool；随后单独 user 承载 [NEXT_ACTION]
+                                    let followup_user_content = if !task_progress.is_empty() {
+                                        format!(
+                                            "[NEXT_ACTION]\n\n[TASK_STATUS]\n{}\n\n{}",
+                                            task_progress, continue_instruction
+                                        )
                                     } else {
-                                        format!("工具调用执行完成，结果如下：\n\n{}{}", tool_results_content, continue_instruction)
+                                        format!("[NEXT_ACTION]\n{}", continue_instruction)
                                     };
-                                    
-                                    current_messages.push(ChatMessage {
+                                    for (tool_id, tool_name, tool_result) in &new_tool_results {
+                                        let mut tool_content = format_single_tool_result_content(tool_name, tool_result);
+                                        if tool_name == "create_folder" && tool_result.success {
+                                            tool_content.push_str("\n\n下一步操作：文件夹已创建，现在必须立即调用 move_file 工具移动文件到这个文件夹。不要停止，不要创建更多文件夹，必须开始移动文件。");
+                                        }
+                                        push_chat_message_if_allowed(&stream_ctx, &mut current_messages, ChatMessage {
+                                            role: "tool".to_string(),
+                                            content: Some(tool_content),
+                                            tool_call_id: Some(tool_id.clone()),
+                                            name: None,
+                                            tool_calls: None,
+                                        });
+                                    }
+                                    push_chat_message_if_allowed(&stream_ctx, &mut current_messages, ChatMessage {
                                         role: "user".to_string(),
-                                        content: final_content,
+                                        content: Some(followup_user_content),
+                                        tool_call_id: None,
+                                        name: None,
+                                        tool_calls: None,
                                     });
-                                    
+
                                     // 清空新的工具结果和文本，准备下一轮（但保留累积结果用于任务分析）
                                     let previous_tool_results = new_tool_results.clone();
                                     new_tool_results.clear();
+                                    new_tool_call_specs.clear();
                                     new_streaming_handler.clear_accumulated(&tab_id);
                                     
                                     // 注意：all_tool_results 已经在上面的 extend 中更新，不需要清空
@@ -2838,6 +3557,7 @@ pub async fn ai_chat_stream(
                                     let mut retry_count_inner = 0;
                                     let max_retries_inner = 2;
                                     let mut next_stream_result = loop {
+                                        begin_next_stream_round(&mut stream_ctx);
                                         match provider_clone.chat_stream(&current_messages, &model_config_clone, &mut next_cancel_rx, tool_definitions_clone.as_deref()).await {
                                             Ok(next_stream) => {
                                                 break Ok(next_stream);
@@ -2852,16 +3572,11 @@ pub async fn ai_chat_stream(
                                                         retry_count_inner += 1;
                                                         eprintln!("⚠️ Token超限，尝试截断消息历史（第 {} 次重试）", retry_count_inner);
                                                         // 更激进的截断：只保留系统消息和最后5条消息
-                                                        if current_messages.len() > 6 {
-                                                            let system_msg = current_messages.remove(0);
-                                                            let recent_count = 5.min(current_messages.len());
-                                                            let recent_msgs: Vec<ChatMessage> = current_messages.drain(current_messages.len().saturating_sub(recent_count)..).collect();
-                                                            current_messages.clear();
-                                                            current_messages.push(system_msg);
-                                                            current_messages.extend(recent_msgs);
-                                                            eprintln!("📝 截断后消息数量: {}", current_messages.len());
-                                                        }
-                                                        // 重新创建cancel channel
+                                    if current_messages.len() > 6 {
+                                        ContextManager::default().truncate_with_strategy(&mut current_messages, TruncationStrategy::KeepRecent(5));
+                                        eprintln!("📝 截断后消息数量: {}", current_messages.len());
+                                    }
+                                    // 重新创建cancel channel
                                                         // ⚠️ 关键修复：重新创建cancel channel并注册
                                                         let (next_cancel_tx2, mut next_cancel_rx2) = tokio::sync::oneshot::channel();
                                                         {
@@ -2894,23 +3609,21 @@ pub async fn ai_chat_stream(
                                             continue_loop = false;
                                         }
                                     }
+                                    } // else (tool_round_count <= MAX_TOOL_ROUNDS)
                                 }
-                                
+
                                 // ⚠️ 关键修复：在继续对话循环结束前检查取消标志
                                 {
                                     let flag = continue_cancel_flag_for_stream.lock().unwrap();
                                     if *flag {
                                         eprintln!("🛑 继续对话循环结束前检测到取消标志，停止处理: tab_id={}", tab_id);
-                                        // 发送取消事件
-                                        let payload = serde_json::json!({
-                                            "tab_id": tab_id,
-                                            "chunk": "",
-                                            "done": true,
-                                            "error": "用户取消了请求",
-                                        });
-                                        if let Err(e) = app_handle.emit("ai-chat-stream", payload) {
-                                            eprintln!("发送取消事件失败: {}", e);
-                                        }
+                                        finalize_stream(&mut stream_ctx, StreamState::Cancelled);
+                                        emit_ai_chat_stream_done(
+                                            &app_handle,
+                                            &tab_id,
+                                            &stream_ctx,
+                                            Some("用户取消了请求"),
+                                        );
                                         // ⚠️ 关键修复：清理取消通道和标志
                                         {
                                             let mut channels = CANCEL_CHANNELS.lock().unwrap();
@@ -2934,13 +3647,13 @@ pub async fn ai_chat_stream(
                                         .rev()
                                         .find(|m| m.role == "assistant")
                                         .map(|m| {
-                                            m.content.len() > 50 && (
-                                                m.content.contains("总结") || 
-                                                m.content.contains("完成") ||
-                                                m.content.contains("已处理") ||
-                                                m.content.contains("下一步") ||
-                                                m.content.contains("执行逻辑") ||
-                                                m.content.contains("执行效果")
+                                            m.text().len() > 50 && (
+                                                m.text().contains("总结") || 
+                                                m.text().contains("完成") ||
+                                                m.text().contains("已处理") ||
+                                                m.text().contains("下一步") ||
+                                                m.text().contains("执行逻辑") ||
+                                                m.text().contains("执行效果")
                                             )
                                         })
                                         .unwrap_or(false);
@@ -2954,21 +3667,27 @@ pub async fn ai_chat_stream(
                                         
                                         // 如果当前有文本，先保存
                                         if !new_accumulated_text_clone.is_empty() {
-                                            current_messages.push(ChatMessage {
+                                            push_chat_message_if_allowed(&stream_ctx, &mut current_messages, ChatMessage {
                                                 role: "assistant".to_string(),
-                                                content: new_accumulated_text_clone.clone(),
+                                                content: Some(new_accumulated_text_clone.clone()),
+                                                tool_call_id: None,
+                                                name: None,
+                                                tool_calls: None,
                                             });
                                         }
-                                        
+
                                         // 添加总结要求
                                         let summary_request = format!(
                                             "{}\n\n任务已完成，请进行工作总结：\n\n请检查你的工作，然后提供一份简洁的总结，包括：\n1. 完成的工作：简要说明你完成了哪些操作（如移动了多少文件、创建了哪些文件夹等）\n2. 执行逻辑：简要说明你是如何组织和执行这些操作的\n3. 执行效果：说明任务完成后的结果和状态\n4. 下一步建议：如果有需要用户注意的事项或后续建议，请说明\n\n请用自然语言回复，不要调用工具。",
                                             final_task_progress_info.progress_hint
                                         );
-                                        
-                                        current_messages.push(ChatMessage {
+
+                                        push_chat_message_if_allowed(&stream_ctx, &mut current_messages, ChatMessage {
                                             role: "user".to_string(),
-                                            content: summary_request,
+                                            content: Some(format!("[NEXT_ACTION]\n{}", summary_request)),
+                                            tool_call_id: None,
+                                            name: None,
+                                            tool_calls: None,
                                         });
                                         
                                         // 重新调用 chat_stream 获取总结
@@ -2983,6 +3702,7 @@ pub async fn ai_chat_stream(
                                         let mut final_summary_retry_count = 0;
                                         let max_final_summary_retries = 2;
                                         let mut final_summary_stream_result = loop {
+                                            begin_next_stream_round(&mut stream_ctx);
                                             match provider_clone.chat_stream(&current_messages, &model_config_clone, &mut final_summary_cancel_rx, tool_definitions_clone.as_deref()).await {
                                                 Ok(final_summary_stream) => {
                                                     break Ok(final_summary_stream);
@@ -2997,16 +3717,11 @@ pub async fn ai_chat_stream(
                                                             final_summary_retry_count += 1;
                                                             eprintln!("⚠️ Token超限，尝试截断消息历史（第 {} 次重试）", final_summary_retry_count);
                                                             // 更激进的截断：只保留系统消息和最后5条消息
-                                                            if current_messages.len() > 6 {
-                                                                let system_msg = current_messages.remove(0);
-                                                                let recent_count = 5.min(current_messages.len());
-                                                                let recent_msgs: Vec<ChatMessage> = current_messages.drain(current_messages.len().saturating_sub(recent_count)..).collect();
-                                                                current_messages.clear();
-                                                                current_messages.push(system_msg);
-                                                                current_messages.extend(recent_msgs);
-                                                                eprintln!("📝 截断后消息数量: {}", current_messages.len());
-                                                            }
-                                                            // 重新创建cancel channel
+                                    if current_messages.len() > 6 {
+                                        ContextManager::default().truncate_with_strategy(&mut current_messages, TruncationStrategy::KeepRecent(5));
+                                        eprintln!("📝 截断后消息数量: {}", current_messages.len());
+                                    }
+                                    // 重新创建cancel channel
                                                             // ⚠️ 关键修复：重新创建cancel channel并注册
                                                             let (final_summary_cancel_tx2, mut final_summary_cancel_rx2) = tokio::sync::oneshot::channel();
                                                             {
@@ -3080,32 +3795,21 @@ pub async fn ai_chat_stream(
                     }
                 }
                 
-                // ⚠️ 关键修复：检查是否已取消
-                let was_cancelled = {
-                    let flag = cancel_flag.lock().unwrap();
-                    *flag
-                };
-                
                 // 清理取消通道
                 {
                     let mut channels = CANCEL_CHANNELS.lock().unwrap();
                     channels.remove(&tab_id_clone);
                     eprintln!("🧹 清理取消通道: tab_id={}", tab_id_clone);
                 }
-                
-                // 只有在未取消时才发送完成信号
-                if !was_cancelled {
-                    // 发送完成信号
-                    let payload = serde_json::json!({
-                        "tab_id": tab_id,
-                        "chunk": "",
-                        "done": true,
-                    });
-                    if let Err(e) = app_handle.emit("ai-chat-stream", payload) {
-                        eprintln!("发送事件失败: {}", e);
-                    }
+
+                // 统一收尾：避免「已取消」又发一次 completed 的 done
+                if stream_ctx.state == StreamState::Cancelled {
+                    eprintln!("🛑 流已取消，不再发送完成信号: tab_id={}", tab_id);
                 } else {
-                    eprintln!("🛑 流已取消，不发送完成信号: tab_id={}", tab_id);
+                    if stream_ctx.state == StreamState::Streaming {
+                        finalize_stream(&mut stream_ctx, StreamState::Completed);
+                    }
+                    emit_ai_chat_stream_done(&app_handle, &tab_id, &stream_ctx, None);
                 }
             });
             
@@ -3126,17 +3830,11 @@ pub async fn ai_chat_stream(
             }
             eprintln!("🧹 清理取消通道和标志（chat_stream 失败）: tab_id={}", tab_id);
             
-            // 发送错误事件给前端
+            // 发送错误事件给前端（统一 stream_state）
             let error_message = format!("AI 请求失败: {}", e);
-            let payload = serde_json::json!({
-                "tab_id": tab_id,
-                "chunk": "",
-                "done": true,
-                "error": error_message,
-            });
-            if let Err(emit_err) = app.emit("ai-chat-stream", payload) {
-                eprintln!("发送错误事件失败: {}", emit_err);
-            }
+            let mut stream_ctx_err = StreamContext::default();
+            finalize_stream(&mut stream_ctx_err, StreamState::Completed);
+            emit_ai_chat_stream_done(&app, &tab_id, &stream_ctx_err, Some(&error_message));
             
             Err(error_message)
         }
@@ -3235,9 +3933,12 @@ pub async fn ai_analyze_document(
     // 构建消息
     let messages = vec![ChatMessage {
         role: "user".to_string(),
-        content: prompt,
+        content: Some(prompt),
+        tool_call_id: None,
+        name: None,
+        tool_calls: None,
     }];
-    
+
     // 使用默认模型配置
     let model_config = ModelConfig::default();
     
@@ -3307,4 +4008,3 @@ pub async fn ai_cancel_chat_stream(tab_id: String) -> Result<(), String> {
         }
     }
 }
-

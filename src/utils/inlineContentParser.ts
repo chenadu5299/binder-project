@@ -33,14 +33,25 @@ export function parseEditorContent(editor: HTMLElement): InlineInputNode[] {
             const element = node as HTMLElement;
             
             // 检查是否是引用标签
+            // Phase 1.1 降级：若 textContent 不含 @，按纯文本输出，不加入 references
             if (element.classList.contains('inline-reference-tag')) {
                 const refId = element.getAttribute('data-ref-id');
-                if (refId) {
+                const textContent = element.textContent || '';
+                if (refId && textContent.includes('@')) {
                     nodes.push({
                         type: 'reference',
                         id: refId,
                         order: order++,
                     });
+                } else {
+                    // 降级为纯文本
+                    if (textContent.trim()) {
+                        nodes.push({
+                            type: 'text',
+                            content: textContent,
+                            order: order++,
+                        });
+                    }
                 }
             } else {
                 // 递归处理子节点（跳过引用标签，因为它已经被处理）
@@ -56,6 +67,45 @@ export function parseEditorContent(editor: HTMLElement): InlineInputNode[] {
     
     // 按顺序排序（虽然应该已经是顺序的，但确保）
     return nodes.sort((a, b) => a.order - b.order);
+}
+
+/** 消息记录展示节点：文本或引用标签（设计文档 2.6） */
+export type DisplayNode =
+    | { type: 'text'; content: string }
+    | { type: 'ref'; displayText: string };
+
+/**
+ * 将节点数组转为结构化展示节点（用于消息记录以标签形式渲染）
+ */
+export function formatNodesToDisplayNodes(
+    nodes: InlineInputNode[],
+    refMap: Map<string, Reference>
+): DisplayNode[] {
+    const result: DisplayNode[] = [];
+    for (const node of nodes) {
+        if (node.type === 'text' && node.content) {
+            result.push({ type: 'text', content: node.content });
+        } else if (node.type === 'reference' && node.id) {
+            const ref = refMap.get(node.id);
+            if (ref) {
+                result.push({ type: 'ref', displayText: getReferenceDisplayText(ref) });
+            }
+        }
+    }
+    return result;
+}
+
+/**
+ * 将节点数组格式化为仅含标签的展示内容（设计文档 2.6，兼容旧版）
+ * @deprecated  prefer formatNodesToDisplayNodes 以支持标签样式渲染
+ */
+export function formatNodesForDisplay(
+    nodes: InlineInputNode[],
+    refMap: Map<string, Reference>
+): string {
+    return formatNodesToDisplayNodes(nodes, refMap)
+        .map(n => n.type === 'text' ? n.content : `@${n.displayText}`)
+        .join('');
 }
 
 /**
@@ -126,7 +176,7 @@ async function formatReferenceForAI(ref: Reference): Promise<string> {
         case ReferenceType.FOLDER: {
             const folderRef = ref as import('../types/reference').FolderReference;
             // 加载文件夹内容（包括文件列表和结构）
-            const folderContent = await loadFolderContent(folderRef.path);
+            const folderContent = await loadFolderContentForProtocol(folderRef.path);
             // ⚠️ 发送文件夹完整内容和结构信息
             return `\n\n[文件夹引用: ${folderRef.name}]\n路径: ${folderRef.path}\n包含 ${folderRef.fileCount || 0} 个文件\n\n${folderContent}\n[以上是文件夹的完整内容，您可以查看文件列表，或使用 list_files 工具浏览文件夹]\n\n`;
         }
@@ -134,7 +184,7 @@ async function formatReferenceForAI(ref: Reference): Promise<string> {
         case ReferenceType.CHAT: {
             const chatRef = ref as import('../types/reference').ChatReference;
             // 加载聊天记录完整内容
-            const chatContent = await loadChatMessages(chatRef.chatTabId, chatRef.messageIds);
+            const chatContent = await loadChatMessagesForProtocol(chatRef.chatTabId, chatRef.messageIds);
             // ⚠️ 发送聊天记录完整内容
             return `\n\n[聊天记录引用: ${chatRef.chatTabTitle} (消息 ${chatRef.messageRange?.start || 0}-${chatRef.messageRange?.end || 0})]\n${chatContent}\n\n`;
         }
@@ -147,6 +197,14 @@ async function formatReferenceForAI(ref: Reference): Promise<string> {
         case ReferenceType.MEMORY: {
             const memoryRef = ref as import('../types/reference').MemoryReference;
             return `\n\n[记忆库引用: ${memoryRef.name}]\n包含 ${memoryRef.itemCount || 0} 个记忆项\n\n`;
+        }
+
+        case ReferenceType.TABLE: {
+            const tableRef = ref as import('../types/reference').TableReference;
+            const tableContent = tableRef.tableData
+                ? tableRef.tableData.map(row => row.join('\t')).join('\n')
+                : '[表格数据]';
+            return `\n\n[表格引用: ${tableRef.fileName}]\n来源: ${tableRef.sourceFile}\n${tableContent}\n\n`;
         }
         
         case ReferenceType.LINK: {
@@ -167,9 +225,9 @@ async function formatReferenceForAI(ref: Reference): Promise<string> {
 }
 
 /**
- * 加载文件夹内容
+ * 加载文件夹内容（供 referenceProtocolAdapter 使用）
  */
-async function loadFolderContent(folderPath: string): Promise<string> {
+export async function loadFolderContentForProtocol(folderPath: string): Promise<string> {
     try {
         const { invoke } = await import('@tauri-apps/api/core');
         
@@ -261,9 +319,9 @@ async function loadFolderContent(folderPath: string): Promise<string> {
 }
 
 /**
- * 加载聊天记录内容
+ * 加载聊天记录内容（供 referenceProtocolAdapter 使用）
  */
-async function loadChatMessages(chatTabId: string, messageIds: string[]): Promise<string> {
+export async function loadChatMessagesForProtocol(chatTabId: string, messageIds: string[]): Promise<string> {
     try {
         const { useChatStore } = await import('../stores/chatStore');
         const { tabs } = useChatStore.getState();
@@ -278,7 +336,7 @@ async function loadChatMessages(chatTabId: string, messageIds: string[]): Promis
             return '[未找到指定的消息]';
         }
         
-        return messages.map((msg, index) => {
+        return messages.map((msg, _index) => {
             const roleLabel = msg.role === 'user' ? '用户' : 'AI';
             return `${roleLabel}: ${msg.content}`;
         }).join('\n\n');
@@ -321,6 +379,11 @@ export function getReferenceDisplayText(ref: Reference): string {
         case ReferenceType.MEMORY: {
             const memoryRef = ref as import('../types/reference').MemoryReference;
             return `${memoryRef.name} (${memoryRef.itemCount || 0} 项)`;
+        }
+
+        case ReferenceType.TABLE: {
+            const tableRef = ref as import('../types/reference').TableReference;
+            return `${tableRef.fileName} (表格)`;
         }
         
         case ReferenceType.LINK: {

@@ -1,6 +1,7 @@
 /**
  * 选区 → Anchor 转换
  * 用于精确定位系统：根据 editor selection (from, to) 创建 blockId + offset 锚点
+ * Phase 0.2：支持跨块选区，返回 { startBlockId, startOffset, endBlockId, endOffset }
  */
 
 import type { Node as PMNode } from '@tiptap/pm/model';
@@ -9,28 +10,46 @@ import { getBlockId } from '../components/Editor/extensions/BlockIdExtension';
 import { BLOCK_NODE_NAMES, EXCLUDED_NODE_NAMES } from './blockConstants';
 
 export interface BlockAnchor {
-  blockId: string;
+  startBlockId: string;
   startOffset: number;
+  endBlockId: string;
   endOffset: number;
+}
+
+/** 兼容：单块时 startBlockId === endBlockId，返回 startBlockId 作为 blockId 别名 */
+export function getBlockIdFromAnchor(anchor: BlockAnchor): string {
+  return anchor.startBlockId;
 }
 
 /**
  * 找到包含 [from, to] 的块节点及其在 doc 中的起始位置
  * 若选区跨多块，返回包含 from 的块
+ * @deprecated 使用 findBlockAtPos 替代，支持跨块
  */
 export function findBlockContainingSelection(
   doc: PMNode,
   from: number,
   _to: number
 ): { node: PMNode; docStart: number } | null {
+  return findBlockAtPos(doc, from);
+}
+
+/**
+ * 在文档中查找包含指定位置 pos 的块节点
+ * Phase 0.2：用于跨块选区的 start/end 分别查找
+ */
+export function findBlockAtPos(
+  doc: PMNode,
+  pos: number
+): { node: PMNode; docStart: number } | null {
   let result: { node: PMNode; docStart: number } | null = null;
-  doc.descendants((node, pos) => {
+  doc.descendants((node, p) => {
     if (result) return false;
     if (EXCLUDED_NODE_NAMES.has(node.type.name)) return true;
     if (!BLOCK_NODE_NAMES.has(node.type.name)) return true;
-    const nodeEnd = pos + node.nodeSize;
-    if (pos <= from && from < nodeEnd) {
-      result = { node, docStart: pos };
+    const nodeEnd = p + node.nodeSize;
+    if (p <= pos && pos < nodeEnd) {
+      result = { node, docStart: p };
       return false;
     }
     return true;
@@ -39,24 +58,42 @@ export function findBlockContainingSelection(
 }
 
 /**
- * 从选区创建 Anchor
- * @returns 成功时返回 { blockId, startOffset, endOffset }，失败返回 null
+ * 从选区创建 Anchor（支持单块与跨块）
+ * @returns 成功时返回 { startBlockId, startOffset, endBlockId, endOffset }，失败返回 null
+ * 单块时 startBlockId === endBlockId
  */
 export function createAnchorFromSelection(
   doc: PMNode,
   from: number,
   to: number
 ): BlockAnchor | null {
-  const found = findBlockContainingSelection(doc, from, to);
-  if (!found) return null;
-  const { node, docStart } = found;
-  const blockId = getBlockId(node);
-  if (!blockId) return null;
-  const range = pmRangeToBlockOffset(node, docStart, from, to);
-  if (!range) return null;
+  const startFound = findBlockAtPos(doc, from);
+  const endFound = findBlockAtPos(doc, to);
+  if (!startFound || !endFound) return null;
+  const startId = getBlockId(startFound.node);
+  const endId = getBlockId(endFound.node);
+  if (!startId || !endId) return null;
+
+  let startOffset: number;
+  let endOffset: number;
+
+  if (startId === endId) {
+    const range = pmRangeToBlockOffset(startFound.node, startFound.docStart, from, to);
+    if (!range) return null;
+    startOffset = range.startOffset;
+    endOffset = range.endOffset;
+  } else {
+    const startOff = pmRangeToBlockOffset(startFound.node, startFound.docStart, from, from);
+    const endOff = pmRangeToBlockOffset(endFound.node, endFound.docStart, to, to);
+    if (!startOff || !endOff) return null;
+    startOffset = startOff.startOffset;
+    endOffset = endOff.endOffset;
+  }
+
   return {
-    blockId,
-    startOffset: range.startOffset,
-    endOffset: range.endOffset,
+    startBlockId: startId,
+    startOffset,
+    endBlockId: endId,
+    endOffset,
   };
 }

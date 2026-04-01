@@ -1,6 +1,6 @@
 // 引用创建辅助函数
 
-import { TextReference, TableReference, ReferenceType } from '../types/reference';
+import { TextReference, ReferenceType, TextReferenceAnchor } from '../types/reference';
 
 /**
  * 创建完整的 TextReference
@@ -39,6 +39,8 @@ export function createTextReferenceFromClipboard(source: {
     fileName?: string;
     lineRange: { start: number; end: number };
     charRange: { start: number; end: number };
+    startBlockId?: string;
+    endBlockId?: string;
     blockId?: string;
     startOffset?: number;
     endOffset?: number;
@@ -50,12 +52,31 @@ export function createTextReferenceFromClipboard(source: {
         lineRange: source.lineRange,
         charRange: source.charRange,
     });
+    const startBlockId = source.startBlockId ?? source.blockId;
+    const endBlockId = source.endBlockId ?? source.blockId ?? source.startBlockId;
+    const startOffset = source.startOffset ?? 0;
+    const endOffset = source.endOffset ?? 0;
+
+    const textReference: TextReferenceAnchor | undefined =
+        startBlockId && endBlockId
+            ? {
+                  startBlockId,
+                  startOffset,
+                  endBlockId,
+                  endOffset,
+              }
+            : undefined;
+
     return {
         ...base,
-        ...(source.blockId != null && {
-            blockId: source.blockId,
-            startOffset: source.startOffset ?? 0,
-            endOffset: source.endOffset ?? 0,
+        ...(textReference != null && {
+            textReference,
+            startBlockId: textReference.startBlockId,
+            endBlockId: textReference.endBlockId,
+            // 兼容旧字段：仍保留 blockId/startOffset/endOffset，供旧链路读取
+            blockId: textReference.startBlockId,
+            startOffset: textReference.startOffset,
+            endOffset: textReference.endOffset,
         }),
     };
 }
@@ -117,4 +138,3 @@ export function parseReferenceFormatString(refString: string): {
         };
     }
 }
-

@@ -5,11 +5,14 @@ import { PaperAirplaneIcon, ArrowPathIcon, StopIcon } from '@heroicons/react/24/
 import { useChatStore } from '../../stores/chatStore';
 import { useReferenceStore } from '../../stores/referenceStore';
 import { ModelSelector } from './ModelSelector';
-import { Reference, ReferenceType, FileReference, ImageReference, FolderReference } from '../../types/reference';
-import { ReferenceManagerButton } from './ReferenceManagerButton';
-import { parseEditorContent, formatNodesForAI, InlineInputNode, getReferenceDisplayText, getReferenceIcon } from '../../utils/inlineContentParser';
+import { Reference, ReferenceType, FileReference, ImageReference, FolderReference, MemoryReference, ChatReference } from '../../types/reference';
+import { MentionSelector, MentionItem } from './MentionSelector';
+import { useMentionData } from '../../hooks/useMentionData';
+import { parseEditorContent, formatNodesForAI, formatNodesToDisplayNodes, getReferenceDisplayText, getReferenceIcon } from '../../utils/inlineContentParser';
+import { getTextBeforeCaret, getCaretPosition, deleteCharsBeforeCaret } from '../../utils/contentEditableCaret';
 import { invoke } from '@tauri-apps/api/core';
 import { useFileStore } from '../../stores/fileStore';
+import { toast } from '../Common/Toast';
 import './InlineChatInput.css';
 
 interface InlineChatInputProps {
@@ -26,10 +29,17 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
     const { sendMessage, regenerate, tabs, createTab, setActiveTab } = useChatStore();
     const { getReferences, clearReferences, addReference, removeReference } = useReferenceStore();
     const { currentWorkspace } = useFileStore();
+    const { itemsByCategory, getItemsByCategory } = useMentionData();
     const editorRef = useRef<HTMLDivElement>(null);
     const containerRef = useRef<HTMLDivElement>(null);
     const isComposingRef = useRef<boolean>(false);
     const compositionEndTimeRef = useRef<number>(0);
+    const prevEditorTextLenRef = useRef<number>(0);
+    const [mentionState, setMentionState] = useState<{
+        show: boolean;
+        query: string;
+        position: { top: number; left: number };
+    } | null>(null);
     
     // 确保这些值在使用前已初始化
     const tab = React.useMemo(() => {
@@ -54,20 +64,6 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
         }
         return new Map(references.map(ref => [ref.id, ref]));
     }, [references]);
-    
-    // 从输入框中删除引用标签
-    const handleRemoveReferenceTag = useCallback((refId: string) => {
-        if (!editorRef.current) return;
-        
-        const editor = editorRef.current;
-        const refTag = editor.querySelector(`.inline-reference-tag[data-ref-id="${refId}"]`) as HTMLElement;
-        
-        if (refTag) {
-            refTag.remove();
-            // 触发输入事件以更新节点数组
-            editor.dispatchEvent(new Event('input', { bubbles: true }));
-        }
-    }, []);
     
     // 插入引用标签到光标位置
     const handleInsertReference = useCallback((refId: string) => {
@@ -113,16 +109,16 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
             const displayText = getReferenceDisplayText(ref);
             const icon = getReferenceIcon(ref);
             
+            // 设计文档 2.6：标签内容为 @displayText，供 Phase 1.1 降级检测
             refTag.innerHTML = `
                 <span class="ref-icon">${icon}</span>
-                <span class="ref-label">${displayText}</span>
+                <span class="ref-label">@${displayText}</span>
                 <button class="ref-remove-btn" data-ref-id="${refId}">×</button>
             `;
         } else {
-            // 如果引用不存在，显示占位符
             refTag.innerHTML = `
                 <span class="ref-icon">📎</span>
-                <span class="ref-label">引用 (ID: ${refId})</span>
+                <span class="ref-label">@引用 (ID: ${refId})</span>
                 <button class="ref-remove-btn" data-ref-id="${refId}">×</button>
             `;
         }
@@ -180,14 +176,109 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
     
     // 处理输入变化
     const handleInput = useCallback(() => {
-        // 检查是否有内容（文本或引用）
-        if (editorRef.current) {
-            const inputNodes = parseEditorContent(editorRef.current);
-            const hasText = inputNodes.some(node => node.type === 'text' && node.content?.trim());
-            const hasReferences = inputNodes.some(node => node.type === 'reference');
-            setHasContent(hasText || hasReferences);
+        if (!editorRef.current || !containerRef.current) return;
+        const editor = editorRef.current;
+        // 检查是否有内容
+        const inputNodes = parseEditorContent(editor);
+        const hasText = inputNodes.some(node => node.type === 'text' && node.content?.trim());
+        const hasReferences = inputNodes.some(node => node.type === 'reference');
+        setHasContent(hasText || hasReferences);
+
+        // Phase 1.2：@ 检测（无 tabId 时不激活，待创建标签页后再支持）
+        if (!tabId) {
+            setMentionState(null);
+            return;
         }
-    }, []);
+        // 使用 requestAnimationFrame 确保 DOM/选区已更新后再检测（避免 contentEditable 时序问题）
+        requestAnimationFrame(() => {
+            if (!editorRef.current || !containerRef.current) return;
+            const textBefore = getTextBeforeCaret(editorRef.current);
+            const atMatch = textBefore.match(/@([^\s@]*)$/);
+            const currentLen = textBefore.length;
+            if (atMatch) {
+                const query = atMatch[1];
+                // 空格取消：query 含空格，或 @ 后紧跟空格（如 "@ "）→ 关闭列表
+                if (/\s/.test(query) || textBefore.match(/@\s/)) {
+                    setMentionState(null);
+                    prevEditorTextLenRef.current = currentLen;
+                    return;
+                }
+                // 回删不激活：query 为空且变短
+                if (query === '' && currentLen < prevEditorTextLenRef.current) {
+                    setMentionState(null);
+                } else {
+                    const pos = getCaretPosition(editorRef.current, containerRef.current);
+                    setMentionState({ show: true, query, position: pos });
+                }
+            } else {
+                setMentionState(null);
+            }
+            prevEditorTextLenRef.current = currentLen;
+        });
+    }, [tabId]);
+
+    // Phase 1.2：InlineChatInput @ 选择器 - 根据 item 创建引用并插入标签
+    const handleMentionSelect = useCallback(async (item: MentionItem) => {
+        if (!editorRef.current || !tabId || !containerRef.current) return;
+        const editor = editorRef.current;
+        const selection = window.getSelection();
+        const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
+        if (!range || !editor.contains(range.commonAncestorContainer)) return;
+
+        const textBefore = getTextBeforeCaret(editor);
+        const atMatch = textBefore.match(/@([^\s@]*)$/);
+        if (!atMatch) return;
+
+        // 创建引用并 addReference
+        let ref: Reference;
+        if (item.type === 'file' && item.path) {
+            ref = {
+                id: '',
+                type: ReferenceType.FILE,
+                createdAt: Date.now(),
+                path: item.path,
+                name: item.name,
+            };
+        } else if (item.type === 'memory') {
+            const { memoryService } = await import('../../services/memoryService');
+            const memories = currentWorkspace
+                ? await memoryService.getAllMemories(currentWorkspace).catch(() => [])
+                : [];
+            const items = memories.filter((m: { entity_name: string }) => m.entity_name === item.name);
+            ref = {
+                id: '',
+                type: ReferenceType.MEMORY,
+                createdAt: Date.now(),
+                memoryId: `memory-${item.name}`,
+                name: item.name,
+                itemCount: items.length,
+            };
+        } else if (item.type === 'chat' && item.chatTabId) {
+            const chatTab = tabs.find(t => t.id === item.chatTabId);
+            ref = {
+                id: '',
+                type: ReferenceType.CHAT,
+                createdAt: Date.now(),
+                chatTabId: item.chatTabId,
+                chatTabTitle: item.name,
+                messageIds: chatTab?.messages.map(m => m.id) ?? [],
+                messageRange: chatTab
+                    ? { start: 0, end: chatTab.messages.length }
+                    : undefined,
+            };
+        } else {
+            setMentionState(null);
+            return;
+        }
+        const refId = addReference(tabId, ref);
+
+        // 删除 @query，插入引用标签
+        const queryLen = atMatch[1].length + 1; // +1 for @
+        deleteCharsBeforeCaret(editor, queryLen);
+        handleInsertReference(refId);
+        setMentionState(null);
+        editor.focus();
+    }, [tabId, currentWorkspace, tabs, addReference, handleInsertReference]);
     
     // 发送消息（先定义，因为 handleKeyDown 需要它）
     const handleSend = useCallback(async () => {
@@ -247,8 +338,15 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
             refMapKeys: Array.from(refMapForFormat.keys()),
         });
         
-        // 格式化内容（将引用标签替换为完整信息）
+        // 格式化内容（将引用标签替换为完整信息，发给 AI）
         const fullContent = await formatNodesForAI(inputNodes, refMapForFormat);
+        // 消息记录展示：结构化节点，引用以标签形式渲染（设计文档 2.6）
+        const displayNodes = formatNodesToDisplayNodes(inputNodes, refMapForFormat);
+
+        // Phase 1.1：仅保留仍含 @ 的有效引用，降级为文本的不传 references
+        const validRefIds = inputNodes
+            .filter(n => n.type === 'reference' && n.id)
+            .map(n => n.id!);
         
         console.log('📤 发送给AI的完整内容:', {
             contentLength: fullContent.length,
@@ -265,8 +363,8 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
             setHasContent(false); // 重置内容状态
         }
         
-        // 发送消息
-        await sendMessage(currentTabId, fullContent);
+        // 发送消息（传递 validRefIds、displayNodes；降级为文本的不加入 references）
+        await sendMessage(currentTabId, fullContent, { validRefIds, displayNodes });
         
         // 发送后清除引用（单次引用只对单次聊天有效）
         clearReferences(currentTabId);
@@ -285,19 +383,21 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
     
     // 处理键盘事件
     const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLDivElement>) => {
+        // Phase 1.2：@ 选择器打开时，preventDefault 阻止默认动作，不触发发送；事件仍冒泡供 MentionSelector 处理
+        if (mentionState?.show) {
+            if (['Enter', 'Tab', 'Escape', 'ArrowUp', 'ArrowDown'].includes(e.key)) {
+                e.preventDefault();
+                return;
+            }
+        }
         if (e.key === 'Enter' && !e.shiftKey) {
-            // 检查是否在输入法组合中
             const isComposing = (e.nativeEvent as KeyboardEvent).isComposing || isComposingRef.current;
             const justEndedComposition = Date.now() - compositionEndTimeRef.current < 100;
-            
-            if (isComposing || justEndedComposition) {
-                return; // 让输入法处理回车
-            }
-            
+            if (isComposing || justEndedComposition) return;
             e.preventDefault();
             handleSend();
         }
-    }, [handleSend]);
+    }, [handleSend, mentionState?.show]);
     
     // 处理中文输入法
     const handleCompositionStart = useCallback(() => {
@@ -308,8 +408,10 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
         compositionEndTimeRef.current = Date.now();
         setTimeout(() => {
             isComposingRef.current = false;
+            // IME 结束后 DOM 已更新，触发 @ 检测（补充 input 可能的时序差异）
+            handleInput();
         }, 0);
-    }, []);
+    }, [handleInput]);
     
     // 处理引用标签移除
     useEffect(() => {
@@ -442,7 +544,7 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
                     // 尝试从文件树中查找文件路径
                     const { currentWorkspace, fileTree } = useFileStore.getState();
                     const { flattenFileTree } = await import('../../utils/fileTreeUtils');
-                    const allFiles = flattenFileTree(fileTree);
+                    const allFiles = fileTree ? flattenFileTree(fileTree) : [];
                     const matchedFile = allFiles.find(f => f.name === parsed.fileName);
                     
                     if (matchedFile && currentWorkspace) {
@@ -929,6 +1031,58 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
             }
             return;
         }
+
+        // Phase 2.1：处理记忆库拖拽
+        const memoryData = dataTransfer.getData('application/binder-reference-memory');
+        if (memoryData) {
+            try {
+                const payload = JSON.parse(memoryData);
+                if (payload.type === 'memory' && payload.entityName) {
+                    const memories = currentWorkspace
+                        ? await (await import('../../services/memoryService')).memoryService.getAllMemories(currentWorkspace).catch(() => [])
+                        : [];
+                    const items = memories.filter((m: { entity_name: string }) => m.entity_name === payload.entityName);
+                    const memoryRef: MemoryReference = {
+                        id: '',
+                        type: ReferenceType.MEMORY,
+                        createdAt: Date.now(),
+                        memoryId: `memory-${payload.entityName}`,
+                        name: payload.entityName,
+                        itemCount: items.length,
+                        items: items.map((m: { content: string }) => ({ content: m.content })),
+                    };
+                    const refId = addReference(currentTabId, memoryRef);
+                    if (refId && editorRef.current) handleInsertReference(refId);
+                    return;
+                }
+            } catch (e) {
+                console.warn('解析记忆库拖拽数据失败:', e);
+            }
+        }
+
+        // Phase 2.1：处理聊天标签拖拽
+        const chatData = dataTransfer.getData('application/binder-reference-chat');
+        if (chatData) {
+            try {
+                const payload = JSON.parse(chatData);
+                if (payload.type === 'chat' && payload.chatTabId) {
+                    const chatRef: ChatReference = {
+                        id: '',
+                        type: ReferenceType.CHAT,
+                        createdAt: Date.now(),
+                        chatTabId: payload.chatTabId,
+                        chatTabTitle: payload.chatTabTitle || '聊天',
+                        messageIds: payload.messageIds || [],
+                        messageRange: payload.messageRange,
+                    };
+                    const refId = addReference(currentTabId, chatRef);
+                    if (refId && editorRef.current) handleInsertReference(refId);
+                    return;
+                }
+            } catch (e) {
+                console.warn('解析聊天标签拖拽数据失败:', e);
+            }
+        }
         
         // 处理外部拖拽的文件
         const files = Array.from(dataTransfer.files);
@@ -944,39 +1098,36 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
             try {
                 console.log('📄 处理外部文件:', file.name, file.type);
                 
-                // 检查是否是图片文件
+                // 检查是否是图片文件（Phase 3.1：外部图片也保存到 .binder/temp，path 可信）
                 if (file.type.startsWith('image/')) {
-                    // 创建图片引用（使用 FileReader 读取图片数据）
-                    const reader = new FileReader();
-                    const imageDataUrl = await new Promise<string>((resolve, reject) => {
-                        reader.onload = (e) => resolve(e.target?.result as string);
-                        reader.onerror = reject;
-                        reader.readAsDataURL(file);
+                    if (!currentWorkspace) {
+                        toast.warning('请先打开工作区后再拖入图片');
+                        continue;
+                    }
+                    const arrayBuffer = await file.arrayBuffer();
+                    const imageData = Array.from(new Uint8Array(arrayBuffer));
+                    const tempPath = await invoke<string>('save_external_file', {
+                        workspacePath: currentWorkspace,
+                        fileData: imageData,
+                        fileName: file.name,
                     });
-                    
                     const imageRef: ImageReference = {
                         id: `ref-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
                         type: ReferenceType.IMAGE,
                         createdAt: Date.now(),
-                        path: file.name, // 外部文件没有路径，使用文件名
+                        path: tempPath,
                         name: file.name,
                         mimeType: file.type,
-                        thumbnail: imageDataUrl, // 使用 thumbnail 字段存储 base64 数据
                     };
-                    
-                    console.log('✅ 创建外部图片引用:', imageRef);
                     const refId = addReference(currentTabId, imageRef);
-                    
-                    if (refId && editorRef.current) {
-                        handleInsertReference(refId);
-                    }
+                    if (refId && editorRef.current) handleInsertReference(refId);
                 } else {
                     // 处理外部文本文件：保存到临时目录并读取内容
                     try {
                         // 检查文件大小（限制为 10MB）
                         const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
                         if (file.size > MAX_FILE_SIZE) {
-                            console.warn('⚠️ 文件过大，跳过:', file.name, '大小:', file.size);
+                            toast.warning(`文件 "${file.name}" 超过 10MB，已跳过`);
                             continue;
                         }
                         
@@ -986,7 +1137,7 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
                         
                         // 获取当前工作区路径
                         if (!currentWorkspace) {
-                            console.error('❌ 没有当前工作区，无法保存外部文件');
+                            toast.warning('请先打开工作区后再拖入外部文件');
                             continue;
                         }
                         
@@ -1032,10 +1183,12 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
                             handleInsertReference(refId);
                         }
                     } catch (error) {
+                        toast.error('保存外部文件失败');
                         console.error('❌ 处理外部文件失败:', error);
                     }
                 }
             } catch (error) {
+                toast.error('处理外部文件失败');
                 console.error('❌ 处理外部文件失败:', error);
             }
         }
@@ -1140,7 +1293,7 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
     return (
         <div
             ref={containerRef}
-            className="inline-chat-input-container flex-shrink-0 border-t border-gray-200 dark:border-gray-700 p-4 bg-white dark:bg-gray-800"
+            className="inline-chat-input-container relative flex-shrink-0 border-t border-gray-200 dark:border-gray-700 p-4 bg-white dark:bg-gray-800"
             onDragEnter={handleDragEnter}
             onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}
@@ -1158,13 +1311,17 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
                 </div>
             )}
             
-            {/* 引用管理按钮（在输入框外面，左上角） */}
-            <ReferenceManagerButton
-                tabId={tabId}
-                onInsertReference={handleInsertReference}
-                onRemoveReference={handleRemoveReferenceTag}
-            />
-            
+            {/* Phase 1.2：@ 选择器（position 相对于 containerRef） */}
+            {mentionState?.show && (
+                <MentionSelector
+                    query={mentionState.query}
+                    itemsByCategory={itemsByCategory}
+                    getItemsByCategory={getItemsByCategory}
+                    position={mentionState.position}
+                    onSelect={handleMentionSelect}
+                    onClose={() => setMentionState(null)}
+                />
+            )}
             <div className="flex items-end gap-2">
                 {/* 内容可编辑区域 */}
                 <div

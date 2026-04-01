@@ -37,7 +37,7 @@ export const memoryService = {
     /**
      * 跳转到记忆库并选中指定记忆项
      */
-    async jumpToMemory(memoryId: string, workspacePath: string): Promise<void> {
+    async jumpToMemory(memoryId: string, _workspacePath: string): Promise<void> {
         // 确保聊天面板显示并切换到记忆库标签
         const { useLayoutStore } = await import('../stores/layoutStore');
         const layoutStore = useLayoutStore.getState();

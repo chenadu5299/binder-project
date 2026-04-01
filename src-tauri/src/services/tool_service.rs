@@ -1,1275 +1,2360 @@
 // 工具调用服务
-use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
 use crate::utils::path_validator::PathValidator;
+use crate::workspace::canonical_html::{
+  canonical_html_for_workspace_cache, materialize_cached_body_if_stale_hash,
+  should_run_workspace_canonical_pipeline,
+};
+use crate::workspace::diff_engine;
+use crate::workspace::workspace_db::WorkspaceDb;
 use scraper::{Html, Selector};
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
-    pub id: String,
-    pub name: String,
-    pub arguments: serde_json::Value,
+  pub id: String,
+  pub name: String,
+  pub arguments: serde_json::Value,
+}
+
+/// 工具错误类型（构建模式前置）：任务调度层据此决定重试/跳过/中止
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolErrorKind {
+  Retryable,
+  Skippable,
+  Fatal,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResult {
-    pub success: bool,
-    pub data: Option<serde_json::Value>,
-    pub error: Option<String>,
-    pub message: Option<String>,
+  pub success: bool,
+  pub data: Option<serde_json::Value>,
+  pub error: Option<String>,
+  pub message: Option<String>,
+  /// 构建模式前置：错误类型，用于任务调度层决策
+  #[serde(skip_serializing_if = "Option::is_none", default)]
+  pub error_kind: Option<ToolErrorKind>,
+  /// 用户可读的中文错误文案
+  #[serde(skip_serializing_if = "Option::is_none", default)]
+  pub display_error: Option<String>,
+}
+
+impl Default for ToolResult {
+  fn default() -> Self {
+    Self {
+      success: false,
+      data: None,
+      error: None,
+      message: None,
+      error_kind: None,
+      display_error: None,
+    }
+  }
+}
+
+pub const E_ROUTE_MISMATCH: &str = "E_ROUTE_MISMATCH";
+pub const E_TARGET_NOT_READY: &str = "E_TARGET_NOT_READY";
+pub const E_RANGE_UNRESOLVABLE: &str = "E_RANGE_UNRESOLVABLE";
+pub const E_ORIGINALTEXT_MISMATCH: &str = "E_ORIGINALTEXT_MISMATCH";
+pub const E_PARTIAL_OVERLAP: &str = "E_PARTIAL_OVERLAP";
+pub const E_BASELINE_MISMATCH: &str = "E_BASELINE_MISMATCH";
+pub const E_APPLY_FAILED: &str = "E_APPLY_FAILED";
+pub const E_REFRESH_FAILED: &str = "E_REFRESH_FAILED";
+pub const E_BLOCKTREE_NODE_MISSING: &str = "E_BLOCKTREE_NODE_MISSING";
+pub const E_BLOCKTREE_STALE: &str = "E_BLOCKTREE_STALE";
+pub const E_BLOCKTREE_BUILD_FAILED: &str = "E_BLOCKTREE_BUILD_FAILED";
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExposureLevel {
+  Info,
+  Warn,
+  Error,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExposurePhase {
+  Route,
+  Resolve,
+  Validate,
+  Apply,
+  Refresh,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionExposure {
+  pub exposure_id: String,
+  pub level: ExposureLevel,
+  pub phase: ExposurePhase,
+  pub code: String,
+  pub message: String,
+  pub target_file: String,
+  #[serde(skip_serializing_if = "Option::is_none", default)]
+  pub diff_id: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none", default)]
+  pub baseline_id: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none", default)]
+  pub route_source: Option<String>,
+  pub timestamp: u64,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 对话编辑 Resolver（§6 主控设计文档）
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 块结构条目（Resolver Step 1 输出）
+struct BlockEntry {
+  block_id: String,
+  /// HTML tag name: p | h1 | h2 | h3 | li | ...
+  block_type: String,
+  /// strip 标签后的纯文本
+  text_content: String,
+  /// chars().count()，不是 len()
+  char_count: usize,
+}
+
+/// Resolver 输入（§6.1）
+pub struct ResolverInput {
+  // 模型提供
+  pub block_index: Option<usize>,
+  pub edit_mode: String,
+  pub target: Option<String>,
+  pub content: Option<String>,
+  /// 默认 0
+  pub occurrence_index: usize,
+  // 系统提供（零搜索路径 Step 2a）
+  pub selection_start_block_id: Option<String>,
+  pub selection_start_offset: Option<usize>,
+  pub selection_end_block_id: Option<String>,
+  pub selection_end_offset: Option<usize>,
+  pub selected_text: Option<String>,
+  // 文档来源
+  pub target_file: String,
+  pub current_editor_content: String,
+  // 基线绑定（RequestContext.baselineId）
+  pub baseline_id: Option<String>,
+}
+
+/// Resolver 内部输出（Step 3 之前）
+struct CanonicalDiffBuilt {
+  start_block_id: String,
+  start_offset: usize,
+  end_block_id: String,
+  end_offset: usize,
+  original_text: String,
+  new_text: String,
+  /// "precise" | "block_level" | "document_level"
+  diff_type: String,
+  /// "replace" | "delete" | "insert"
+  edit_type: String,
+  /// "selection" | "reference" | "block_search"
+  route_source: String,
+  /// BlockTree 退化/异常错误码暴露（为空表示无异常）
+  resolver_error_codes: Vec<String>,
 }
 
 pub struct ToolService;
 
 impl ToolService {
-    pub fn new() -> Self {
-        ToolService
+  pub fn new() -> Self {
+    ToolService
+  }
+
+  /// 执行工具调用
+  pub async fn execute_tool(
+    &self,
+    tool_call: &ToolCall,
+    workspace_path: &Path,
+  ) -> Result<ToolResult, String> {
+    // 验证工作区路径
+    if !workspace_path.exists() {
+      return Err("工作区路径不存在".to_string());
     }
 
-    /// 执行工具调用
-    pub async fn execute_tool(
-        &self,
-        tool_call: &ToolCall,
-        workspace_path: &Path,
-    ) -> Result<ToolResult, String> {
-        // 验证工作区路径
-        if !workspace_path.exists() {
-            return Err("工作区路径不存在".to_string());
-        }
+    match tool_call.name.as_str() {
+      "read_file" => self.read_file(tool_call, workspace_path).await,
+      "create_file" => self.create_file(tool_call, workspace_path).await,
+      "update_file" => self.update_file(tool_call, workspace_path).await,
+      "delete_file" => self.delete_file(tool_call, workspace_path).await,
+      "list_files" => self.list_files(tool_call, workspace_path).await,
+      "search_files" => self.search_files(tool_call, workspace_path).await,
+      "move_file" => self.move_file(tool_call, workspace_path).await,
+      "rename_file" => self.rename_file(tool_call, workspace_path).await,
+      "create_folder" => self.create_folder(tool_call, workspace_path).await,
+      "get_current_editor_file" => self.get_current_editor_file(tool_call).await,
+      "edit_current_editor_document" => self.edit_current_editor_document(tool_call).await,
+      "save_file_dependency" => self.save_file_dependency(tool_call, workspace_path).await,
+      _ => Err(format!("未知的工具: {}", tool_call.name)),
+    }
+  }
 
-        match tool_call.name.as_str() {
-            "read_file" => self.read_file(tool_call, workspace_path).await,
-            "create_file" => self.create_file(tool_call, workspace_path).await,
-            "update_file" => self.update_file(tool_call, workspace_path).await,
-            "delete_file" => self.delete_file(tool_call, workspace_path).await,
-            "list_files" => self.list_files(tool_call, workspace_path).await,
-            "search_files" => self.search_files(tool_call, workspace_path).await,
-            "move_file" => self.move_file(tool_call, workspace_path).await,
-            "rename_file" => self.rename_file(tool_call, workspace_path).await,
-            "create_folder" => self.create_folder(tool_call, workspace_path).await,
-            "get_current_editor_file" => self.get_current_editor_file(tool_call).await,
-            "edit_current_editor_document" => self.edit_current_editor_document(tool_call).await,
-            _ => Err(format!("未知的工具: {}", tool_call.name)),
-        }
+  /// 读取文件内容
+  async fn read_file(
+    &self,
+    tool_call: &ToolCall,
+    workspace_path: &Path,
+  ) -> Result<ToolResult, String> {
+    let file_path = tool_call
+      .arguments
+      .get("path")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| "缺少 path 参数".to_string())?;
+
+    let full_path = workspace_path.join(file_path);
+
+    // 验证路径安全性
+    // 检查路径是否包含 .. 或其他不安全字符
+    if file_path.contains("..") || file_path.contains("/") && file_path.starts_with("/") {
+      return Err("路径不安全".to_string());
     }
 
-    /// 读取文件内容
-    async fn read_file(
-        &self,
-        tool_call: &ToolCall,
-        workspace_path: &Path,
-    ) -> Result<ToolResult, String> {
-        let file_path = tool_call
-            .arguments
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "缺少 path 参数".to_string())?;
-
-        let full_path = workspace_path.join(file_path);
-
-        // 验证路径安全性
-        // 检查路径是否包含 .. 或其他不安全字符
-        if file_path.contains("..") || file_path.contains("/") && file_path.starts_with("/") {
+    // 对于已存在的文件，使用 PathValidator 验证
+    if full_path.exists() {
+      if PathValidator::validate_workspace_path(&full_path, workspace_path).is_err() {
+        return Err("路径不安全".to_string());
+      }
+    } else {
+      // 对于不存在的文件，检查父目录是否在工作区内
+      if let Some(parent) = full_path.parent() {
+        if parent.exists() {
+          if PathValidator::validate_workspace_path(parent, workspace_path).is_err() {
             return Err("路径不安全".to_string());
-        }
-        
-        // 对于已存在的文件，使用 PathValidator 验证
-        if full_path.exists() {
-            if PathValidator::validate_workspace_path(&full_path, workspace_path).is_err() {
-                return Err("路径不安全".to_string());
-            }
+          }
         } else {
-            // 对于不存在的文件，检查父目录是否在工作区内
-            if let Some(parent) = full_path.parent() {
-                if parent.exists() {
-                    if PathValidator::validate_workspace_path(parent, workspace_path).is_err() {
-                        return Err("路径不安全".to_string());
-                    }
-                } else {
-                    // 如果父目录也不存在，检查路径是否在工作区根目录下
-                    if !full_path.starts_with(workspace_path) {
-                        return Err("路径不安全".to_string());
-                    }
-                }
-            }
-        }
-
-        // 检查文件是否存在
-        if !full_path.exists() {
-            return Ok(ToolResult {
-                success: false,
-                data: None,
-                error: Some(format!("文件不存在: {}", file_path)),
-                message: None,
-            });
-        }
-
-        // 检查文件扩展名，如果是 DOCX，需要使用 Pandoc 转换
-        let ext = full_path.extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_lowercase());
-        
-        if ext.as_deref() == Some("docx") || file_path.ends_with(".draft.docx") {
-            // DOCX 文件：使用 Pandoc 转换为纯文本
-            use crate::services::pandoc_service::PandocService;
-            let pandoc_service = PandocService::new();
-            
-            if !pandoc_service.is_available() {
-                return Ok(ToolResult {
-                    success: false,
-                    data: None,
-                    error: Some("Pandoc 不可用，无法读取 DOCX 文件。请安装 Pandoc 或使用其他格式。".to_string()),
-                    message: None,
-                });
-            }
-            
-            // 使用 Pandoc 将 DOCX 转换为 HTML（不设置工作目录，保持原行为）
-            match pandoc_service.convert_document_to_html(&full_path, None) {
-                Ok(html_content) => {
-                    // 从 HTML 中提取纯文本（简单处理）
-                    // 注意：这里返回的是 HTML，如果需要纯文本，可以进一步处理
-                    // 但为了保持兼容性，先返回 HTML
-                    Ok(ToolResult {
-                        success: true,
-                        data: Some(serde_json::json!({
-                            "path": file_path,
-                            "content": html_content,
-                            "size": html_content.len(),
-                            "format": "html",
-                        })),
-                        error: None,
-                        message: Some(format!("成功读取 DOCX 文件（已转换为 HTML）: {}", file_path)),
-                    })
-                },
-                Err(e) => Ok(ToolResult {
-                    success: false,
-                    data: None,
-                    error: Some(format!("读取 DOCX 文件失败: {}", e)),
-                    message: None,
-                }),
-            }
-        } else {
-            // 普通文本文件：直接读取
-            match std::fs::read_to_string(&full_path) {
-                Ok(content) => Ok(ToolResult {
-                    success: true,
-                    data: Some(serde_json::json!({
-                        "path": file_path,
-                        "content": content,
-                        "size": content.len(),
-                    })),
-                    error: None,
-                    message: Some(format!("成功读取文件: {}", file_path)),
-                }),
-                Err(e) => Ok(ToolResult {
-                    success: false,
-                    data: None,
-                    error: Some(format!("读取文件失败: {}", e)),
-                    message: None,
-                }),
-            }
-        }
-    }
-
-    /// 创建文件（原子写入）
-    async fn create_file(
-        &self,
-        tool_call: &ToolCall,
-        workspace_path: &Path,
-    ) -> Result<ToolResult, String> {
-        eprintln!("🔧 create_file 调用参数: {}", serde_json::to_string(&tool_call.arguments).unwrap_or_default());
-        
-        let file_path = tool_call
-            .arguments
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                eprintln!("❌ create_file 缺少 path 参数，arguments: {:?}", tool_call.arguments);
-                "缺少 path 参数".to_string()
-            })?;
-
-        // content 可以为空字符串，但不能缺失
-        let content = tool_call
-            .arguments
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap_or(""); // 如果 content 不存在，使用空字符串
-
-        let full_path = workspace_path.join(file_path);
-
-        // 验证路径安全性
-        // 检查路径是否包含 .. 或其他不安全字符
-        if file_path.contains("..") || file_path.contains("/") && file_path.starts_with("/") {
+          // 如果父目录也不存在，检查路径是否在工作区根目录下
+          if !full_path.starts_with(workspace_path) {
             return Err("路径不安全".to_string());
+          }
         }
-        
-        // 对于已存在的文件，使用 PathValidator 验证
-        if full_path.exists() {
-            if PathValidator::validate_workspace_path(&full_path, workspace_path).is_err() {
-                return Err("路径不安全".to_string());
-            }
-        } else {
-            // 对于不存在的文件，检查父目录是否在工作区内
-            if let Some(parent) = full_path.parent() {
-                if parent.exists() {
-                    if PathValidator::validate_workspace_path(parent, workspace_path).is_err() {
-                        return Err("路径不安全".to_string());
-                    }
-                } else {
-                    // 如果父目录也不存在，检查路径是否在工作区根目录下
-                    if !full_path.starts_with(workspace_path) {
-                        return Err("路径不安全".to_string());
-                    }
-                }
-            }
-        }
-
-        // 检查文件是否已存在
-        if full_path.exists() {
-            return Ok(ToolResult {
-                success: false,
-                data: None,
-                error: Some(format!("文件已存在: {}", file_path)),
-                message: None,
-            });
-        }
-
-        // 创建父目录
-        if let Some(parent) = full_path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                return Ok(ToolResult {
-                    success: false,
-                    data: None,
-                    error: Some(format!("创建目录失败: {}", e)),
-                    message: None,
-                });
-            }
-        }
-
-        // 检查文件扩展名，如果是 DOCX，需要特殊处理
-        let ext = full_path.extension()
-            .and_then(|s| s.to_str())
-            .map(|s| s.to_lowercase());
-        
-        if ext.as_deref() == Some("docx") {
-            // DOCX 文件：使用 Pandoc 将内容转换为 DOCX 格式
-            use crate::services::pandoc_service::PandocService;
-            let pandoc_service = PandocService::new();
-            
-            if !pandoc_service.is_available() {
-                return Ok(ToolResult {
-                    success: false,
-                    data: None,
-                    error: Some("Pandoc 不可用，无法创建 DOCX 文件。请安装 Pandoc 或使用其他格式。".to_string()),
-                    message: None,
-                });
-            }
-            
-            // 将内容（Markdown 或 HTML）转换为 DOCX
-            match pandoc_service.convert_html_to_docx(&content, &full_path) {
-                Ok(_) => Ok(ToolResult {
-                    success: true,
-                    data: Some(serde_json::json!({
-                        "path": file_path,
-                        "format": "docx",
-                    })),
-                    error: None,
-                    message: Some(format!("成功创建 DOCX 文件: {}", file_path)),
-                }),
-                Err(e) => Ok(ToolResult {
-                    success: false,
-                    data: None,
-                    error: Some(format!("转换 DOCX 失败: {}", e)),
-                    message: None,
-                }),
-            }
-        } else {
-            // 其他文件：直接写入文本内容
-            match self.atomic_write_file(&full_path, content.as_bytes()) {
-                Ok(_) => Ok(ToolResult {
-                    success: true,
-                    data: Some(serde_json::json!({
-                        "path": file_path,
-                        "size": content.len(),
-                    })),
-                    error: None,
-                    message: Some(format!("成功创建文件: {}", file_path)),
-                }),
-                Err(e) => Ok(ToolResult {
-                    success: false,
-                    data: None,
-                    error: Some(format!("写入文件失败: {}", e)),
-                    message: None,
-                }),
-            }
-        }
+      }
     }
 
-    /// 更新文件（原子写入）
-    async fn update_file(
-        &self,
-        tool_call: &ToolCall,
-        workspace_path: &Path,
-    ) -> Result<ToolResult, String> {
-        let file_path = tool_call
-            .arguments
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "缺少 path 参数".to_string())?;
-
-        let content = tool_call
-            .arguments
-            .get("content")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "缺少 content 参数".to_string())?;
-
-        let full_path = workspace_path.join(file_path);
-
-        // 验证路径安全性
-        // 检查路径是否包含 .. 或其他不安全字符
-        if file_path.contains("..") || file_path.contains("/") && file_path.starts_with("/") {
-            return Err("路径不安全".to_string());
-        }
-        
-        // 对于已存在的文件，使用 PathValidator 验证
-        if full_path.exists() {
-            if PathValidator::validate_workspace_path(&full_path, workspace_path).is_err() {
-                return Err("路径不安全".to_string());
-            }
-        } else {
-            // 对于不存在的文件，检查父目录是否在工作区内
-            if let Some(parent) = full_path.parent() {
-                if parent.exists() {
-                    if PathValidator::validate_workspace_path(parent, workspace_path).is_err() {
-                        return Err("路径不安全".to_string());
-                    }
-                } else {
-                    // 如果父目录也不存在，检查路径是否在工作区根目录下
-                    if !full_path.starts_with(workspace_path) {
-                        return Err("路径不安全".to_string());
-                    }
-                }
-            }
-        }
-
-        // 检查文件是否存在
-        if !full_path.exists() {
-            return Ok(ToolResult {
-                success: false,
-                data: None,
-                error: Some(format!("文件不存在: {}", file_path)),
-                message: None,
-            });
-        }
-
-        // 原子写入文件
-        match self.atomic_write_file(&full_path, content.as_bytes()) {
-            Ok(_) => Ok(ToolResult {
-                success: true,
-                data: Some(serde_json::json!({
-                    "path": file_path,
-                    "size": content.len(),
-                })),
-                error: None,
-                message: Some(format!("成功更新文件: {}", file_path)),
-            }),
-            Err(e) => Ok(ToolResult {
-                success: false,
-                data: None,
-                error: Some(format!("写入文件失败: {}", e)),
-                message: None,
-            }),
-        }
+    // 检查文件是否存在
+    if !full_path.exists() {
+      return Ok(ToolResult {
+        success: false,
+        data: None,
+        error: Some(format!("文件不存在: {}", file_path)),
+        message: None,
+        error_kind: None,
+        display_error: None,
+      });
     }
 
-    /// 删除文件
-    async fn delete_file(
-        &self,
-        tool_call: &ToolCall,
-        workspace_path: &Path,
-    ) -> Result<ToolResult, String> {
-        let file_path = tool_call
-            .arguments
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "缺少 path 参数".to_string())?;
+    // 检查文件扩展名，如果是 DOCX，需要使用 Pandoc 转换
+    let ext = full_path
+      .extension()
+      .and_then(|e| e.to_str())
+      .map(|e| e.to_lowercase());
 
-        let full_path = workspace_path.join(file_path);
+    if ext.as_deref() == Some("docx") || file_path.ends_with(".draft.docx") {
+      // DOCX 文件：使用 Pandoc 转换为纯文本
+      use crate::services::pandoc_service::PandocService;
+      let pandoc_service = PandocService::new();
 
-        // 验证路径安全性
-        // 检查路径是否包含 .. 或其他不安全字符
-        if file_path.contains("..") || file_path.contains("/") && file_path.starts_with("/") {
-            return Err("路径不安全".to_string());
-        }
-        
-        // 对于已存在的文件，使用 PathValidator 验证
-        if full_path.exists() {
-            if PathValidator::validate_workspace_path(&full_path, workspace_path).is_err() {
-                return Err("路径不安全".to_string());
-            }
-        } else {
-            // 对于不存在的文件，检查父目录是否在工作区内
-            if let Some(parent) = full_path.parent() {
-                if parent.exists() {
-                    if PathValidator::validate_workspace_path(parent, workspace_path).is_err() {
-                        return Err("路径不安全".to_string());
-                    }
-                } else {
-                    // 如果父目录也不存在，检查路径是否在工作区根目录下
-                    if !full_path.starts_with(workspace_path) {
-                        return Err("路径不安全".to_string());
-                    }
-                }
-            }
-        }
+      if !pandoc_service.is_available() {
+        return Ok(ToolResult {
+          success: false,
+          data: None,
+          error: Some(
+            "Pandoc 不可用，无法读取 DOCX 文件。请安装 Pandoc 或使用其他格式。".to_string(),
+          ),
+          message: None,
+          error_kind: None,
+          display_error: None,
+        });
+      }
 
-        // 检查文件或文件夹是否存在
-        if !full_path.exists() {
-            return Ok(ToolResult {
-                success: false,
-                data: None,
-                error: Some(format!("文件或文件夹不存在: {}", file_path)),
-                message: None,
-            });
-        }
-
-        // 判断是文件还是文件夹，使用不同的删除方法
-        let metadata = match std::fs::metadata(&full_path) {
-            Ok(m) => m,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    data: None,
-                    error: Some(format!("无法获取文件信息: {}", e)),
-                    message: None,
-                });
-            }
-        };
-
-        // 删除文件或文件夹
-        let result = if metadata.is_dir() {
-            // 删除文件夹（递归删除）
-            std::fs::remove_dir_all(&full_path)
-        } else {
-            // 删除文件
-            std::fs::remove_file(&full_path)
-        };
-
-        match result {
-            Ok(_) => Ok(ToolResult {
-                success: true,
-                data: Some(serde_json::json!({
-                    "path": file_path,
-                    "type": if metadata.is_dir() { "folder" } else { "file" },
-                })),
-                error: None,
-                message: Some(format!("成功删除{}: {}", if metadata.is_dir() { "文件夹" } else { "文件" }, file_path)),
-            }),
-            Err(e) => Ok(ToolResult {
-                success: false,
-                data: None,
-                error: Some(format!("删除{}失败: {}", if metadata.is_dir() { "文件夹" } else { "文件" }, e)),
-                message: None,
-            }),
-        }
-    }
-
-    /// 列出文件
-    async fn list_files(
-        &self,
-        tool_call: &ToolCall,
-        workspace_path: &Path,
-    ) -> Result<ToolResult, String> {
-        let dir_path = tool_call
-            .arguments
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or(".");
-
-        let full_path = workspace_path.join(dir_path);
-
-        // 验证路径安全性
-        if dir_path.contains("..") {
-            return Err("路径不安全".to_string());
-        }
-        
-        if full_path.exists() {
-            if PathValidator::validate_workspace_path(&full_path, workspace_path).is_err() {
-                return Err("路径不安全".to_string());
-            }
-        }
-
-        // 检查目录是否存在
-        if !full_path.exists() {
-            return Ok(ToolResult {
-                success: false,
-                data: None,
-                error: Some(format!("目录不存在: {}", dir_path)),
-                message: None,
-            });
-        }
-
-        // 列出文件
-        match std::fs::read_dir(&full_path) {
-            Ok(entries) => {
-                let mut files = Vec::new();
-                for entry in entries {
-                    if let Ok(entry) = entry {
-                        let path = entry.path();
-                        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                        let is_dir = path.is_dir();
-                        files.push(serde_json::json!({
-                            "name": name,
-                            "path": path.strip_prefix(workspace_path)
-                                .ok()
-                                .and_then(|p| p.to_str())
-                                .unwrap_or(""),
-                            "is_directory": is_dir,
-                        }));
-                    }
-                }
-                Ok(ToolResult {
-                    success: true,
-                    data: Some(serde_json::json!({
-                        "path": dir_path,
-                        "files": files,
-                    })),
-                    error: None,
-                    message: Some(format!("成功列出目录: {}", dir_path)),
-                })
-            }
-            Err(e) => Ok(ToolResult {
-                success: false,
-                data: None,
-                error: Some(format!("读取目录失败: {}", e)),
-                message: None,
-            }),
-        }
-    }
-
-    /// 搜索文件
-    async fn search_files(
-        &self,
-        tool_call: &ToolCall,
-        workspace_path: &Path,
-    ) -> Result<ToolResult, String> {
-        let query = tool_call
-            .arguments
-            .get("query")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "缺少 query 参数".to_string())?;
-
-        // 简单的文件名搜索（后续可以优化为全文搜索）
-        let mut results = Vec::new();
-        self.search_files_recursive(workspace_path, workspace_path, query, &mut results)?;
-
-        Ok(ToolResult {
+      // 使用 Pandoc 将 DOCX 转换为 HTML（不设置工作目录，保持原行为）
+      match pandoc_service.convert_document_to_html(&full_path, None) {
+        Ok(html_content) => {
+          // 从 HTML 中提取纯文本（简单处理）
+          // 注意：这里返回的是 HTML，如果需要纯文本，可以进一步处理
+          // 但为了保持兼容性，先返回 HTML
+          Ok(ToolResult {
             success: true,
             data: Some(serde_json::json!({
-                "query": query,
-                "results": results,
+                "path": file_path,
+                "content": html_content,
+                "size": html_content.len(),
+                "format": "html",
             })),
             error: None,
-            message: Some(format!("找到 {} 个匹配的文件", results.len())),
+            message: Some(format!(
+              "成功读取 DOCX 文件（已转换为 HTML）: {}",
+              file_path
+            )),
+            error_kind: None,
+            display_error: None,
+          })
+        }
+        Err(e) => Ok(ToolResult {
+          success: false,
+          data: None,
+          error: Some(format!("读取 DOCX 文件失败: {}", e)),
+          message: None,
+          error_kind: None,
+          display_error: None,
+        }),
+      }
+    } else {
+      // 普通文本文件：直接读取
+      match std::fs::read_to_string(&full_path) {
+        Ok(content) => Ok(ToolResult {
+          success: true,
+          data: Some(serde_json::json!({
+              "path": file_path,
+              "content": content,
+              "size": content.len(),
+          })),
+          error: None,
+          message: Some(format!("成功读取文件: {}", file_path)),
+          error_kind: None,
+          display_error: None,
+        }),
+        Err(e) => Ok(ToolResult {
+          success: false,
+          data: None,
+          error: Some(format!("读取文件失败: {}", e)),
+          message: None,
+          error_kind: None,
+          display_error: None,
+        }),
+      }
+    }
+  }
+
+  /// 创建文件（原子写入）
+  async fn create_file(
+    &self,
+    tool_call: &ToolCall,
+    workspace_path: &Path,
+  ) -> Result<ToolResult, String> {
+    eprintln!(
+      "🔧 create_file 调用参数: {}",
+      serde_json::to_string(&tool_call.arguments).unwrap_or_default()
+    );
+
+    let file_path = tool_call
+      .arguments
+      .get("path")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| {
+        eprintln!(
+          "❌ create_file 缺少 path 参数，arguments: {:?}",
+          tool_call.arguments
+        );
+        "缺少 path 参数".to_string()
+      })?;
+
+    // content 可以为空字符串，但不能缺失
+    let content = tool_call
+      .arguments
+      .get("content")
+      .and_then(|v| v.as_str())
+      .unwrap_or(""); // 如果 content 不存在，使用空字符串
+
+    let full_path = workspace_path.join(file_path);
+
+    // 验证路径安全性
+    // 检查路径是否包含 .. 或其他不安全字符
+    if file_path.contains("..") || file_path.contains("/") && file_path.starts_with("/") {
+      return Err("路径不安全".to_string());
+    }
+
+    // 对于已存在的文件，使用 PathValidator 验证
+    if full_path.exists() {
+      if PathValidator::validate_workspace_path(&full_path, workspace_path).is_err() {
+        return Err("路径不安全".to_string());
+      }
+    } else {
+      // 对于不存在的文件，检查父目录是否在工作区内
+      if let Some(parent) = full_path.parent() {
+        if parent.exists() {
+          if PathValidator::validate_workspace_path(parent, workspace_path).is_err() {
+            return Err("路径不安全".to_string());
+          }
+        } else {
+          // 如果父目录也不存在，检查路径是否在工作区根目录下
+          if !full_path.starts_with(workspace_path) {
+            return Err("路径不安全".to_string());
+          }
+        }
+      }
+    }
+
+    // 检查文件是否已存在
+    if full_path.exists() {
+      return Ok(ToolResult {
+        success: false,
+        data: None,
+        error: Some(format!("文件已存在: {}", file_path)),
+        message: None,
+        error_kind: None,
+        display_error: None,
+      });
+    }
+
+    // 创建父目录
+    if let Some(parent) = full_path.parent() {
+      if let Err(e) = std::fs::create_dir_all(parent) {
+        return Ok(ToolResult {
+          success: false,
+          data: None,
+          error: Some(format!("创建目录失败: {}", e)),
+          message: None,
+          error_kind: None,
+          display_error: None,
+        });
+      }
+    }
+
+    // 检查文件扩展名，如果是 DOCX，需要特殊处理
+    let ext = full_path
+      .extension()
+      .and_then(|s| s.to_str())
+      .map(|s| s.to_lowercase());
+
+    if ext.as_deref() == Some("docx") {
+      // DOCX 文件：使用 Pandoc 将内容转换为 DOCX 格式
+      use crate::services::pandoc_service::PandocService;
+      let pandoc_service = PandocService::new();
+
+      if !pandoc_service.is_available() {
+        return Ok(ToolResult {
+          success: false,
+          data: None,
+          error: Some(
+            "Pandoc 不可用，无法创建 DOCX 文件。请安装 Pandoc 或使用其他格式。".to_string(),
+          ),
+          message: None,
+          error_kind: None,
+          display_error: None,
+        });
+      }
+
+      // 将内容（Markdown 或 HTML）转换为 DOCX
+      match pandoc_service.convert_html_to_docx(&content, &full_path) {
+        Ok(_) => Ok(ToolResult {
+          success: true,
+          data: Some(serde_json::json!({
+              "path": file_path,
+              "format": "docx",
+          })),
+          error: None,
+          message: Some(format!("成功创建 DOCX 文件: {}", file_path)),
+          error_kind: None,
+          display_error: None,
+        }),
+        Err(e) => Ok(ToolResult {
+          success: false,
+          data: None,
+          error: Some(format!("转换 DOCX 失败: {}", e)),
+          message: None,
+          error_kind: None,
+          display_error: None,
+        }),
+      }
+    } else {
+      // 其他文件：直接写入文本内容
+      match self.atomic_write_file(&full_path, content.as_bytes()) {
+        Ok(_) => Ok(ToolResult {
+          success: true,
+          data: Some(serde_json::json!({
+              "path": file_path,
+              "size": content.len(),
+          })),
+          error: None,
+          message: Some(format!("成功创建文件: {}", file_path)),
+          error_kind: None,
+          display_error: None,
+        }),
+        Err(e) => Ok(ToolResult {
+          success: false,
+          data: None,
+          error: Some(format!("写入文件失败: {}", e)),
+          message: None,
+          error_kind: None,
+          display_error: None,
+        }),
+      }
+    }
+  }
+
+  /// 更新文件（原子写入）
+  async fn update_file(
+    &self,
+    tool_call: &ToolCall,
+    workspace_path: &Path,
+  ) -> Result<ToolResult, String> {
+    let file_path = tool_call
+      .arguments
+      .get("path")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| "缺少 path 参数".to_string())?;
+
+    let content = tool_call
+      .arguments
+      .get("content")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| "缺少 content 参数".to_string())?;
+
+    let full_path = workspace_path.join(file_path);
+
+    // 验证路径安全性
+    // 检查路径是否包含 .. 或其他不安全字符
+    if file_path.contains("..") || file_path.contains("/") && file_path.starts_with("/") {
+      return Err("路径不安全".to_string());
+    }
+
+    // 对于已存在的文件，使用 PathValidator 验证
+    if full_path.exists() {
+      if PathValidator::validate_workspace_path(&full_path, workspace_path).is_err() {
+        return Err("路径不安全".to_string());
+      }
+    } else {
+      // 对于不存在的文件，检查父目录是否在工作区内
+      if let Some(parent) = full_path.parent() {
+        if parent.exists() {
+          if PathValidator::validate_workspace_path(parent, workspace_path).is_err() {
+            return Err("路径不安全".to_string());
+          }
+        } else {
+          // 如果父目录也不存在，检查路径是否在工作区根目录下
+          if !full_path.starts_with(workspace_path) {
+            return Err("路径不安全".to_string());
+          }
+        }
+      }
+    }
+
+    // 检查文件是否存在
+    if !full_path.exists() {
+      return Ok(ToolResult {
+        success: false,
+        data: None,
+        error: Some(format!("文件不存在: {}", file_path)),
+        message: None,
+        error_kind: None,
+        display_error: None,
+      });
+    }
+
+    // use_diff：生成 pending diffs，不写盘
+    let use_diff = tool_call
+      .arguments
+      .get("use_diff")
+      .and_then(|v| v.as_bool())
+      .unwrap_or(true);
+
+    if use_diff {
+      let db =
+        WorkspaceDb::new(workspace_path).map_err(|e| format!("WorkspaceDb 初始化失败: {}", e))?;
+
+      let mtime = std::fs::metadata(&full_path)
+        .and_then(|m| m.modified())
+        .map(|t| {
+          t.duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64
         })
-    }
+        .unwrap_or(0);
 
-    fn search_files_recursive(
-        &self,
-        root: &Path,
-        current: &Path,
-        query: &str,
-        results: &mut Vec<serde_json::Value>,
-    ) -> Result<(), String> {
-        if let Ok(entries) = std::fs::read_dir(current) {
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    let path = entry.path();
-                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+      let file_type = full_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("txt")
+        .to_lowercase();
 
-                    if name.contains(query) {
-                        results.push(serde_json::json!({
-                            "name": name,
-                            "path": path.strip_prefix(root)
-                                .ok()
-                                .and_then(|p| p.to_str())
-                                .unwrap_or(""),
-                            "is_directory": path.is_dir(),
-                        }));
-                    }
-
-                    if path.is_dir() {
-                        self.search_files_recursive(root, &path, query, results)?;
-                    }
-                }
+      let old_content = match db.get_file_cache(file_path)? {
+        Some(entry) if entry.mtime == mtime => materialize_cached_body_if_stale_hash(
+          &db,
+          file_path,
+          &file_type,
+          entry.cached_content.clone(),
+          entry.content_hash.clone(),
+          mtime,
+        )?,
+        _ => {
+          let raw = if file_type == "docx" {
+            use crate::services::pandoc_service::PandocService;
+            let pandoc = PandocService::new();
+            if pandoc.is_available() {
+              pandoc
+                .convert_document_to_html(&full_path, full_path.parent())
+                .map_err(|e| format!("读取 DOCX 失败: {}", e))?
+            } else {
+              return Ok(ToolResult {
+                success: false,
+                data: None,
+                error: Some("Pandoc 不可用，无法读取 DOCX".to_string()),
+                message: None,
+                error_kind: None,
+                display_error: None,
+              });
             }
+          } else {
+            std::fs::read_to_string(&full_path).map_err(|e| format!("读取文件失败: {}", e))?
+          };
+          if should_run_workspace_canonical_pipeline(&file_type) {
+            let (html, hash) = canonical_html_for_workspace_cache(&raw);
+            db.upsert_file_cache(
+              file_path,
+              &file_type,
+              Some(&html),
+              Some(hash.as_str()),
+              mtime,
+            )?;
+            html
+          } else {
+            db.upsert_file_cache(file_path, &file_type, Some(&raw), None, mtime)?;
+            raw
+          }
         }
-        Ok(())
+      };
+
+      let diffs =
+        diff_engine::generate_pending_diffs_for_file_type(&old_content, content, &file_type);
+      let rows: Vec<(String, String, i32)> = diffs
+        .iter()
+        .map(|d| (d.original_text.clone(), d.new_text.clone(), d.para_index))
+        .collect();
+
+      let entries = db.insert_pending_diffs(file_path, &rows)?;
+      let pending_dtos: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|e| {
+          serde_json::json!({
+              "id": e.id,
+              "file_path": e.file_path,
+              "diff_index": e.diff_index,
+              "original_text": e.original_text,
+              "new_text": e.new_text,
+              "para_index": e.para_index,
+              "diff_type": e.diff_type,
+              "status": e.status,
+          })
+        })
+        .collect();
+
+      return Ok(ToolResult {
+        success: true,
+        data: Some(serde_json::json!({
+            "written": false,
+            "path": file_path,
+            "pending_diffs": pending_dtos,
+        })),
+        error: None,
+        message: Some(format!(
+          "已生成 {} 处待确认修改，请用户确认后写盘",
+          entries.len()
+        )),
+        error_kind: None,
+        display_error: None,
+      });
     }
 
-    /// 移动文件
-    async fn move_file(
-        &self,
-        tool_call: &ToolCall,
-        workspace_path: &Path,
-    ) -> Result<ToolResult, String> {
-        let source_path = tool_call
-            .arguments
-            .get("source")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "缺少 source 参数".to_string())?;
+    // 原子写入文件
+    match self.atomic_write_file(&full_path, content.as_bytes()) {
+      Ok(_) => Ok(ToolResult {
+        success: true,
+        data: Some(serde_json::json!({
+            "path": file_path,
+            "size": content.len(),
+        })),
+        error: None,
+        message: Some(format!("成功更新文件: {}", file_path)),
+        error_kind: None,
+        display_error: None,
+      }),
+      Err(e) => Ok(ToolResult {
+        success: false,
+        data: None,
+        error: Some(format!("写入文件失败: {}", e)),
+        message: None,
+        error_kind: None,
+        display_error: None,
+      }),
+    }
+  }
 
-        let dest_path = tool_call
-            .arguments
-            .get("destination")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "缺少 destination 参数".to_string())?;
+  /// 删除文件
+  async fn delete_file(
+    &self,
+    tool_call: &ToolCall,
+    workspace_path: &Path,
+  ) -> Result<ToolResult, String> {
+    let file_path = tool_call
+      .arguments
+      .get("path")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| "缺少 path 参数".to_string())?;
 
-        let source_full = workspace_path.join(source_path);
-        let dest_full = workspace_path.join(dest_path);
+    let full_path = workspace_path.join(file_path);
 
-        // 验证路径安全性
-        if source_path.contains("..") || dest_path.contains("..") {
+    // 验证路径安全性
+    // 检查路径是否包含 .. 或其他不安全字符
+    if file_path.contains("..") || file_path.contains("/") && file_path.starts_with("/") {
+      return Err("路径不安全".to_string());
+    }
+
+    // 对于已存在的文件，使用 PathValidator 验证
+    if full_path.exists() {
+      if PathValidator::validate_workspace_path(&full_path, workspace_path).is_err() {
+        return Err("路径不安全".to_string());
+      }
+    } else {
+      // 对于不存在的文件，检查父目录是否在工作区内
+      if let Some(parent) = full_path.parent() {
+        if parent.exists() {
+          if PathValidator::validate_workspace_path(parent, workspace_path).is_err() {
             return Err("路径不安全".to_string());
+          }
+        } else {
+          // 如果父目录也不存在，检查路径是否在工作区根目录下
+          if !full_path.starts_with(workspace_path) {
+            return Err("路径不安全".to_string());
+          }
         }
-
-        if source_full.exists() {
-            if PathValidator::validate_workspace_path(&source_full, workspace_path).is_err() {
-                return Err("源路径不安全".to_string());
-            }
-        }
-
-        // 检查源文件是否存在
-        if !source_full.exists() {
-            return Ok(ToolResult {
-                success: false,
-                data: None,
-                error: Some(format!("源文件不存在: {}", source_path)),
-                message: None,
-            });
-        }
-
-        // 检查目标文件是否已存在
-        if dest_full.exists() {
-            return Ok(ToolResult {
-                success: false,
-                data: None,
-                error: Some(format!("目标文件已存在: {}", dest_path)),
-                message: None,
-            });
-        }
-
-        // 创建目标目录
-        if let Some(parent) = dest_full.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                return Ok(ToolResult {
-                    success: false,
-                    data: None,
-                    error: Some(format!("创建目标目录失败: {}", e)),
-                    message: None,
-                });
-            }
-        }
-
-        // 移动文件
-        match std::fs::rename(&source_full, &dest_full) {
-            Ok(_) => Ok(ToolResult {
-                success: true,
-                data: Some(serde_json::json!({
-                    "source": source_path,
-                    "destination": dest_path,
-                })),
-                error: None,
-                message: Some(format!("成功移动文件: {} -> {}", source_path, dest_path)),
-            }),
-            Err(e) => Ok(ToolResult {
-                success: false,
-                data: None,
-                error: Some(format!("移动文件失败: {}", e)),
-                message: None,
-            }),
-        }
+      }
     }
 
-    /// 重命名文件
-    async fn rename_file(
-        &self,
-        tool_call: &ToolCall,
-        workspace_path: &Path,
-    ) -> Result<ToolResult, String> {
-        let file_path = tool_call
-            .arguments
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "缺少 path 参数".to_string())?;
+    // 检查文件或文件夹是否存在
+    if !full_path.exists() {
+      return Ok(ToolResult {
+        success: false,
+        data: None,
+        error: Some(format!("文件或文件夹不存在: {}", file_path)),
+        message: None,
+        error_kind: None,
+        display_error: None,
+      });
+    }
 
-        let new_name = tool_call
-            .arguments
-            .get("new_name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "缺少 new_name 参数".to_string())?;
+    // 判断是文件还是文件夹，使用不同的删除方法
+    let metadata = match std::fs::metadata(&full_path) {
+      Ok(m) => m,
+      Err(e) => {
+        return Ok(ToolResult {
+          success: false,
+          data: None,
+          error: Some(format!("无法获取文件信息: {}", e)),
+          message: None,
+          error_kind: None,
+          display_error: None,
+        });
+      }
+    };
 
-        let full_path = workspace_path.join(file_path);
+    // 删除文件或文件夹
+    let result = if metadata.is_dir() {
+      // 删除文件夹（递归删除）
+      std::fs::remove_dir_all(&full_path)
+    } else {
+      // 删除文件
+      std::fs::remove_file(&full_path)
+    };
 
-        // 验证路径安全性
-        if file_path.contains("..") || new_name.contains("..") || new_name.contains("/") || new_name.contains("\\") {
-            return Err("路径不安全".to_string());
-        }
+    match result {
+      Ok(_) => Ok(ToolResult {
+        success: true,
+        data: Some(serde_json::json!({
+            "path": file_path,
+            "type": if metadata.is_dir() { "folder" } else { "file" },
+        })),
+        error: None,
+        message: Some(format!(
+          "成功删除{}: {}",
+          if metadata.is_dir() {
+            "文件夹"
+          } else {
+            "文件"
+          },
+          file_path
+        )),
+        error_kind: None,
+        display_error: None,
+      }),
+      Err(e) => Ok(ToolResult {
+        success: false,
+        data: None,
+        error: Some(format!(
+          "删除{}失败: {}",
+          if metadata.is_dir() {
+            "文件夹"
+          } else {
+            "文件"
+          },
+          e
+        )),
+        message: None,
+        error_kind: None,
+        display_error: None,
+      }),
+    }
+  }
 
-        if full_path.exists() {
-            if PathValidator::validate_workspace_path(&full_path, workspace_path).is_err() {
-                return Err("路径不安全".to_string());
-            }
-        }
+  /// 列出文件
+  async fn list_files(
+    &self,
+    tool_call: &ToolCall,
+    workspace_path: &Path,
+  ) -> Result<ToolResult, String> {
+    let dir_path = tool_call
+      .arguments
+      .get("path")
+      .and_then(|v| v.as_str())
+      .unwrap_or(".");
 
-        // 检查文件是否存在
-        if !full_path.exists() {
-            return Ok(ToolResult {
-                success: false,
-                data: None,
-                error: Some(format!("文件不存在: {}", file_path)),
-                message: None,
-            });
-        }
+    let full_path = workspace_path.join(dir_path);
 
-        // 构建新路径
-        let parent = full_path.parent().ok_or_else(|| "无法获取父目录".to_string())?;
-        let new_path = parent.join(new_name);
+    // 验证路径安全性
+    if dir_path.contains("..") {
+      return Err("路径不安全".to_string());
+    }
 
-        // 检查新名称是否已存在
-        if new_path.exists() {
-            return Ok(ToolResult {
-                success: false,
-                data: None,
-                error: Some(format!("目标名称已存在: {}", new_name)),
-                message: None,
-            });
-        }
+    if full_path.exists() {
+      if PathValidator::validate_workspace_path(&full_path, workspace_path).is_err() {
+        return Err("路径不安全".to_string());
+      }
+    }
 
-        // 重命名文件
-        match std::fs::rename(&full_path, &new_path) {
-            Ok(_) => {
-                // 计算新的相对路径
-                let new_relative = new_path.strip_prefix(workspace_path)
+    // 检查目录是否存在
+    if !full_path.exists() {
+      return Ok(ToolResult {
+        success: false,
+        data: None,
+        error: Some(format!("目录不存在: {}", dir_path)),
+        message: None,
+        error_kind: None,
+        display_error: None,
+      });
+    }
+
+    // 列出文件
+    match std::fs::read_dir(&full_path) {
+      Ok(entries) => {
+        let mut files = Vec::new();
+        for entry in entries {
+          if let Ok(entry) = entry {
+            let path = entry.path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let is_dir = path.is_dir();
+            files.push(serde_json::json!({
+                "name": name,
+                "path": path.strip_prefix(workspace_path)
                     .ok()
                     .and_then(|p| p.to_str())
-                    .unwrap_or("");
-
-                Ok(ToolResult {
-                    success: true,
-                    data: Some(serde_json::json!({
-                        "old_path": file_path,
-                        "new_path": new_relative,
-                        "new_name": new_name,
-                    })),
-                    error: None,
-                    message: Some(format!("成功重命名文件: {} -> {}", file_path, new_name)),
-                })
-            }
-            Err(e) => Ok(ToolResult {
-                success: false,
-                data: None,
-                error: Some(format!("重命名文件失败: {}", e)),
-                message: None,
-            }),
+                    .unwrap_or(""),
+                "is_directory": is_dir,
+            }));
+          }
         }
-    }
-
-    /// 创建文件夹
-    async fn create_folder(
-        &self,
-        tool_call: &ToolCall,
-        workspace_path: &Path,
-    ) -> Result<ToolResult, String> {
-        eprintln!("🔧 create_folder 调用参数: {}", serde_json::to_string(&tool_call.arguments).unwrap_or_default());
-        eprintln!("🔧 工作区路径: {:?}", workspace_path);
-        
-        let folder_path = tool_call
-            .arguments
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                eprintln!("❌ create_folder 缺少 path 参数，arguments: {:?}", tool_call.arguments);
-                "缺少 path 参数".to_string()
-            })?;
-
-        let full_path = workspace_path.join(folder_path);
-        eprintln!("🔧 完整路径: {:?}", full_path);
-
-        // 验证路径安全性
-        if folder_path.contains("..") {
-            eprintln!("❌ 路径不安全，包含 ..");
-            return Err("路径不安全".to_string());
-        }
-
-        // 检查文件夹是否已存在
-        if full_path.exists() {
-            if full_path.is_dir() {
-                eprintln!("✅ 文件夹已存在: {:?}", full_path);
-                return Ok(ToolResult {
-                    success: true,
-                    data: Some(serde_json::json!({
-                        "path": folder_path,
-                        "full_path": full_path.to_string_lossy().to_string(),
-                        "message": "文件夹已存在",
-                    })),
-                    error: None,
-                    message: Some(format!("文件夹已存在: {}", folder_path)),
-                });
-            } else {
-                eprintln!("❌ 路径已存在但不是文件夹: {:?}", full_path);
-                return Ok(ToolResult {
-                    success: false,
-                    data: None,
-                    error: Some(format!("路径已存在但不是文件夹: {}", folder_path)),
-                    message: None,
-                });
-            }
-        }
-
-        // 创建文件夹
-        eprintln!("🚀 开始创建文件夹: {:?}", full_path);
-        match std::fs::create_dir_all(&full_path) {
-            Ok(_) => {
-                eprintln!("✅ 文件夹创建成功: {:?}", full_path);
-                // 验证文件夹是否真的创建成功
-                if full_path.exists() && full_path.is_dir() {
-                    Ok(ToolResult {
-                        success: true,
-                        data: Some(serde_json::json!({
-                            "path": folder_path,
-                            "full_path": full_path.to_string_lossy().to_string(),
-                        })),
-                        error: None,
-                        message: Some(format!("成功创建文件夹: {}", folder_path)),
-                    })
-                } else {
-                    eprintln!("⚠️ 文件夹创建后验证失败: {:?}", full_path);
-                    Ok(ToolResult {
-                        success: false,
-                        data: None,
-                        error: Some(format!("文件夹创建后验证失败: {}", folder_path)),
-                        message: None,
-                    })
-                }
-            }
-            Err(e) => {
-                eprintln!("❌ 创建文件夹失败: {:?} - {}", full_path, e);
-                Ok(ToolResult {
-                    success: false,
-                    data: None,
-                    error: Some(format!("创建文件夹失败: {} - {}", folder_path, e)),
-                    message: None,
-                })
-            }
-        }
-    }
-
-    /// 获取当前编辑器打开的文件
-    /// 注意：这个工具需要通过事件系统与前端通信，这里返回一个占位符
-    async fn get_current_editor_file(
-        &self,
-        _tool_call: &ToolCall,
-    ) -> Result<ToolResult, String> {
-        // 这个工具需要前端状态信息，返回提示信息
         Ok(ToolResult {
-            success: true,
-            data: Some(serde_json::json!({
-                "message": "请在前端自动引用当前编辑器打开的文件",
-                "note": "当前编辑器打开的文件会自动添加到引用中"
-            })),
-            error: None,
-            message: Some("当前编辑器打开的文件信息会通过引用系统提供".to_string()),
+          success: true,
+          data: Some(serde_json::json!({
+              "path": dir_path,
+              "files": files,
+          })),
+          error: None,
+          message: Some(format!("成功列出目录: {}", dir_path)),
+          error_kind: None,
+          display_error: None,
         })
+      }
+      Err(e) => Ok(ToolResult {
+        success: false,
+        data: None,
+        error: Some(format!("读取目录失败: {}", e)),
+        message: None,
+        error_kind: None,
+        display_error: None,
+      }),
+    }
+  }
+
+  /// 搜索文件
+  async fn search_files(
+    &self,
+    tool_call: &ToolCall,
+    workspace_path: &Path,
+  ) -> Result<ToolResult, String> {
+    let query = tool_call
+      .arguments
+      .get("query")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| "缺少 query 参数".to_string())?;
+
+    // 简单的文件名搜索（后续可以优化为全文搜索）
+    let mut results = Vec::new();
+    self.search_files_recursive(workspace_path, workspace_path, query, &mut results)?;
+
+    Ok(ToolResult {
+      success: true,
+      data: Some(serde_json::json!({
+          "query": query,
+          "results": results,
+      })),
+      error: None,
+      message: Some(format!("找到 {} 个匹配的文件", results.len())),
+      error_kind: None,
+      display_error: None,
+    })
+  }
+
+  fn search_files_recursive(
+    &self,
+    root: &Path,
+    current: &Path,
+    query: &str,
+    results: &mut Vec<serde_json::Value>,
+  ) -> Result<(), String> {
+    if let Ok(entries) = std::fs::read_dir(current) {
+      for entry in entries {
+        if let Ok(entry) = entry {
+          let path = entry.path();
+          let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+          if name.contains(query) {
+            results.push(serde_json::json!({
+                "name": name,
+                "path": path.strip_prefix(root)
+                    .ok()
+                    .and_then(|p| p.to_str())
+                    .unwrap_or(""),
+                "is_directory": path.is_dir(),
+            }));
+          }
+
+          if path.is_dir() {
+            self.search_files_recursive(root, &path, query, results)?;
+          }
+        }
+      }
+    }
+    Ok(())
+  }
+
+  /// 移动文件
+  async fn move_file(
+    &self,
+    tool_call: &ToolCall,
+    workspace_path: &Path,
+  ) -> Result<ToolResult, String> {
+    let source_path = tool_call
+      .arguments
+      .get("source")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| "缺少 source 参数".to_string())?;
+
+    let dest_path = tool_call
+      .arguments
+      .get("destination")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| "缺少 destination 参数".to_string())?;
+
+    let source_full = workspace_path.join(source_path);
+    let dest_full = workspace_path.join(dest_path);
+
+    // 验证路径安全性
+    if source_path.contains("..") || dest_path.contains("..") {
+      return Err("路径不安全".to_string());
     }
 
-    /// 当 AI 只返回替换片段时，根据 instruction/target_content 在当前内容中做一次替换，得到完整新内容再参与 diff。
-    /// 优先解析 instruction 中的「将 "X" 修改为 ... "Y"」模式，只做短语级替换，避免整篇被替换。
-    fn resolve_new_content_for_diff(
-        current_content: &str,
-        new_content: &str,
-        target_content: Option<&str>,
-        instruction: Option<&str>,
-    ) -> String {
-        // 1. 优先：instruction 中明确「将 X 改为 Y」时，提取两处引号内容，只做短语替换（不依赖 AI 的 content 长度）
-        if let Some((old_str, new_str)) = Self::extract_two_quoted_from_instruction(instruction) {
-            if !old_str.is_empty() && !new_str.is_empty() && current_content.contains(old_str.as_str()) {
-                let full = current_content.replacen(old_str.as_str(), new_str.as_str(), 1);
-                eprintln!("📝 [edit_current_editor_document] 已按 instruction 短语替换: \"{}\" -> \"{}\"", old_str.chars().take(20).collect::<String>(), new_str.chars().take(20).collect::<String>());
-                return full;
-            }
-        }
-
-        let current_chars = current_content.chars().count();
-        let new_chars = new_content.chars().count();
-
-        // 2. 若有 target_content（如前端传入的选中文本）且当前内容包含它，且新内容较短（短语级），只做短语替换
-        if let Some(ref target) = target_content {
-            let t = target.trim();
-            if !t.is_empty() && current_content.contains(t) {
-                let phrase_max = 300.max(current_chars / 5);
-                if new_chars <= phrase_max {
-                    let full = current_content.replacen(t, new_content, 1);
-                    eprintln!("📝 [edit_current_editor_document] 已按 target_content 短语替换: \"{}\" (新内容长度: {})", t.chars().take(20).collect::<String>(), new_chars);
-                    return full;
-                }
-                // 3. 若有 target_content 但 AI 返回了长文档，不做整篇替换，避免覆盖用户只想改的词
-                if new_chars >= current_chars / 3 {
-                    eprintln!("📝 [edit_current_editor_document] 检测到 target_content 但 content 为长文档，跳过整篇替换，保持当前内容");
-                    return current_content.to_string();
-                }
-            }
-        }
-
-        // 若新内容长度已接近当前内容（例如超过 30%），视为 AI 已返回完整文档，直接使用
-        if current_chars > 0 && new_chars >= current_chars / 3 {
-            return new_content.to_string();
-        }
-        // 确定要被替换的原文：优先 target_content，否则从 instruction 中解析第一个引号内的片段
-        let to_replace: Option<String> = target_content
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| s.trim().to_string())
-            .or_else(|| Self::extract_first_quoted_from_instruction(instruction));
-        let Some(ref old) = to_replace else {
-            return new_content.to_string();
-        };
-        if old.is_empty() || !current_content.contains(old.as_str()) {
-            return new_content.to_string();
-        }
-        // 在当前内容中只替换第一次出现，得到完整新内容
-        let full = current_content.replacen(old.as_str(), new_content, 1);
-        eprintln!("📝 [edit_current_editor_document] content 为替换片段，已用 instruction/target 构建完整新内容（替换 \"{}\"）", old.chars().take(20).collect::<String>());
-        full
+    if source_full.exists() {
+      if PathValidator::validate_workspace_path(&source_full, workspace_path).is_err() {
+        return Err("源路径不安全".to_string());
+      }
     }
 
-    /// 从 instruction 中提取前两处引号内的内容，用于「将 "X" 修改为 ... "Y"」的短语替换。
-    /// 例如：将\"高度自动化\"修改为英文\"High Automation\" -> ("高度自动化", "High Automation")
-    fn extract_two_quoted_from_instruction(instruction: Option<&str>) -> Option<(String, String)> {
-        let s = instruction?.trim();
-        if s.is_empty() {
-            return None;
-        }
-        let quote_chars = ['"', '"', '"', '"', '\''];
-        let mut segments: Vec<String> = Vec::new();
-        let mut start: Option<usize> = None;
-        for (i, c) in s.char_indices() {
-            if quote_chars.contains(&c) {
-                if start.is_none() {
-                    start = Some(i + c.len_utf8());
-                } else {
-                    if let Some(st) = start {
-                        if st < i {
-                            segments.push(s[st..i].to_string());
-                        }
-                        start = None;
-                    }
-                }
-            }
-        }
-        if segments.len() >= 2 {
-            Some((segments[0].clone(), segments[1].clone()))
-        } else {
-            None
-        }
+    // 检查源文件是否存在
+    if !source_full.exists() {
+      return Ok(ToolResult {
+        success: false,
+        data: None,
+        error: Some(format!("源文件不存在: {}", source_path)),
+        message: None,
+        error_kind: None,
+        display_error: None,
+      });
     }
 
-    /// 从 instruction 中提取第一个双引号或中文引号之间的内容（作为「要被替换」的原文）
-    fn extract_first_quoted_from_instruction(instruction: Option<&str>) -> Option<String> {
-        let s = instruction?.trim();
-        if s.is_empty() {
-            return None;
-        }
-        let mut chars = s.char_indices().peekable();
-        let mut start: Option<usize> = None;
-        let quote_chars = ['"', '"', '"', '"', '\''];
-        while let Some((i, c)) = chars.next() {
-            if quote_chars.contains(&c) {
-                if start.is_none() {
-                    start = Some(i + c.len_utf8()); // 跳过引号，记录内容起始（字节）
-                } else {
-                    let start_byte = start.unwrap();
-                    if start_byte < i {
-                        return Some(s[start_byte..i].to_string());
-                    }
-                    start = None;
-                }
-            }
-        }
-        None
+    // 检查目标文件是否已存在
+    if dest_full.exists() {
+      return Ok(ToolResult {
+        success: false,
+        data: None,
+        error: Some(format!("目标文件已存在: {}", dest_path)),
+        message: None,
+        error_kind: None,
+        display_error: None,
+      });
     }
 
-    /// 从 HTML 内容中根据 block_id 和 offset 提取块内文本
-    fn extract_block_text_by_id(
-        html_content: &str,
-        block_id: &str,
-        start_offset: usize,
-        end_offset: usize,
-    ) -> Result<String, String> {
-        let document = Html::parse_document(html_content);
-        let selector = Selector::parse(&format!("[data-block-id=\"{}\"]", block_id))
-            .map_err(|e| format!("Selector 解析失败: {}", e))?;
-        let element = document
-            .select(&selector)
-            .next()
-            .ok_or_else(|| format!("未找到 block_id={} 的块", block_id))?;
-        let block_text: String = element.text().collect();
-        let char_count = block_text.chars().count();
-        if start_offset >= char_count || end_offset > char_count || start_offset >= end_offset {
-            return Err(format!(
-                "offset 越界: start={}, end={}, block_len={}",
-                start_offset, end_offset, char_count
-            ));
-        }
-        let extracted: String = block_text.chars().skip(start_offset).take(end_offset - start_offset).collect();
-        Ok(extracted)
+    // 创建目标目录
+    if let Some(parent) = dest_full.parent() {
+      if let Err(e) = std::fs::create_dir_all(parent) {
+        return Ok(ToolResult {
+          success: false,
+          data: None,
+          error: Some(format!("创建目标目录失败: {}", e)),
+          message: None,
+          error_kind: None,
+          display_error: None,
+        });
+      }
     }
 
-    /// 编辑当前编辑器打开的文档
-    /// 新实现：获取当前编辑器内容，计算 diff，返回完整的编辑信息
-    async fn edit_current_editor_document(
-        &self,
-        tool_call: &ToolCall,
-    ) -> Result<ToolResult, String> {
-        eprintln!("📝 [edit_current_editor_document] 开始处理文档编辑请求");
-        eprintln!("📝 [edit_current_editor_document] 工具调用参数: {:?}", tool_call.arguments);
-        
-        use crate::services::diff_service::{DiffService, Diff as DiffStruct, DiffType};
-        
-        // 0. 若有 edit_target（精确定位），走 Anchor 路径，直接返回单条 diff
-        if let Some(et) = tool_call.arguments.get("edit_target") {
-            if let Some(anchor) = et.get("anchor") {
-                let block_id = anchor.get("block_id").and_then(|v| v.as_str());
-                let start_offset = anchor.get("start_offset").and_then(|v| v.as_u64()).map(|u| u as usize);
-                let end_offset = anchor.get("end_offset").and_then(|v| v.as_u64()).map(|u| u as usize);
-                if let (Some(bid), Some(so), Some(eo)) = (block_id, start_offset, end_offset) {
-                    let current_content = tool_call.arguments.get("current_content").and_then(|v| v.as_str()).unwrap_or("");
-                    if let Ok(original_code) = Self::extract_block_text_by_id(current_content, bid, so, eo) {
-                        let elem_id = serde_json::json!({
-                            "block_id": bid,
-                            "start_offset": so,
-                            "end_offset": eo,
-                        }).to_string();
-                        let diff_area_id = format!("diff_area_{}", uuid::Uuid::new_v4());
-                        let new_code = tool_call.arguments.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                        // 注意：不在此处做全文替换，由前端根据 element_identifier 在编辑器中精确定位并替换
-                        let effective_new_content = current_content.to_string();
-                        eprintln!("✅ [edit_current_editor_document] 使用 edit_target 精确定位路径 (block_id={})", bid);
-                        return Ok(ToolResult {
-                            success: true,
-                            data: Some(serde_json::json!({
-                                "diff_area_id": diff_area_id,
-                                "file_path": tool_call.arguments.get("current_file").and_then(|v| v.as_str()).unwrap_or(""),
-                                "old_content": current_content,
-                                "new_content": effective_new_content,
-                                "diffs": vec![DiffStruct {
-                                    diff_id: format!("diff_{}", uuid::Uuid::new_v4()),
-                                    diff_area_id: diff_area_id.clone(),
-                                    diff_type: DiffType::Edit,
-                                    original_code: original_code.clone(),
-                                    original_start_line: 1,
-                                    original_end_line: 1,
-                                    new_code: new_code.to_string(),
-                                    start_line: 1,
-                                    end_line: 1,
-                                    context_before: None,
-                                    context_after: None,
-                                    element_type: Some("text".to_string()),
-                                    element_identifier: Some(elem_id),
-                                }],
-                            })),
-                            error: None,
-                            message: Some("文档编辑已准备（精确定位）".to_string()),
-                        });
-                    }
-                }
-            }
-        }
-        
-        // 1. 获取当前编辑器内容（从工具调用参数中获取，已在 ai_commands.rs 中增强）
-        let current_file = tool_call
-            .arguments
-            .get("current_file")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "缺少 current_file 参数，请确保前端传递了当前编辑器信息".to_string())?;
-        
-        let current_content = tool_call
-            .arguments
-            .get("current_content")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "缺少 current_content 参数，请确保前端传递了当前编辑器内容".to_string())?;
-        
-        // 2. 获取新内容
-        let new_content = tool_call
-            .arguments
-            .get("content")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "缺少 content 参数".to_string())?;
-        
-        // 3. 获取可选参数（用于增强 diff 信息）
-        let target_content = tool_call
-            .arguments
-            .get("target_content")
-            .and_then(|v| v.as_str());
-        let context_before = tool_call
-            .arguments
-            .get("context_before")
-            .and_then(|v| v.as_str());
-        let context_after = tool_call
-            .arguments
-            .get("context_after")
-            .and_then(|v| v.as_str());
-        let element_type = tool_call
-            .arguments
-            .get("element_type")
-            .and_then(|v| v.as_str());
-        let element_identifier = tool_call
-            .arguments
-            .get("element_identifier")
-            .and_then(|v| v.as_str());
-        
-        eprintln!("📝 [edit_current_editor_document] 当前文件: {}", current_file);
-        eprintln!("📝 [edit_current_editor_document] 当前内容长度: {} 字符", current_content.len());
-        eprintln!("📝 [edit_current_editor_document] 新内容长度: {} 字符", new_content.len());
-        eprintln!("📝 [edit_current_editor_document] 元素类型: {:?}", element_type);
-        eprintln!("📝 [edit_current_editor_document] 元素标识符: {:?}", element_identifier);
-        
-        // 4. 若 AI 只返回了替换片段（content 远短于当前内容），根据 instruction/target_content 构建完整新内容再算 diff
-        let instruction = tool_call
-            .arguments
-            .get("instruction")
-            .and_then(|v| v.as_str());
-        let effective_new_content = Self::resolve_new_content_for_diff(
-            current_content,
-            new_content,
-            target_content,
-            instruction,
+    // 移动文件
+    match std::fs::rename(&source_full, &dest_full) {
+      Ok(_) => Ok(ToolResult {
+        success: true,
+        data: Some(serde_json::json!({
+            "source": source_path,
+            "destination": dest_path,
+        })),
+        error: None,
+        message: Some(format!("成功移动文件: {} -> {}", source_path, dest_path)),
+        error_kind: None,
+        display_error: None,
+      }),
+      Err(e) => Ok(ToolResult {
+        success: false,
+        data: None,
+        error: Some(format!("移动文件失败: {}", e)),
+        message: None,
+        error_kind: None,
+        display_error: None,
+      }),
+    }
+  }
+
+  /// 重命名文件
+  async fn rename_file(
+    &self,
+    tool_call: &ToolCall,
+    workspace_path: &Path,
+  ) -> Result<ToolResult, String> {
+    let file_path = tool_call
+      .arguments
+      .get("path")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| "缺少 path 参数".to_string())?;
+
+    let new_name = tool_call
+      .arguments
+      .get("new_name")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| "缺少 new_name 参数".to_string())?;
+
+    let full_path = workspace_path.join(file_path);
+
+    // 验证路径安全性
+    if file_path.contains("..")
+      || new_name.contains("..")
+      || new_name.contains("/")
+      || new_name.contains("\\")
+    {
+      return Err("路径不安全".to_string());
+    }
+
+    if full_path.exists() {
+      if PathValidator::validate_workspace_path(&full_path, workspace_path).is_err() {
+        return Err("路径不安全".to_string());
+      }
+    }
+
+    // 检查文件是否存在
+    if !full_path.exists() {
+      return Ok(ToolResult {
+        success: false,
+        data: None,
+        error: Some(format!("文件不存在: {}", file_path)),
+        message: None,
+        error_kind: None,
+        display_error: None,
+      });
+    }
+
+    // 构建新路径
+    let parent = full_path
+      .parent()
+      .ok_or_else(|| "无法获取父目录".to_string())?;
+    let new_path = parent.join(new_name);
+
+    // 检查新名称是否已存在
+    if new_path.exists() {
+      return Ok(ToolResult {
+        success: false,
+        data: None,
+        error: Some(format!("目标名称已存在: {}", new_name)),
+        message: None,
+        error_kind: None,
+        display_error: None,
+      });
+    }
+
+    // 重命名文件
+    match std::fs::rename(&full_path, &new_path) {
+      Ok(_) => {
+        // 计算新的相对路径
+        let new_relative = new_path
+          .strip_prefix(workspace_path)
+          .ok()
+          .and_then(|p| p.to_str())
+          .unwrap_or("");
+
+        Ok(ToolResult {
+          success: true,
+          data: Some(serde_json::json!({
+              "old_path": file_path,
+              "new_path": new_relative,
+              "new_name": new_name,
+          })),
+          error: None,
+          message: Some(format!("成功重命名文件: {} -> {}", file_path, new_name)),
+          error_kind: None,
+          display_error: None,
+        })
+      }
+      Err(e) => Ok(ToolResult {
+        success: false,
+        data: None,
+        error: Some(format!("重命名文件失败: {}", e)),
+        message: None,
+        error_kind: None,
+        display_error: None,
+      }),
+    }
+  }
+
+  /// 创建文件夹
+  async fn create_folder(
+    &self,
+    tool_call: &ToolCall,
+    workspace_path: &Path,
+  ) -> Result<ToolResult, String> {
+    eprintln!(
+      "🔧 create_folder 调用参数: {}",
+      serde_json::to_string(&tool_call.arguments).unwrap_or_default()
+    );
+    eprintln!("🔧 工作区路径: {:?}", workspace_path);
+
+    let folder_path = tool_call
+      .arguments
+      .get("path")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| {
+        eprintln!(
+          "❌ create_folder 缺少 path 参数，arguments: {:?}",
+          tool_call.arguments
         );
-        
-        // 5. 计算 Diff（使用 DiffService）
-        eprintln!("📝 [edit_current_editor_document] 开始计算 diff...");
-        let diff_service = DiffService::new();
-        let mut diffs = diff_service.calculate_diff(current_content, &effective_new_content)
-            .map_err(|e| {
-                eprintln!("❌ [edit_current_editor_document] 计算 diff 失败: {}", e);
-                format!("计算 diff 失败: {}", e)
-            })?;
-        
-        eprintln!("📝 [edit_current_editor_document] 计算完成，共 {} 个 diff", diffs.len());
-        
-        // 5a. 若为「整篇替换」：单条 Edit 且变更块过大（>50% 原文或新文），改为一条「全文替换」diff，避免预览乱序/乱码
-        let current_chars = current_content.chars().count();
-        let new_chars_total = effective_new_content.chars().count();
-        if diffs.len() == 1 {
-            let d = &diffs[0];
-            if matches!(d.diff_type, DiffType::Edit) {
-                let orig_chars = d.original_code.chars().count();
-                let new_code_chars = d.new_code.chars().count();
-                let is_whole_replace = current_chars > 0
-                    && (orig_chars > current_chars / 2 || new_code_chars > new_chars_total / 2);
-                if is_whole_replace {
-                    eprintln!("📝 [edit_current_editor_document] 检测为整篇替换，改为单条 replace_whole diff");
-                    diffs = vec![DiffStruct {
-                        diff_id: format!("diff_{}", uuid::Uuid::new_v4()),
-                        diff_area_id: String::new(),
-                        diff_type: DiffType::Edit,
-                        original_code: current_content.to_string(),
-                        original_start_line: 1,
-                        original_end_line: 1,
-                        new_code: effective_new_content.clone(),
-                        start_line: 1,
-                        end_line: 1,
-                        context_before: None,
-                        context_after: None,
-                        element_type: Some("replace_whole".to_string()),
-                        element_identifier: None,
-                    }];
-                }
-            }
-        }
-        
-        // 6. 如果提供了上下文，增强 diff 信息
-        if let (Some(ctx_before), Some(ctx_after)) = (context_before, context_after) {
-            for diff in &mut diffs {
-                if diff.context_before.is_none() {
-                    diff.context_before = Some(ctx_before.to_string());
-                }
-                if diff.context_after.is_none() {
-                    diff.context_after = Some(ctx_after.to_string());
-                }
-            }
-        }
-        
-        // 7. 如果提供了元素类型，设置到 diff 中
-        if let Some(elem_type) = element_type {
-            for diff in &mut diffs {
-                diff.element_type = Some(elem_type.to_string());
-                if let Some(identifier) = element_identifier {
-                    diff.element_identifier = Some(identifier.to_string());
-                }
-            }
-        }
-        
-        // 调试：打印每个 diff 的上下文信息
-        for (i, diff) in diffs.iter().enumerate() {
-            eprintln!("📝 [edit_current_editor_document] Diff #{}: type={:?}, start_line={}, end_line={}, context_before={:?}, context_after={:?}, element_type={:?}", 
-                i + 1,
-                diff.diff_type,
-                diff.original_start_line,
-                diff.original_end_line,
-                diff.context_before.as_ref().map(|s| s.len()).unwrap_or(0),
-                diff.context_after.as_ref().map(|s| s.len()).unwrap_or(0),
-                diff.element_type,
-            );
-            if let Some(ref ctx_before) = diff.context_before {
-                eprintln!("   context_before: {}", ctx_before.chars().take(50).collect::<String>());
-            }
-            if let Some(ref ctx_after) = diff.context_after {
-                eprintln!("   context_after: {}", ctx_after.chars().take(50).collect::<String>());
-            }
-        }
-        
-        // 8. 生成 diff_area_id（MVP 阶段简化处理，阶段二使用 EditCodeService）
-        let diff_area_id = format!("diff_area_{}", uuid::Uuid::new_v4());
-        eprintln!("📝 [edit_current_editor_document] 生成的 diff_area_id: {}", diff_area_id);
-        
-        // 9. 返回结果（包含所有必要信息供前端使用；new_content 使用构建后的完整内容以便应用时一致）
-        let result = ToolResult {
+        "缺少 path 参数".to_string()
+      })?;
+
+    let full_path = workspace_path.join(folder_path);
+    eprintln!("🔧 完整路径: {:?}", full_path);
+
+    // 验证路径安全性
+    if folder_path.contains("..") {
+      eprintln!("❌ 路径不安全，包含 ..");
+      return Err("路径不安全".to_string());
+    }
+
+    // 检查文件夹是否已存在
+    if full_path.exists() {
+      if full_path.is_dir() {
+        eprintln!("✅ 文件夹已存在: {:?}", full_path);
+        return Ok(ToolResult {
+          success: true,
+          data: Some(serde_json::json!({
+              "path": folder_path,
+              "full_path": full_path.to_string_lossy().to_string(),
+              "message": "文件夹已存在",
+          })),
+          error: None,
+          message: Some(format!("文件夹已存在: {}", folder_path)),
+          error_kind: None,
+          display_error: None,
+        });
+      } else {
+        eprintln!("❌ 路径已存在但不是文件夹: {:?}", full_path);
+        return Ok(ToolResult {
+          success: false,
+          data: None,
+          error: Some(format!("路径已存在但不是文件夹: {}", folder_path)),
+          message: None,
+          error_kind: None,
+          display_error: None,
+        });
+      }
+    }
+
+    // 创建文件夹
+    eprintln!("🚀 开始创建文件夹: {:?}", full_path);
+    match std::fs::create_dir_all(&full_path) {
+      Ok(_) => {
+        eprintln!("✅ 文件夹创建成功: {:?}", full_path);
+        // 验证文件夹是否真的创建成功
+        if full_path.exists() && full_path.is_dir() {
+          Ok(ToolResult {
             success: true,
             data: Some(serde_json::json!({
-                "diff_area_id": diff_area_id,
-                "file_path": current_file,
-                "old_content": current_content,
-                "new_content": effective_new_content,
-                "diffs": diffs,  // 后端计算的 diffs，前端直接使用
+                "path": folder_path,
+                "full_path": full_path.to_string_lossy().to_string(),
             })),
             error: None,
-            message: Some("文档编辑已准备，请查看预览".to_string()),
-        };
-        
-        eprintln!("✅ [edit_current_editor_document] 文档编辑处理完成，返回结果");
-        Ok(result)
+            message: Some(format!("成功创建文件夹: {}", folder_path)),
+            error_kind: None,
+            display_error: None,
+          })
+        } else {
+          eprintln!("⚠️ 文件夹创建后验证失败: {:?}", full_path);
+          Ok(ToolResult {
+            success: false,
+            data: None,
+            error: Some(format!("文件夹创建后验证失败: {}", folder_path)),
+            message: None,
+            error_kind: None,
+            display_error: None,
+          })
+        }
+      }
+      Err(e) => {
+        eprintln!("❌ 创建文件夹失败: {:?} - {}", full_path, e);
+        Ok(ToolResult {
+          success: false,
+          data: None,
+          error: Some(format!("创建文件夹失败: {} - {}", folder_path, e)),
+          message: None,
+          error_kind: None,
+          display_error: None,
+        })
+      }
     }
+  }
 
-    /// 原子文件写入
-    fn atomic_write_file(&self, path: &Path, content: &[u8]) -> Result<(), String> {
-        // 1. 创建临时文件
-        let temp_path = path.with_extension(format!(
-            "{}.tmp.{}",
-            path.extension()
-                .and_then(|s| s.to_str())
-                .unwrap_or("tmp"),
-            std::process::id()
+  /// 获取当前编辑器打开的文件
+  /// 注意：这个工具需要通过事件系统与前端通信，这里返回一个占位符
+  async fn get_current_editor_file(&self, _tool_call: &ToolCall) -> Result<ToolResult, String> {
+    // 这个工具需要前端状态信息，返回提示信息
+    Ok(ToolResult {
+      success: true,
+      data: Some(serde_json::json!({
+          "message": "请在前端自动引用当前编辑器打开的文件",
+          "note": "当前编辑器打开的文件会自动添加到引用中"
+      })),
+      error: None,
+      message: Some("当前编辑器打开的文件信息会通过引用系统提供".to_string()),
+      error_kind: None,
+      display_error: None,
+    })
+  }
+
+  /// Phase 0.5：从 HTML 中提取跨块或单块文本
+  /// 单块：start_block_id == end_block_id，取 [start_offset, end_offset]
+  /// 跨块：start 块 [start_offset..] + "\n" + 中间块全文 + "\n" + end 块 [..end_offset]
+  fn extract_block_range(
+    html_content: &str,
+    start_block_id: &str,
+    start_offset: usize,
+    end_block_id: &str,
+    end_offset: usize,
+  ) -> Result<String, String> {
+    let document = Html::parse_document(html_content);
+    let block_selector =
+      Selector::parse("[data-block-id]").map_err(|e| format!("Selector 解析失败: {}", e))?;
+    let blocks: Vec<_> = document.select(&block_selector).collect();
+
+    if start_block_id == end_block_id {
+      let el = blocks
+        .iter()
+        .find(|e| e.value().attr("data-block-id") == Some(start_block_id))
+        .ok_or_else(|| format!("未找到 block_id={} 的块", start_block_id))?;
+      let text: String = el.text().collect();
+      let chars: Vec<_> = text.chars().collect();
+      let len = chars.len();
+      if start_offset >= len || end_offset > len || start_offset >= end_offset {
+        return Err(format!(
+          "offset 越界: start={}, end={}, block_len={}",
+          start_offset, end_offset, len
         ));
-
-        // 2. 写入临时文件
-        std::fs::write(&temp_path, content)
-            .map_err(|e| format!("写入临时文件失败: {}", e))?;
-
-        // 3. 原子重命名（仅在写入成功后才替换原文件）
-        std::fs::rename(&temp_path, path)
-            .map_err(|e| format!("原子重命名失败: {}", e))?;
-
-        Ok(())
+      }
+      return Ok(chars[start_offset..end_offset].iter().collect());
     }
-}
 
+    let start_idx = blocks
+      .iter()
+      .position(|e| e.value().attr("data-block-id") == Some(start_block_id))
+      .ok_or_else(|| format!("未找到 start_block_id={} 的块", start_block_id))?;
+    let end_idx = blocks
+      .iter()
+      .position(|e| e.value().attr("data-block-id") == Some(end_block_id))
+      .ok_or_else(|| format!("未找到 end_block_id={} 的块", end_block_id))?;
+    if start_idx > end_idx {
+      return Err("start block 必须在 end block 之前".to_string());
+    }
+
+    let block_separator = "\n";
+    let mut parts = vec![];
+    for (i, el) in blocks[start_idx..=end_idx].iter().enumerate() {
+      let text: String = el.text().collect();
+      let chars: Vec<_> = text.chars().collect();
+      let len = chars.len();
+      if i == 0 {
+        if start_offset >= len {
+          return Err(format!(
+            "start_offset 越界: start_offset={}, block_len={}",
+            start_offset, len
+          ));
+        }
+        parts.push(chars[start_offset..].iter().collect::<String>());
+      } else if i == end_idx - start_idx {
+        if end_offset > len {
+          return Err(format!(
+            "end_offset 越界: end_offset={}, block_len={}",
+            end_offset, len
+          ));
+        }
+        parts.push(chars[..end_offset].iter().collect::<String>());
+      } else {
+        parts.push(text);
+      }
+    }
+    Ok(parts.join(block_separator))
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Resolver（§6 主控设计文档）
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /// Step 1：从 HTML 中按文档顺序提取 data-block-id 块。
+  fn extract_block_map(html: &str) -> Vec<BlockEntry> {
+    let document = Html::parse_document(html);
+    let selector = match Selector::parse("[data-block-id]") {
+      Ok(s) => s,
+      Err(_) => return Vec::new(),
+    };
+    let mut result = Vec::new();
+    for el in document.select(&selector) {
+      let block_id = el.value().attr("data-block-id").unwrap_or("").to_string();
+      let block_type = el.value().name().to_string();
+      let text_content: String = el.text().collect();
+      let char_count = text_content.chars().count();
+      result.push(BlockEntry {
+        block_id,
+        block_type,
+        text_content,
+        char_count,
+      });
+    }
+    result
+  }
+
+  /// Phase-4：优先使用 baseline 绑定的 BlockTreeIndex；不可用时线性回退。
+  /// 返回值：(block_map, error_codes)
+  fn resolve_block_map_with_fallback(
+    baseline_id: Option<&str>,
+    html: &str,
+  ) -> (Vec<BlockEntry>, Vec<String>) {
+    use crate::services::block_tree_index::get_or_build_for_baseline;
+
+    match get_or_build_for_baseline(baseline_id, html) {
+      Ok(acquired) => {
+        let first_node_meta = acquired
+          .index
+          .nodes
+          .first()
+          .map(|n| {
+            format!(
+              "#{} {} text_hash={}..",
+              n.block_index,
+              n.path,
+              n.text_hash.chars().take(8).collect::<String>()
+            )
+          })
+          .unwrap_or_else(|| "none".to_string());
+        eprintln!(
+          "[positioning][BlockTree] baseline_id={:?} cache_hit={} nodes={} content_hash={}.. first_node={}",
+          acquired.index.baseline_id,
+          acquired.cache_hit,
+          acquired.index.nodes.len(),
+          &acquired
+            .index
+            .content_hash
+            .chars()
+            .take(8)
+            .collect::<String>(),
+          first_node_meta
+        );
+        let map = acquired
+          .index
+          .nodes
+          .iter()
+          .map(|n| {
+            BlockEntry {
+              block_id: n.block_id.clone(),
+              block_type: n.block_type.clone(),
+              text_content: n.text_content.clone(),
+              char_count: n.text_end.saturating_sub(n.text_start),
+            }
+          })
+          .collect();
+        (map, Vec::new())
+      }
+      Err(err) => {
+        let code = err.error_code().to_string();
+        eprintln!(
+          "[positioning][BlockTree] {} code={} -> linear fallback",
+          err, code
+        );
+        let fallback = Self::extract_block_map(html);
+        if fallback.is_empty() {
+          eprintln!("[positioning][BlockTree] linear fallback failed: no [data-block-id] nodes");
+        }
+        (fallback, vec![code])
+      }
+    }
+  }
+
+  fn resolve_zero_search_route_source(selected_text: Option<&String>) -> String {
+    if selected_text.map(|s| !s.trim().is_empty()).unwrap_or(false) {
+      "selection".to_string()
+    } else {
+      // 无显式选中文本但有精确坐标，归类为 reference 零搜索。
+      "reference".to_string()
+    }
+  }
+
+  fn should_reject_rewrite_document(input: &ResolverInput) -> bool {
+    input.block_index.is_some()
+      || input
+        .target
+        .as_ref()
+        .map(|t| !t.trim().is_empty())
+        .unwrap_or(false)
+      || input.selection_start_block_id.is_some()
+  }
+
+  fn is_no_op_diff(cd: &CanonicalDiffBuilt) -> bool {
+    if cd.original_text == cd.new_text {
+      return true;
+    }
+    match cd.edit_type.as_str() {
+      "insert" => cd.new_text.is_empty(),
+      "delete" => cd.original_text.is_empty(),
+      _ => false,
+    }
+  }
+
+  fn now_millis() -> u64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+      Ok(d) => d.as_millis() as u64,
+      Err(_) => 0,
+    }
+  }
+
+  fn build_execution_exposure(
+    level: ExposureLevel,
+    phase: ExposurePhase,
+    code: &str,
+    message: &str,
+    target_file: &str,
+    baseline_id: Option<&str>,
+    route_source: Option<&str>,
+    diff_id: Option<&str>,
+  ) -> ExecutionExposure {
+    ExecutionExposure {
+      exposure_id: format!("exp-{}", uuid::Uuid::new_v4()),
+      level,
+      phase,
+      code: code.to_string(),
+      message: message.to_string(),
+      target_file: target_file.to_string(),
+      diff_id: diff_id.map(|s| s.to_string()),
+      baseline_id: baseline_id.map(|s| s.to_string()),
+      route_source: route_source.map(|s| s.to_string()),
+      timestamp: Self::now_millis(),
+    }
+  }
+
+  fn append_execution_exposures(
+    mut data: Option<serde_json::Value>,
+    exposures: Vec<ExecutionExposure>,
+    error_code: Option<&str>,
+  ) -> Option<serde_json::Value> {
+    if exposures.is_empty() && error_code.is_none() {
+      return data;
+    }
+
+    let mut data_obj = match data.take() {
+      Some(serde_json::Value::Object(map)) => map,
+      Some(other) => {
+        let mut map = serde_json::Map::new();
+        map.insert("payload".to_string(), other);
+        map
+      }
+      None => serde_json::Map::new(),
+    };
+
+    if let Some(code) = error_code {
+      data_obj.insert("error_code".to_string(), serde_json::json!(code));
+    }
+
+    if !exposures.is_empty() {
+      let mut exposure_values: Vec<serde_json::Value> = data_obj
+        .get("execution_exposures")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+      let appended_values: Vec<serde_json::Value> = exposures
+        .into_iter()
+        .filter_map(|x| serde_json::to_value(x).ok())
+        .collect();
+      if let Some(first) = appended_values.first() {
+        data_obj.insert("execution_exposure".to_string(), first.clone());
+      }
+      exposure_values.extend(appended_values);
+      data_obj.insert(
+        "execution_exposures".to_string(),
+        serde_json::Value::Array(exposure_values),
+      );
+    }
+
+    Some(serde_json::Value::Object(data_obj))
+  }
+
+  fn resolver_error_result(
+    input: &ResolverInput,
+    code: &str,
+    phase: ExposurePhase,
+    level: ExposureLevel,
+    route_source: Option<&str>,
+    error: String,
+    error_kind: ToolErrorKind,
+    display_error: String,
+    mut data_obj: serde_json::Map<String, serde_json::Value>,
+  ) -> ToolResult {
+    data_obj.insert("error_code".to_string(), serde_json::json!(code));
+    let exposure = Self::build_execution_exposure(
+      level,
+      phase,
+      code,
+      &error,
+      &input.target_file,
+      input.baseline_id.as_deref(),
+      route_source,
+      None,
+    );
+    let data = Self::append_execution_exposures(
+      Some(serde_json::Value::Object(data_obj)),
+      vec![exposure],
+      Some(code),
+    );
+    ToolResult {
+      success: false,
+      data,
+      error: Some(error),
+      message: None,
+      error_kind: Some(error_kind),
+      display_error: Some(display_error),
+    }
+  }
+
+  fn resolver_warning_exposures(
+    codes: &[String],
+    target_file: &str,
+    baseline_id: Option<&str>,
+    route_source: &str,
+  ) -> Vec<ExecutionExposure> {
+    codes
+      .iter()
+      .filter(|code| {
+        matches!(
+          code.as_str(),
+          E_BLOCKTREE_NODE_MISSING | E_BLOCKTREE_STALE | E_BLOCKTREE_BUILD_FAILED
+        )
+      })
+      .map(|code| {
+        let message = format!("resolver degraded to linear block map fallback: {}", code);
+        Self::build_execution_exposure(
+          ExposureLevel::Warn,
+          ExposurePhase::Resolve,
+          code,
+          &message,
+          target_file,
+          baseline_id,
+          Some(route_source),
+          None,
+        )
+      })
+      .collect()
+  }
+
+  /// 主 Resolver 函数（§6.2）。
+  /// Ok → 成功产出 canonical diff；Err → ToolResult（含 error_kind）。
+  fn resolve(input: ResolverInput) -> Result<CanonicalDiffBuilt, ToolResult> {
+    // ── Step 1 ───────────────────────────────────────────────────────────
+    let (block_map, resolver_error_codes) = Self::resolve_block_map_with_fallback(
+      input.baseline_id.as_deref(),
+      &input.current_editor_content,
+    );
+    let build_error = |code: &str,
+                       phase: ExposurePhase,
+                       level: ExposureLevel,
+                       route_source: Option<&str>,
+                       error: String,
+                       error_kind: ToolErrorKind,
+                       display_error: &str| {
+      let mut data_obj = serde_json::Map::new();
+      if !resolver_error_codes.is_empty() {
+        data_obj.insert(
+          "resolver_error_codes".to_string(),
+          serde_json::json!(resolver_error_codes.clone()),
+        );
+      }
+      Self::resolver_error_result(
+        &input,
+        code,
+        phase,
+        level,
+        route_source,
+        error,
+        error_kind,
+        display_error.to_string(),
+        data_obj,
+      )
+    };
+    if block_map.is_empty() {
+      let code = resolver_error_codes
+        .first()
+        .map(|s| s.as_str())
+        .unwrap_or(E_BLOCKTREE_NODE_MISSING);
+      return Err(build_error(
+        code,
+        ExposurePhase::Resolve,
+        ExposureLevel::Error,
+        None,
+        "BlockTree and linear fallback both failed: no [data-block-id] blocks.".to_string(),
+        ToolErrorKind::Retryable,
+        "当前文档结构不可定位，AI 正在重试",
+      ));
+    }
+
+    // ── Step 2 路由 ───────────────────────────────────────────────────────
+    let mode = input.edit_mode.as_str();
+
+    // Step 2a：零搜索路径（有选区坐标）
+    if let Some(ref sbid) = input.selection_start_block_id {
+      let so = input.selection_start_offset.unwrap_or(0);
+      let ebid = input
+        .selection_end_block_id
+        .as_ref()
+        .unwrap_or(sbid)
+        .clone();
+      let eo = input.selection_end_offset.unwrap_or(so);
+      let route_source = Self::resolve_zero_search_route_source(input.selected_text.as_ref());
+
+      return match mode {
+        "delete" => {
+          let original_text = input.selected_text.clone().unwrap_or_else(|| {
+            Self::extract_block_range(&input.current_editor_content, sbid, so, &ebid, eo)
+              .unwrap_or_default()
+          });
+          Ok(CanonicalDiffBuilt {
+            start_block_id: sbid.clone(),
+            start_offset: so,
+            end_block_id: ebid,
+            end_offset: eo,
+            original_text,
+            new_text: String::new(),
+            diff_type: "precise".to_string(),
+            edit_type: "delete".to_string(),
+            route_source: route_source.clone(),
+            resolver_error_codes: resolver_error_codes.clone(),
+          })
+        }
+        "insert" => {
+          // 在选区结束位置插入（0 长度 range）
+          Ok(CanonicalDiffBuilt {
+            start_block_id: ebid.clone(),
+            start_offset: eo,
+            end_block_id: ebid,
+            end_offset: eo,
+            original_text: String::new(),
+            new_text: input.content.clone().unwrap_or_default(),
+            diff_type: "precise".to_string(),
+            edit_type: "insert".to_string(),
+            route_source: route_source.clone(),
+            resolver_error_codes: resolver_error_codes.clone(),
+          })
+        }
+        _ => {
+          // replace / rewrite_block / rewrite_document → 以选区为 anchor，replace
+          let original_text = input.selected_text.clone().unwrap_or_else(|| {
+            Self::extract_block_range(&input.current_editor_content, sbid, so, &ebid, eo)
+              .unwrap_or_default()
+          });
+          Ok(CanonicalDiffBuilt {
+            start_block_id: sbid.clone(),
+            start_offset: so,
+            end_block_id: ebid,
+            end_offset: eo,
+            original_text,
+            new_text: input.content.clone().unwrap_or_default(),
+            diff_type: "precise".to_string(),
+            edit_type: "replace".to_string(),
+            route_source: route_source.clone(),
+            resolver_error_codes: resolver_error_codes.clone(),
+          })
+        }
+      };
+    }
+
+    // Step 2e：rewrite_document
+    if mode == "rewrite_document" {
+      if Self::should_reject_rewrite_document(&input) {
+        return Err(build_error(
+          E_ROUTE_MISMATCH,
+          ExposurePhase::Route,
+          ExposureLevel::Warn,
+          Some("block_search"),
+          "rewrite_document is forbidden for local/multi-block edit intent. Use per-block edits instead."
+            .to_string(),
+          ToolErrorKind::Retryable,
+          "检测到局部编辑意图，已禁止全文重写，AI 正在改用分块编辑",
+        ));
+      }
+      if block_map.is_empty() {
+        return Err(build_error(
+          E_RANGE_UNRESOLVABLE,
+          ExposurePhase::Resolve,
+          ExposureLevel::Error,
+          Some("block_search"),
+          "rewrite_document: document has no blocks.".to_string(),
+          ToolErrorKind::Retryable,
+          "文档为空，无法全文重写",
+        ));
+      }
+      let first = &block_map[0];
+      let last = &block_map[block_map.len() - 1];
+      let full_text: String = block_map
+        .iter()
+        .map(|b| b.text_content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+      return Ok(CanonicalDiffBuilt {
+        start_block_id: first.block_id.clone(),
+        start_offset: 0,
+        end_block_id: last.block_id.clone(),
+        end_offset: last.char_count,
+        original_text: full_text,
+        new_text: input.content.clone().unwrap_or_default(),
+        diff_type: "document_level".to_string(),
+        edit_type: "replace".to_string(),
+        route_source: "block_search".to_string(),
+        resolver_error_codes: resolver_error_codes.clone(),
+      });
+    }
+
+    // Step 2d：rewrite_block
+    if mode == "rewrite_block" {
+      let block_index = match input.block_index {
+        Some(i) => i,
+        None => {
+          return Err(build_error(
+            E_TARGET_NOT_READY,
+            ExposurePhase::Validate,
+            ExposureLevel::Error,
+            Some("block_search"),
+            "block_index required for edit_mode=rewrite_block.".to_string(),
+            ToolErrorKind::Fatal,
+            "编辑参数不完整",
+          ));
+        }
+      };
+      if block_index >= block_map.len() {
+        return Err(build_error(
+          E_RANGE_UNRESOLVABLE,
+          ExposurePhase::Resolve,
+          ExposureLevel::Error,
+          Some("block_search"),
+          format!(
+            "block_index {} out of range. Has {} blocks (0 to {}).",
+            block_index,
+            block_map.len(),
+            block_map.len().saturating_sub(1)
+          ),
+          ToolErrorKind::Retryable,
+          "块编号超出范围，AI 正在修正",
+        ));
+      }
+      let block = &block_map[block_index];
+      return Ok(CanonicalDiffBuilt {
+        start_block_id: block.block_id.clone(),
+        start_offset: 0,
+        end_block_id: block.block_id.clone(),
+        end_offset: block.char_count,
+        original_text: block.text_content.clone(),
+        new_text: input.content.clone().unwrap_or_default(),
+        diff_type: "block_level".to_string(),
+        edit_type: "replace".to_string(),
+        route_source: "block_search".to_string(),
+        resolver_error_codes: resolver_error_codes.clone(),
+      });
+    }
+
+    // Step 2b：块内搜索（replace | delete | insert）
+    let block_index = match input.block_index {
+      Some(i) => i,
+      None => {
+        return Err(build_error(
+          E_TARGET_NOT_READY,
+          ExposurePhase::Validate,
+          ExposureLevel::Error,
+          Some("block_search"),
+          format!("block_index required for edit_mode={}.", mode),
+          ToolErrorKind::Fatal,
+          "编辑参数不完整",
+        ));
+      }
+    };
+    if block_index >= block_map.len() {
+      return Err(build_error(
+        E_RANGE_UNRESOLVABLE,
+        ExposurePhase::Resolve,
+        ExposureLevel::Error,
+        Some("block_search"),
+        format!(
+          "block_index {} out of range. Has {} blocks (0 to {}).",
+          block_index,
+          block_map.len(),
+          block_map.len().saturating_sub(1)
+        ),
+        ToolErrorKind::Retryable,
+        "块编号超出范围，AI 正在修正",
+      ));
+    }
+    let block = &block_map[block_index];
+
+    // target 检验（replace/delete/insert 必须有 target）
+    let target = match &input.target {
+      Some(t) if !t.is_empty() => t.clone(),
+      _ => {
+        return Err(build_error(
+          E_TARGET_NOT_READY,
+          ExposurePhase::Validate,
+          ExposureLevel::Error,
+          Some("block_search"),
+          format!("target required for edit_mode={}.", mode),
+          ToolErrorKind::Fatal,
+          "缺少目标文本",
+        ));
+      }
+    };
+
+    // 在块文本中查找 target 的所有出现位置（char 偏移）
+    let block_chars: Vec<char> = block.text_content.chars().collect();
+    let target_chars: Vec<char> = target.chars().collect();
+    let mut match_starts: Vec<usize> = Vec::new();
+    if !target_chars.is_empty() && target_chars.len() <= block_chars.len() {
+      for i in 0..=block_chars.len() - target_chars.len() {
+        if block_chars[i..i + target_chars.len()] == target_chars[..] {
+          match_starts.push(i);
+        }
+      }
+    }
+
+    if match_starts.is_empty() {
+      // Step 2c：整块替换降级
+      let whitelist_hit = crate::services::positioning_resolver::match_strict_block_level_whitelist(
+        &target,
+        &block.text_content,
+      );
+      if whitelist_hit.is_none() {
+        return Err(build_error(
+          E_RANGE_UNRESOLVABLE,
+          ExposurePhase::Resolve,
+          ExposureLevel::Warn,
+          Some("block_search"),
+          "strict downgrade denied: target miss and whitelist not matched (table/code/special/rich_text/math)."
+            .to_string(),
+          ToolErrorKind::Retryable,
+          "未命中目标文本，且不满足块级降级白名单，AI 正在重试精确定位",
+        ));
+      }
+      eprintln!(
+                "📝 [Resolver] target 未在 block {} 中命中，命中严格降级白名单 {:?}，降级为 block_level 替换",
+                block_index,
+                whitelist_hit.map(|c| c.as_str())
+            );
+      let new_text = input.content.clone().unwrap_or_default();
+      return Ok(CanonicalDiffBuilt {
+        start_block_id: block.block_id.clone(),
+        start_offset: 0,
+        end_block_id: block.block_id.clone(),
+        end_offset: block.char_count,
+        original_text: block.text_content.clone(),
+        new_text,
+        diff_type: "block_level".to_string(),
+        edit_type: "replace".to_string(),
+        route_source: "block_search".to_string(),
+        resolver_error_codes: resolver_error_codes.clone(),
+      });
+    }
+
+    // occurrence_index 校验
+    if input.occurrence_index >= match_starts.len() {
+      return Err(build_error(
+        E_RANGE_UNRESOLVABLE,
+        ExposurePhase::Resolve,
+        ExposureLevel::Warn,
+        Some("block_search"),
+        format!(
+          "Found {} occurrences in block {}. occurrence_index: 0 to {}.",
+          match_starts.len(),
+          block_index,
+          match_starts.len() - 1
+        ),
+        ToolErrorKind::Retryable,
+        "块内多处相同文本，AI 正在确认位置",
+      ));
+    }
+
+    let match_start = match_starts[input.occurrence_index];
+    let match_end = match_start + target_chars.len();
+
+    // Step 2b 精确定位 → Step 3
+    match mode {
+      "delete" => Ok(CanonicalDiffBuilt {
+        start_block_id: block.block_id.clone(),
+        start_offset: match_start,
+        end_block_id: block.block_id.clone(),
+        end_offset: match_end,
+        original_text: target.clone(),
+        new_text: String::new(),
+        diff_type: "precise".to_string(),
+        edit_type: "delete".to_string(),
+        route_source: "block_search".to_string(),
+        resolver_error_codes: resolver_error_codes.clone(),
+      }),
+      "insert" => Ok(CanonicalDiffBuilt {
+        // 在 target 结束位置插入（0 长度）
+        start_block_id: block.block_id.clone(),
+        start_offset: match_end,
+        end_block_id: block.block_id.clone(),
+        end_offset: match_end,
+        original_text: String::new(),
+        new_text: input.content.clone().unwrap_or_default(),
+        diff_type: "precise".to_string(),
+        edit_type: "insert".to_string(),
+        route_source: "block_search".to_string(),
+        resolver_error_codes: resolver_error_codes.clone(),
+      }),
+      _ => Ok(CanonicalDiffBuilt {
+        // replace（或未知 mode 降级为 replace）
+        start_block_id: block.block_id.clone(),
+        start_offset: match_start,
+        end_block_id: block.block_id.clone(),
+        end_offset: match_end,
+        original_text: target.clone(),
+        new_text: input.content.clone().unwrap_or_default(),
+        diff_type: "precise".to_string(),
+        edit_type: "replace".to_string(),
+        route_source: "block_search".to_string(),
+        resolver_error_codes: resolver_error_codes.clone(),
+      }),
+    }
+  }
+
+  fn validate_edit_params(arguments: &serde_json::Value) -> Result<(), ToolResult> {
+    let err = |message: String| ToolResult {
+      success: false,
+      data: None,
+      message: None,
+      error: Some(message),
+      error_kind: Some(ToolErrorKind::Fatal),
+      display_error: Some("编辑参数格式有误，AI 正在重试。".to_string()),
+    };
+
+    let deprecated_fields = [
+      "scope",
+      "anchor",
+      "edit_target",
+      "instruction",
+      "target_content",
+      "element_identifier",
+      "target_content_source",
+      "scope_block_id",
+    ];
+    let mut hit: Vec<&str> = Vec::new();
+    for key in deprecated_fields {
+      if arguments.get(key).is_some() {
+        hit.push(key);
+      }
+    }
+    if !hit.is_empty() {
+      return Err(err(format!(
+        "deprecated fields are not allowed: {}",
+        hit.join(", ")
+      )));
+    }
+
+    let mode = arguments
+      .get("edit_mode")
+      .and_then(|v| v.as_str())
+      .map(str::trim)
+      .filter(|s| !s.is_empty())
+      .ok_or_else(|| err("edit_mode is required".to_string()))?;
+
+    let valid_mode = matches!(
+      mode,
+      "replace" | "delete" | "insert" | "rewrite_block" | "rewrite_document"
+    );
+    if !valid_mode {
+      return Err(err(format!(
+        "unsupported edit_mode: {}. allowed: replace|delete|insert|rewrite_block|rewrite_document",
+        mode
+      )));
+    }
+
+    if mode != "rewrite_document" {
+      if arguments.get("block_index").and_then(|v| v.as_u64()).is_none() {
+        return Err(err("block_index is required unless edit_mode=rewrite_document".to_string()));
+      }
+    }
+
+    if matches!(mode, "replace" | "delete" | "insert") {
+      let has_target = arguments
+        .get("target")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+      if !has_target {
+        return Err(err("target is required for replace/delete/insert".to_string()));
+      }
+    }
+
+    if matches!(mode, "replace" | "insert" | "rewrite_block" | "rewrite_document")
+      && arguments.get("content").and_then(|v| v.as_str()).is_none()
+    {
+      return Err(err(
+        "content is required for replace/insert/rewrite_block/rewrite_document".to_string(),
+      ));
+    }
+
+    Ok(())
+  }
+
+  /// 编辑当前编辑器打开的文档
+  /// 新实现：获取当前编辑器内容，计算 diff，返回完整的编辑信息
+  async fn edit_current_editor_document(&self, tool_call: &ToolCall) -> Result<ToolResult, String> {
+    eprintln!("📝 [edit_current_editor_document] 开始处理文档编辑请求");
+    eprintln!(
+      "📝 [edit_current_editor_document] 工具调用参数: {:?}",
+      tool_call.arguments
+    );
+
+    // 前置参数校验（冻结协议）
+    if let Err(mut validation_error) = Self::validate_edit_params(&tool_call.arguments) {
+      let target_file = tool_call
+        .arguments
+        .get("current_file")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<current_editor_document>");
+      let code = validation_error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("error_code"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(E_TARGET_NOT_READY)
+        .to_string();
+      let message = validation_error
+        .error
+        .clone()
+        .unwrap_or_else(|| "edit parameter validation failed".to_string());
+      let exposure = Self::build_execution_exposure(
+        ExposureLevel::Error,
+        ExposurePhase::Validate,
+        &code,
+        &message,
+        target_file,
+        tool_call
+          .arguments
+          .get("baseline_id")
+          .and_then(|v| v.as_str()),
+        None,
+        None,
+      );
+      validation_error.data =
+        Self::append_execution_exposures(validation_error.data.take(), vec![exposure], Some(&code));
+      if validation_error.error_kind.is_none() {
+        validation_error.error_kind = Some(ToolErrorKind::Fatal);
+      }
+      return Ok(validation_error);
+    }
+
+    let current_file_new = tool_call
+      .arguments
+      .get("current_file")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| "缺少 current_file 参数，请确保前端传递了当前编辑器信息".to_string())?;
+    let current_content_new = tool_call
+      .arguments
+      .get("current_content")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| "缺少 current_content 参数，请确保前端传递了当前编辑器内容".to_string())?;
+
+    let block_index = tool_call
+      .arguments
+      .get("block_index")
+      .and_then(|v| v.as_u64())
+      .map(|u| u as usize);
+    let edit_mode = tool_call
+      .arguments
+      .get("edit_mode")
+      .and_then(|v| v.as_str())
+      .unwrap_or("")
+      .to_string();
+    let target = tool_call
+      .arguments
+      .get("target")
+      .and_then(|v| v.as_str())
+      .map(|s| s.to_string());
+    let content = tool_call
+      .arguments
+      .get("content")
+      .and_then(|v| v.as_str())
+      .map(|s| s.to_string());
+    let occurrence_index = tool_call
+      .arguments
+      .get("occurrence_index")
+      .and_then(|v| v.as_u64())
+      .map(|u| u as usize)
+      .unwrap_or(0);
+    let selection_start_block_id = tool_call
+      .arguments
+      .get("_sel_start_block_id")
+      .and_then(|v| v.as_str())
+      .map(|s| s.to_string());
+    let selection_start_offset = tool_call
+      .arguments
+      .get("_sel_start_offset")
+      .and_then(|v| v.as_u64())
+      .map(|u| u as usize);
+    let selection_end_block_id = tool_call
+      .arguments
+      .get("_sel_end_block_id")
+      .and_then(|v| v.as_str())
+      .map(|s| s.to_string());
+    let selection_end_offset = tool_call
+      .arguments
+      .get("_sel_end_offset")
+      .and_then(|v| v.as_u64())
+      .map(|u| u as usize);
+    let selected_text = tool_call
+      .arguments
+      .get("_sel_text")
+      .and_then(|v| v.as_str())
+      .map(|s| s.to_string());
+    let baseline_id = tool_call
+      .arguments
+      .get("baseline_id")
+      .and_then(|v| v.as_str())
+      .map(|s| s.to_string());
+
+    let resolver_input = ResolverInput {
+      block_index,
+      edit_mode: edit_mode.clone(),
+      target,
+      content,
+      occurrence_index,
+      selection_start_block_id,
+      selection_start_offset,
+      selection_end_block_id,
+      selection_end_offset,
+      selected_text,
+      target_file: current_file_new.to_string(),
+      current_editor_content: current_content_new.to_string(),
+      baseline_id,
+    };
+
+    match Self::resolve(resolver_input) {
+      Err(tool_result) => Ok(tool_result),
+      Ok(cd) => {
+        let doc_rev = tool_call
+          .arguments
+          .get("document_revision")
+          .and_then(|v| v.as_u64());
+        if Self::is_no_op_diff(&cd) {
+          let route_source = cd.route_source.clone();
+          let resolver_error_codes = cd.resolver_error_codes.clone();
+          let mut data_obj = serde_json::Map::new();
+          data_obj.insert("diff_area_id".to_string(), serde_json::Value::Null);
+          data_obj.insert("file_path".to_string(), serde_json::json!(current_file_new));
+          data_obj.insert("old_content".to_string(), serde_json::json!(current_content_new));
+          data_obj.insert("new_content".to_string(), serde_json::json!(current_content_new));
+          data_obj.insert("diffs".to_string(), serde_json::json!(Vec::<serde_json::Value>::new()));
+          data_obj.insert("document_revision".to_string(), serde_json::json!(doc_rev));
+          data_obj.insert("no_op".to_string(), serde_json::json!(true));
+          data_obj.insert("route_source".to_string(), serde_json::json!(route_source.clone()));
+          data_obj.insert(
+            "resolver_error_codes".to_string(),
+            serde_json::json!(resolver_error_codes.clone()),
+          );
+          let warning_exposures = Self::resolver_warning_exposures(
+            &resolver_error_codes,
+            current_file_new,
+            tool_call
+              .arguments
+              .get("baseline_id")
+              .and_then(|v| v.as_str()),
+            &route_source,
+          );
+          Ok(ToolResult {
+            success: true,
+            data: Self::append_execution_exposures(
+              Some(serde_json::Value::Object(data_obj)),
+              warning_exposures,
+              None,
+            ),
+            error: None,
+            message: Some("edit_current_editor_document: NO_OP（内容无变化，未生成 diff）".to_string()),
+            error_kind: None,
+            display_error: None,
+          })
+        } else {
+          let diff_type = cd.diff_type.clone();
+          let resolver_error_codes = cd.resolver_error_codes.clone();
+          let route_source = cd.route_source.clone();
+          let diff_id = format!("diff_{}", uuid::Uuid::new_v4());
+          let canonical_diff = serde_json::json!({
+            "diffId": diff_id,
+            "startBlockId": cd.start_block_id,
+            "endBlockId": cd.end_block_id,
+            "startOffset": cd.start_offset,
+            "endOffset": cd.end_offset,
+            "originalText": cd.original_text,
+            "newText": cd.new_text,
+            "type": cd.edit_type,
+            "diff_type": diff_type.clone(),
+            "route_source": route_source.clone(),
+          });
+          let diff_area_id = format!("diff_area_{}", uuid::Uuid::new_v4());
+          eprintln!(
+            "[positioning] path=Resolver2 file={} diff_type={} route_source={} edit_mode={} document_revision={:?} resolver_error_codes={:?}",
+            current_file_new, diff_type, route_source, edit_mode, doc_rev, resolver_error_codes
+          );
+          let mut data_obj = serde_json::Map::new();
+          data_obj.insert("diff_area_id".to_string(), serde_json::json!(diff_area_id));
+          data_obj.insert("file_path".to_string(), serde_json::json!(current_file_new));
+          data_obj.insert("old_content".to_string(), serde_json::json!(current_content_new));
+          data_obj.insert("new_content".to_string(), serde_json::json!(current_content_new));
+          data_obj.insert("diffs".to_string(), serde_json::json!(vec![canonical_diff]));
+          data_obj.insert("document_revision".to_string(), serde_json::json!(doc_rev));
+          data_obj.insert(
+            "resolver_error_codes".to_string(),
+            serde_json::json!(resolver_error_codes.clone()),
+          );
+          data_obj.insert("route_source".to_string(), serde_json::json!(route_source.clone()));
+          let warning_exposures = Self::resolver_warning_exposures(
+            &resolver_error_codes,
+            current_file_new,
+            tool_call
+              .arguments
+              .get("baseline_id")
+              .and_then(|v| v.as_str()),
+            &route_source,
+          );
+          Ok(ToolResult {
+            success: true,
+            data: Self::append_execution_exposures(
+              Some(serde_json::Value::Object(data_obj)),
+              warning_exposures,
+              None,
+            ),
+            error: None,
+            message: Some(format!(
+              "edit_current_editor_document: SUCCESS\n\
+               Operation: {} (block_index={:?}, diff_type={})\n\
+               Status: diff queued, awaiting user confirmation\n\
+               Note: Do not re-edit this content until the user accepts or rejects the diff.",
+              edit_mode, block_index, diff_type
+            )),
+            error_kind: None,
+            display_error: None,
+          })
+        }
+      }
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /// Phase 5.5：保存文件依赖关系
+  async fn save_file_dependency(
+    &self,
+    tool_call: &ToolCall,
+    workspace_path: &Path,
+  ) -> Result<ToolResult, String> {
+    let source_path = tool_call
+      .arguments
+      .get("source_path")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| "缺少 source_path 参数".to_string())?;
+    let target_path = tool_call
+      .arguments
+      .get("target_path")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| "缺少 target_path 参数".to_string())?;
+    let dependency_type = tool_call
+      .arguments
+      .get("dependency_type")
+      .and_then(|v| v.as_str())
+      .unwrap_or("references");
+    let description = tool_call
+      .arguments
+      .get("description")
+      .and_then(|v| v.as_str());
+
+    let db =
+      WorkspaceDb::new(workspace_path).map_err(|e| format!("WorkspaceDb 初始化失败: {}", e))?;
+    db.save_file_dependency(source_path, target_path, dependency_type, description)
+      .map_err(|e| format!("保存依赖失败: {}", e))?;
+
+    Ok(ToolResult {
+      success: true,
+      data: Some(serde_json::json!({
+          "source_path": source_path,
+          "target_path": target_path,
+          "dependency_type": dependency_type,
+      })),
+      error: None,
+      message: Some("依赖关系已保存".to_string()),
+      error_kind: None,
+      display_error: None,
+    })
+  }
+
+  /// 原子文件写入
+  fn atomic_write_file(&self, path: &Path, content: &[u8]) -> Result<(), String> {
+    // 1. 创建临时文件
+    let temp_path = path.with_extension(format!(
+      "{}.tmp.{}",
+      path.extension().and_then(|s| s.to_str()).unwrap_or("tmp"),
+      std::process::id()
+    ));
+
+    // 2. 写入临时文件
+    std::fs::write(&temp_path, content).map_err(|e| format!("写入临时文件失败: {}", e))?;
+
+    // 3. 原子重命名（仅在写入成功后才替换原文件）
+    std::fs::rename(&temp_path, path).map_err(|e| format!("原子重命名失败: {}", e))?;
+
+    Ok(())
+  }
+}

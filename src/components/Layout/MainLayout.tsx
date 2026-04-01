@@ -9,8 +9,12 @@ import ChatPanel from '../Chat/ChatPanel';
 import FloatingActionButton from '../Chat/FloatingActionButton';
 import PanelResizer from './PanelResizer';
 import StatusBar from '../StatusBar/StatusBar';
+import { PendingDiffPanel } from '../Editor/PendingDiffPanel';
 import { ToastContainer, useToastStore, toast } from '../Common/Toast';
 import { fileService } from '../../services/fileService';
+import { setupPositioningEditorSnapshotListener } from '../../utils/positioningEditorSnapshotListener';
+import { useDiffStore } from '../../stores/diffStore';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 
 const MainLayout: React.FC = () => {
   const {
@@ -19,8 +23,8 @@ const MainLayout: React.FC = () => {
     fileTree,
     editor,
     chat,
-    setChatVisible,
-    setFileTreeVisible,
+    setChatVisible: _setChatVisible,
+    setFileTreeVisible: _setFileTreeVisible,
     setEditorVisible,
     setFileTreeWidth,
     setChatWidth,
@@ -35,6 +39,41 @@ const MainLayout: React.FC = () => {
   // 如果没有工作区且没有临时聊天，显示欢迎页面
   // 如果已经有临时聊天，即使没有工作区也不显示欢迎页面
   const shouldShowWelcome = showWelcomeDialog || (!currentWorkspace && !hasTemporaryChats);
+
+  // 应用关闭时：若有未确认的 diff 卡，提示用户（重启后 block ID 会变，diff 卡将自动失效）
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    getCurrentWindow().onCloseRequested(async (event) => {
+      const { hasAny } = useDiffStore.getState().getAllPending();
+      if (!hasAny) return; // 没有 pending diffs，直接关闭
+      // 阻止默认关闭行为，等用户确认
+      event.preventDefault();
+      const confirmed = window.confirm(
+        '有未确认的 AI 修改建议（diff 卡）。\n\n应用关闭后重新打开，这些修改建议将自动失效。\n\n确定要关闭并放弃所有未确认修改吗？'
+      );
+      if (confirmed) {
+        await getCurrentWindow().destroy();
+      }
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => { unlisten?.(); };
+  }, []);
+
+  // 工具执行前 IPC 重采 L + revision；挂在 MainLayout 避免侧栏聊天关闭时 ChatPanel 卸载导致超时
+  useEffect(() => {
+    if (shouldShowWelcome) return;
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    void setupPositioningEditorSnapshotListener().then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [shouldShowWelcome]);
   
   // 应用启动时清理过期的临时文件
   useEffect(() => {
@@ -51,6 +90,7 @@ const MainLayout: React.FC = () => {
       
       return () => clearTimeout(timer);
     }
+    return undefined;
   }, [currentWorkspace]); // 只在工作区变化时执行
   
   // 调试日志
@@ -66,7 +106,7 @@ const MainLayout: React.FC = () => {
       editorVisible: editor.visible,
       chatVisible: chat.visible,
     });
-  }, [showWelcomeDialog, currentWorkspace, hasTemporaryChats, shouldShowWelcome, fileTree.visible, editor.visible, chat.visible, tabs]);
+  }, [showWelcomeDialog, currentWorkspace, hasTemporaryChats, shouldShowWelcome, fileTree.visible, editor.visible, chat.visible]);
 
   // 判断是否为全屏聊天模式（没有工作区，且只显示聊天窗口）
   const isFullscreenChatMode = !currentWorkspace && !fileTree.visible && !editor.visible && chat.visible;
@@ -189,7 +229,8 @@ const MainLayout: React.FC = () => {
 
       {/* 主内容区域 - 欢迎页面显示时不渲染 */}
       {!shouldShowWelcome && (
-        <div className="flex-1 min-h-0 flex overflow-hidden relative">
+        <div className="flex-1 min-h-0 flex flex-col overflow-hidden relative">
+          <div className="flex-1 min-h-0 flex overflow-hidden">
           {/* 全屏聊天模式（没有工作区时） */}
           {isFullscreenChatMode ? (
             <>
@@ -270,6 +311,9 @@ const MainLayout: React.FC = () => {
               <ToastContainer toasts={toasts} onClose={removeToast} />
             </>
           )}
+          </div>
+          {/* Phase 5：待确认修改面板（有 pending 时显示） */}
+          {!isFullscreenChatMode && currentWorkspace && <PendingDiffPanel />}
         </div>
       )}
 

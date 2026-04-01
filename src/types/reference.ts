@@ -11,6 +11,7 @@ export enum ReferenceType {
     LINK = 'link',           // 链接引用
     KNOWLEDGE_BASE = 'kb',   // 知识库引用（后续）
     CHAT = 'chat',           // 聊天记录引用
+    TEMPLATE = 'template',   // 模板库引用（Phase 3.2 占位）
 }
 
 // 引用基础接口
@@ -18,6 +19,14 @@ export interface BaseReference {
     id: string;
     type: ReferenceType;
     createdAt: number;
+}
+
+/** TextReference 精确定位四元组（DE-PROTO-003） */
+export interface TextReferenceAnchor {
+    startBlockId: string;
+    startOffset: number;
+    endBlockId: string;
+    endOffset: number;
 }
 
 // 文本引用
@@ -36,9 +45,18 @@ export interface TextReference extends BaseReference {
         end: number;
     };
     displayText: string;       // 显示文本：如 "main.ts (行 10-15)"
+    /** 精确引用四元组（优先使用） */
+    textReference?: TextReferenceAnchor;
+    /** 兼容字段：单块引用时可作为 startBlockId/endBlockId 的别名 */
+    startBlockId?: string;
+    /** 兼容字段：单块引用时可作为 startBlockId/endBlockId 的别名 */
+    endBlockId?: string;
     // 精确定位（可选，用于 edit_target）
+    /** @deprecated 使用 textReference.startBlockId/endBlockId */
     blockId?: string;
+    /** @deprecated 使用 textReference.startOffset */
     startOffset?: number;
+    /** @deprecated 使用 textReference.endOffset */
     endOffset?: number;
 }
 
@@ -129,6 +147,14 @@ export interface KnowledgeBaseReference extends BaseReference {
     itemCount?: number;        // 匹配项数量
 }
 
+// 模板库引用（Phase 3.2 占位）
+export interface TemplateReference extends BaseReference {
+    type: ReferenceType.TEMPLATE;
+    templateId: string;
+    templateName: string;
+    templateType?: 'document' | 'workflow' | 'skill';
+}
+
 // 联合类型
 export type Reference = 
     | TextReference 
@@ -139,5 +165,5 @@ export type Reference =
     | MemoryReference 
     | LinkReference
     | ChatReference
-    | KnowledgeBaseReference;
-
+    | KnowledgeBaseReference
+    | TemplateReference;

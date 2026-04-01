@@ -1,6 +1,6 @@
 // 内容块构建工具函数
 
-import { MessageContentBlock, ToolCall, AuthorizationRequest } from '../types/tool';
+import { MessageContentBlock, ToolCall } from '../types/tool';
 import { needsAuthorization } from './toolDescription';
 
 /**

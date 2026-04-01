@@ -1,5 +1,5 @@
 import React from 'react';
-import { useThemeStore, Theme } from '../../stores/themeStore';
+import { useThemeStore } from '../../stores/themeStore';
 import { SunIcon, MoonIcon, ComputerDesktopIcon } from '@heroicons/react/24/outline';
 
 const ThemeSelector: React.FC = () => {

@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { CheckIcon, XMarkIcon } from '@heroicons/react/24/outline';
 import { DiffChange, calculateHybridDiff, mergeIntoParagraphs } from '../../utils/diffCalculator';
-import { Change, diffChars } from 'diff';
+import { Change } from 'diff';
 
 // 定义 Diff 类型（与后端保持一致）
 export interface Diff {
@@ -125,13 +125,9 @@ export const DocumentDiffView: React.FC<DocumentDiffViewProps> = ({
     let paragraphs: ReturnType<typeof mergeIntoParagraphs>;
     
     if (diffs && diffs.length > 0) {
-        // 使用后端计算的 diffs
-        console.log('[DocumentDiffView] 使用后端 diffs', { diffsCount: diffs.length, diffs });
         changes = convertBackendDiffsToFrontend(diffs);
         paragraphs = mergeIntoParagraphs(changes);
     } else {
-        // 向后兼容：前端计算
-        console.log('[DocumentDiffView] 使用前端计算 diffs');
         changes = calculateHybridDiff(oldContent, newContent);
         paragraphs = mergeIntoParagraphs(changes);
     }

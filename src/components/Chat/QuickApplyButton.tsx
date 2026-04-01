@@ -8,6 +8,7 @@ import {
 import { useEditorStore } from '../../stores/editorStore';
 import { useFileStore } from '../../stores/fileStore';
 import { documentService } from '../../services/documentService';
+import { fileService } from '../../services/fileService';
 import { DocumentDiffView } from './DocumentDiffView';
 
 interface QuickApplyButtonProps {
@@ -18,10 +19,10 @@ interface QuickApplyButtonProps {
 }
 
 export const QuickApplyButton: React.FC<QuickApplyButtonProps> = ({
-    messageId,
+    messageId: _messageId,
     content,
     onApply,
-    onPreview
+    onPreview: _onPreview
 }) => {
     const { getActiveTab } = useEditorStore();
     const { currentWorkspace } = useFileStore();
@@ -61,7 +62,7 @@ export const QuickApplyButton: React.FC<QuickApplyButtonProps> = ({
                 // 这里需要用户输入文件名，暂时使用默认名称
                 const fileName = `新文档_${Date.now()}.md`;
                 const filePath = `${currentWorkspace}/${fileName}`;
-                await documentService.createFile(filePath, newContent);
+                await fileService.writeFile(filePath, newContent);
                 await documentService.openFile(filePath);
             } else if (activeTab) {
                 // 应用到当前编辑器

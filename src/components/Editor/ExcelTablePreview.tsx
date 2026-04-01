@@ -540,6 +540,7 @@ const ExcelTablePreview: React.FC<ExcelTablePreviewProps> = ({ filePath }) => {
         document.removeEventListener('mousedown', handleClickOutside);
       };
     }
+    return undefined;
   }, [showReferenceButton]);
 
   // 加载状态

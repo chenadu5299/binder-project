@@ -77,7 +77,7 @@ const FileTreePanel: React.FC = () => {
     if (workspaceExpanded) return '搜索文件...';
     if (memoryExpanded) return '搜索记忆...';
     if (knowledgeExpanded) return '搜索知识库...';
-    if (instructionExpanded) return '搜索指令...';
+    if (instructionExpanded) return '搜索模板...';
     if (historyExpanded) return '搜索历史记录...';
     return '搜索...';
   };
@@ -127,7 +127,7 @@ const FileTreePanel: React.FC = () => {
         </CollapsibleSection>
       </div>
 
-      {/* 底部固定区域 - 记忆库、知识库、指令库、历史记录 */}
+      {/* 底部固定区域 - 记忆库、知识库、模板库、历史记录 */}
       <div className="flex-shrink-0 border-t border-gray-200 dark:border-gray-700">
         {/* 记忆库区域 */}
         <CollapsibleSection
@@ -149,9 +149,9 @@ const FileTreePanel: React.FC = () => {
           <KnowledgeSection isExpanded={knowledgeExpanded} />
         </CollapsibleSection>
 
-        {/* 指令库区域 */}
+        {/* 模板库区域 */}
         <CollapsibleSection
-          title="指令库"
+          title="模板库"
           icon={<CommandLineIcon className="w-4 h-4" />}
           isExpanded={instructionExpanded}
           onToggle={() => setInstructionExpanded(!instructionExpanded)}

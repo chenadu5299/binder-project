@@ -1,29 +1,10 @@
 import { create } from 'zustand';
 import { Editor } from '@tiptap/react';
+import { isSameDocumentForEdit } from '../utils/pathUtils';
+import { useDiffStore } from './diffStore';
 
-// Diff 数据结构（与后端保持一致）
-export interface Diff {
-  diff_id: string;
-  diff_area_id: string;
-  diff_type: 'Edit' | 'Insertion' | 'Deletion';
-  original_code: string;
-  original_start_line: number;
-  original_end_line: number;
-  new_code: string;
-  start_line: number;
-  end_line: number;
-  // ⚠️ 上下文信息：用于精确匹配定位
-  context_before?: string | null; // 目标文本前面的上下文（50-100字符）
-  context_after?: string | null;  // 目标文本后面的上下文（50-100字符）
-  // ⚠️ 元素类型和标识符：用于表格、图片等复杂元素
-  element_type?: 'text' | 'table' | 'image' | 'code_block' | 'replace_whole';
-  element_identifier?: string; // 用于表格、图片等复杂元素
-  // ⚠️ 前端添加的定位信息
-  from?: number; // ProseMirror 位置
-  to?: number;
-  confidence?: number; // 匹配置信度
-  strategy?: string; // 使用的匹配策略
-}
+// Phase 0.1：指令无效提示的 timer，防止连续触发时前一次 timer 提前清除本次提示
+let invalidCommandHintTimer: ReturnType<typeof setTimeout> | null = null;
 
 export interface EditorTab {
   id: string;
@@ -37,35 +18,47 @@ export interface EditorTab {
   isDraft: boolean; // ⚠️ 新增：是否为草稿文件
   lastModifiedTime: number; // ⚠️ Week 17.1.2：文件最后修改时间（毫秒时间戳）
   editor: Editor | null;
-  diffAreaId?: string; // ⚠️ 新增：当前 diff area ID
-  diffs?: Diff[]; // ⚠️ 新增：diff 数据
-  oldContent?: string; // ⚠️ 新增：旧内容（用于 diff 显示）
-  newContent?: string; // ⚠️ 新增：新内容（用于 diff 显示）
+  /** 文档定位版本戳：内容变化时递增，用于 diff 与 (L, revision) 门禁（§2.1.1） */
+  documentRevision: number;
 }
 
 interface EditorState {
   tabs: EditorTab[];
   activeTabId: string | null;
+  invalidCommandHint: string | null; // Phase 0.1：光标未激活时显示的提示
   addTab: (filePath: string, fileName: string, content: string, isReadOnly?: boolean, isDraft?: boolean, lastModifiedTime?: number) => string;
   removeTab: (tabId: string) => void;
   setActiveTab: (tabId: string) => void;
   updateTabContent: (tabId: string, content: string) => void;
-  markTabSaved: (tabId: string) => void;
+  markTabSaved: (tabId: string, savedContent: string) => void;
   setTabSaving: (tabId: string, isSaving: boolean) => void;
   setTabEditor: (tabId: string, editor: Editor | null) => void;
   getActiveTab: () => EditorTab | null;
+  /** 按文件路径解析已打开 tab（P3）；无匹配返回 null */
+  getTabByFilePath: (filePath: string) => EditorTab | null;
   enableEditMode: (tabId: string) => void; // ⚠️ 新增：启用编辑模式
   updateTabPath: (tabId: string, newPath: string) => void; // ⚠️ 新增：更新标签页路径
   markTabConflict: (tabId: string) => void; // ⚠️ 新增：标记冲突
   updateTabModifiedTime: (tabId: string, modifiedTime: number) => void; // ⚠️ Week 17.1.2：更新文件修改时间
-  setTabDiff: (tabId: string, diffAreaId: string, diffs: Diff[], oldContent: string, newContent: string) => void; // ⚠️ 新增：设置 diff 数据
-  clearTabDiff: (tabId: string) => void; // ⚠️ 新增：清除 diff 数据
-  applyTabDiff: (tabId: string) => void; // ⚠️ 新增：触发应用 diff（通过编辑器的 onApplyDiff）
+  setInvalidCommandHint: (hint: string) => void; // Phase 0.1：设置指令无效提示，2 秒后自动清除
+  /** Diff 卡定位：打开文件后请求滚动到此位置 */
+  setPendingScrollTo: (tabId: string, from: number, to: number) => void;
+  getPendingScrollTo: () => { tabId: string; from: number; to: number } | null;
+  clearPendingScrollTo: () => void;
 }
 
-export const useEditorStore = create<EditorState>((set, get) => ({
+interface EditorStoreState extends EditorState {
+  pendingScrollTo: { tabId: string; from: number; to: number } | null;
+}
+
+export const useEditorStore = create<EditorStoreState>((set, get) => ({
   tabs: [],
   activeTabId: null,
+  invalidCommandHint: null,
+  pendingScrollTo: null,
+  setPendingScrollTo: (tabId, from, to) => set({ pendingScrollTo: { tabId, from, to } }),
+  getPendingScrollTo: () => get().pendingScrollTo,
+  clearPendingScrollTo: () => set({ pendingScrollTo: null }),
 
   addTab: (filePath, fileName, content, isReadOnly = false, isDraft = false, lastModifiedTime = Date.now()) => {
     // ⚠️ 关键：检查文件是否已打开，如果已打开则切换到该标签
@@ -78,7 +71,6 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     
     const tabId = `tab-${Date.now()}`;
     // 判断是否为 DOCX 文件
-    const isDocx = filePath.toLowerCase().endsWith('.docx');
     const newTab: EditorTab = {
       id: tabId,
       filePath,
@@ -91,10 +83,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
       isDraft, // ⚠️ 新增：草稿标记
       lastModifiedTime, // ⚠️ Week 17.1.2：文件最后修改时间
       editor: null,
-      diffAreaId: undefined, // ⚠️ 新增：diff area ID
-      diffs: undefined, // ⚠️ 新增：diff 数据
-      oldContent: undefined, // ⚠️ 新增：旧内容
-      newContent: undefined, // ⚠️ 新增：新内容
+      documentRevision: 1,
     };
     
     set((state) => ({
@@ -128,6 +117,17 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   },
 
   updateTabContent: (tabId, content) => {
+    const prev = get().tabs.find((t) => t.id === tabId);
+    if (!prev) return;
+    if (prev.content === content) {
+      set((state) => ({
+        tabs: state.tabs.map((tab) =>
+          tab.id === tabId ? { ...tab, content, isDirty: content !== tab.lastSavedContent } : tab
+        ),
+      }));
+      return;
+    }
+    const nextRev = (prev.documentRevision ?? 1) + 1;
     set((state) => ({
       tabs: state.tabs.map((tab) =>
         tab.id === tabId
@@ -135,20 +135,22 @@ export const useEditorStore = create<EditorState>((set, get) => ({
               ...tab,
               content,
               isDirty: content !== tab.lastSavedContent,
+              documentRevision: nextRev,
             }
           : tab
       ),
     }));
+    useDiffStore.getState().expirePendingForStaleRevision(prev.filePath, nextRev);
   },
 
-  markTabSaved: (tabId) => {
+  markTabSaved: (tabId, savedContent) => {
     set((state) => ({
       tabs: state.tabs.map((tab) =>
         tab.id === tabId
           ? {
               ...tab,
-              lastSavedContent: tab.content,
-              isDirty: false,
+              lastSavedContent: savedContent,
+              isDirty: tab.content !== savedContent,
               isSaving: false,
             }
           : tab
@@ -179,6 +181,11 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   getActiveTab: () => {
     const state = get();
     return state.tabs.find((t) => t.id === state.activeTabId) || null;
+  },
+
+  getTabByFilePath: (filePath) => {
+    const hit = get().tabs.find((t) => isSameDocumentForEdit(t.filePath, filePath));
+    return hit ?? null;
   },
 
   // ⚠️ 新增：启用编辑模式（从只读切换到可编辑）
@@ -224,58 +231,13 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     }));
   },
 
-  // ⚠️ 新增：设置 diff 数据
-  setTabDiff: (tabId, diffAreaId, diffs, oldContent, newContent) => {
-    set((state) => ({
-      tabs: state.tabs.map((tab) =>
-        tab.id === tabId
-          ? {
-              ...tab,
-              diffAreaId,
-              diffs,
-              oldContent,
-              newContent,
-            }
-          : tab
-      ),
-    }));
-  },
-
-  // ⚠️ 新增：清除 diff 数据
-  clearTabDiff: (tabId) => {
-    set((state) => ({
-      tabs: state.tabs.map((tab) =>
-        tab.id === tabId
-          ? {
-              ...tab,
-              diffAreaId: undefined,
-              diffs: undefined,
-              oldContent: undefined,
-              newContent: undefined,
-            }
-          : tab
-      ),
-    }));
-  },
-
-  // ⚠️ 新增：触发应用 diff（通过编辑器的 onApplyDiff）
-  applyTabDiff: (tabId) => {
-    const state = get();
-    const tab = state.tabs.find(t => t.id === tabId);
-    if (tab && tab.editor) {
-      // 通过编辑器实例触发 onApplyDiff
-      // 但是，onApplyDiff 是在 TipTapEditor 中定义的，我们无法直接访问
-      // 所以，我们通过触发一个 transaction 来通知编辑器应用 diff
-      const { view } = tab.editor;
-      if (view) {
-        // 触发一个带有 applyDiff meta 的 transaction
-        const tr = view.state.tr.setMeta('applyDiff', true);
-        view.dispatch(tr);
-        console.log('✅ [EditorStore] 已触发编辑器应用 diff');
-      }
-    } else {
-      console.warn('⚠️ [EditorStore] 无法应用 diff：编辑器实例不存在');
-    }
+  setInvalidCommandHint: (hint) => {
+    if (invalidCommandHintTimer) clearTimeout(invalidCommandHintTimer);
+    set({ invalidCommandHint: hint });
+    invalidCommandHintTimer = setTimeout(() => {
+      set({ invalidCommandHint: null });
+      invalidCommandHintTimer = null;
+    }, 2000);
   },
 }));
 

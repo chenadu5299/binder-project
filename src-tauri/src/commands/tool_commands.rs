@@ -57,6 +57,8 @@ pub async fn execute_tool_with_retry(
         data: None,
         error: last_error,
         message: Some("工具调用失败，已重试多次".to_string()),
+        error_kind: None,
+                                display_error: None,
     })
 }
 

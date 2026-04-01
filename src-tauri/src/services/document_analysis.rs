@@ -1,54 +1,51 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 /// 文档分析类型
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AnalysisType {
-    Summarize,        // 总结
-    ExtractKeywords, // 提取关键词
-    FindReferences,  // 查找引用
-    ExtractEntities, // 提取实体（人物、地点、事件等）
+  Summarize,       // 总结
+  ExtractKeywords, // 提取关键词
+  FindReferences,  // 查找引用
+  ExtractEntities, // 提取实体（人物、地点、事件等）
 }
 
 /// 引用信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Reference {
-    pub text: String,          // 引用的文本
-    pub source: String,        // 引用的来源
-    pub position: usize,       // 在文档中的位置（字符偏移）
-    pub reference_type: String, // 引用类型：document, person, event, concept
+  pub text: String,           // 引用的文本
+  pub source: String,         // 引用的来源
+  pub position: usize,        // 在文档中的位置（字符偏移）
+  pub reference_type: String, // 引用类型：document, person, event, concept
 }
 
 /// 实体信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entity {
-    pub name: String,          // 实体名称
-    pub entity_type: String,   // 实体类型：person, location, event, concept
-    pub description: String,  // 实体描述
-    pub positions: Vec<usize>, // 在文档中出现的位置
+  pub name: String,          // 实体名称
+  pub entity_type: String,   // 实体类型：person, location, event, concept
+  pub description: String,   // 实体描述
+  pub positions: Vec<usize>, // 在文档中出现的位置
 }
 
 /// 文档分析结果
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentAnalysisResult {
-    pub summary: Option<String>,
-    pub keywords: Vec<String>,
-    pub references: Vec<Reference>,
-    pub entities: Vec<Entity>,
+  pub summary: Option<String>,
+  pub keywords: Vec<String>,
+  pub references: Vec<Reference>,
+  pub entities: Vec<Entity>,
 }
 
 /// 文档分析服务
 pub struct DocumentAnalysisService;
 
 impl DocumentAnalysisService {
-    /// 构建分析提示词
-    pub fn build_analysis_prompt(
-        content: &str,
-        analysis_type: &AnalysisType,
-    ) -> String {
-        // 限制内容长度，避免超出 token 限制
-        let content_preview: String = content.chars().take(4000).collect();
-        
-        match analysis_type {
+  /// 构建分析提示词
+  pub fn build_analysis_prompt(content: &str, analysis_type: &AnalysisType) -> String {
+    // 限制内容长度，避免超出 token 限制
+    let content_preview: String = content.chars().take(4000).collect();
+
+    match analysis_type {
             AnalysisType::Summarize => format!(
                 "请对以下文档进行总结，要求：\n\
                 1. 总结主要内容（3-5 点）\n\
@@ -87,6 +84,5 @@ impl DocumentAnalysisService {
                 content_preview
             ),
         }
-    }
+  }
 }
-

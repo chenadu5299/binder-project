@@ -54,12 +54,19 @@ code {
   outline: none !important;
 }
 
-/* T-DOCX 分页模式：仅在页首行时隐藏原生光标（由 PageTopCaretExtension 设置 data-caret-at-page-top） */
+/* Bug 4：空段落行高与正常段落一致，避免回车新建行高度偏矮 */
+.ProseMirror p:has(>br.ProseMirror-trailingBreak:only-child),
+.ProseMirror p:has(>br:only-child) {
+  min-height: 1.5em !important;
+  line-height: 1.5 !important;
+}
+
+/* T-DOCX 分页模式：光标态时隐藏原生光标，显示全篇模拟光标（由 PageTopCaretExtension 设置 data-caret-at-page-top） */
 .ProseMirror.rm-with-pagination[data-caret-at-page-top="true"] {
   caret-color: transparent;
 }
 
-/* 页首行模拟光标：挂载到 scrollContainer ?? body；top/left/height 由 JS 动态设置 */
+/* 分页模式全篇模拟光标：挂载到 scrollContainer ?? body；top/left/height 由 JS 动态设置 */
 /* 1px 宽度接近原生光标；闪烁动画与原生光标一致 */
 @keyframes rm-caret-blink {
   0%, 50% { opacity: 1; }
@@ -136,7 +143,7 @@ code {
   overflow-x: visible !important;
 }
 
-/* 调试：block ID 定位符已隐藏，避免影响版面（需调试时可恢复 content/display） */
+/* block ID 用于精确定位系统，不在前端展示 */
 .ProseMirror [data-block-id]::before {
   display: none;
 }

@@ -10,8 +10,14 @@ export function usePaginationFromEditor(editor: Editor | null, enabled: boolean)
   const [totalPages, setTotalPages] = useState(1);
 
   // 获取分页 DOM 容器和页码（PaginationPlus 使用 [data-rm-pagination] 容器）
+  // ⚠️ 关闭标签时 editor 可能已销毁，需防护避免 [tiptap error]: The editor view is not available
   const getPageElements = useCallback(() => {
-    if (!editor?.view?.dom) return null;
+    if (!editor || (editor as any).isDestroyed) return null;
+    try {
+      if (!editor.view?.dom) return null;
+    } catch {
+      return null; // editor.view 访问可能抛错（编辑器已销毁）
+    }
     const dom = editor.view.dom;
     const paginationEl = dom.querySelector('[data-rm-pagination]') as HTMLElement | null;
     const pageBreaks = paginationEl?.querySelectorAll('.rm-page-break') ?? paginationEl?.children;
