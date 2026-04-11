@@ -2,7 +2,7 @@ import React, { useRef, useState, useCallback } from 'react';
 import FileTree, { FileTreeRef } from './FileTree';
 import ResourceToolbar from './ResourceToolbar';
 import CollapsibleSection from './CollapsibleSection';
-import MemorySection from './MemorySection';
+import MemoryTab from '../Memory/MemoryTab';
 import KnowledgeSection from './KnowledgeSection';
 import InstructionSection from './InstructionSection';
 import HistorySection from './HistorySection';
@@ -69,7 +69,7 @@ const FileTreePanel: React.FC = () => {
     if (workspaceExpanded) {
       searchFileTree(query);
     }
-    // 记忆库和历史记录的搜索在各自组件内部处理
+    // 记忆库和时间轴的搜索在各自组件内部处理
   };
 
   // 确定搜索占位符
@@ -78,7 +78,7 @@ const FileTreePanel: React.FC = () => {
     if (memoryExpanded) return '搜索记忆...';
     if (knowledgeExpanded) return '搜索知识库...';
     if (instructionExpanded) return '搜索模板...';
-    if (historyExpanded) return '搜索历史记录...';
+    if (historyExpanded) return '搜索时间轴...';
     return '搜索...';
   };
 
@@ -127,7 +127,7 @@ const FileTreePanel: React.FC = () => {
         </CollapsibleSection>
       </div>
 
-      {/* 底部固定区域 - 记忆库、知识库、模板库、历史记录 */}
+      {/* 底部固定区域 - 记忆库、知识库、模板库、时间轴 */}
       <div className="flex-shrink-0 border-t border-gray-200 dark:border-gray-700">
         {/* 记忆库区域 */}
         <CollapsibleSection
@@ -136,7 +136,7 @@ const FileTreePanel: React.FC = () => {
           isExpanded={memoryExpanded}
           onToggle={() => setMemoryExpanded(!memoryExpanded)}
         >
-          <MemorySection isExpanded={memoryExpanded} />
+          {memoryExpanded ? <MemoryTab /> : null}
         </CollapsibleSection>
 
         {/* 知识库区域 */}
@@ -159,9 +159,9 @@ const FileTreePanel: React.FC = () => {
           <InstructionSection isExpanded={instructionExpanded} />
         </CollapsibleSection>
 
-        {/* 历史记录区域 */}
+        {/* 时间轴区域 */}
         <CollapsibleSection
-          title="历史记录"
+          title="时间轴"
           icon={<ClockIcon className="w-4 h-4" />}
           isExpanded={historyExpanded}
           onToggle={() => setHistoryExpanded(!historyExpanded)}
@@ -174,4 +174,3 @@ const FileTreePanel: React.FC = () => {
 };
 
 export default FileTreePanel;
-

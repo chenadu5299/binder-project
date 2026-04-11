@@ -6,4 +6,5 @@ pub mod workspace_db;
 pub mod diff_engine;
 pub mod canonical_html;
 pub mod canonical_service;
+pub mod timeline_support;
 pub mod workspace_commands;

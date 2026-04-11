@@ -24,6 +24,17 @@ import { DiffCard } from './DiffCard';
 import { positionToLine } from '../../utils/editorOffsetUtils';
 import { documentService } from '../../services/documentService';
 import { toast } from '../Common/Toast';
+import { useAgentStore } from '../../stores/agentStore';
+import {
+    createPendingConfirmationRecord,
+    createShadowStageState,
+} from '../../types/agent_state';
+import {
+    markAgentInvalidated,
+    markAgentStageComplete,
+    markAgentUserConfirmed,
+} from '../../utils/agentShadowLifecycle';
+import type { KnowledgeInjectionSlice } from '../../types/knowledge';
 import './InlineChatInput.css';
 
 interface ChatMessagesProps {
@@ -48,6 +59,7 @@ export const ChatMessages: React.FC<ChatMessagesProps> = ({
     const { updateToolCall, regenerate, deleteMessage, updateContentBlock } = useChatStore();
     const { currentWorkspace } = useFileStore();
     const { getActiveTab, updateTabContent } = useEditorStore();
+    const agentRuntime = useAgentStore((s) => s.runtimesByTab[tabId]);
     useDiffStore((s) => s.byTab);
     
     const [contextMenu, setContextMenu] = useState<{
@@ -56,6 +68,48 @@ export const ChatMessages: React.FC<ChatMessagesProps> = ({
     } | null>(null);
     // 工作计划确认状态（按消息 ID 存储）
     const [confirmedPlans, setConfirmedPlans] = useState<Set<string>>(new Set());
+
+    useEffect(() => {
+        if (!agentRuntime?.currentTask) return;
+        if (!['structured', 'candidate_ready'].includes(agentRuntime.stageState.stage)) return;
+
+        const hasRenderableCandidate = messages.some((message) =>
+            (message.contentBlocks ?? []).some((block) => {
+                const toolCall = block.toolCall;
+                if (!toolCall?.result?.success) return false;
+                if (toolCall.name === 'update_file') {
+                    const data = typeof toolCall.result.data === 'object' && toolCall.result.data !== null
+                        ? toolCall.result.data
+                        : typeof toolCall.result.data === 'string'
+                            ? (() => { try { return JSON.parse(toolCall.result.data); } catch { return {}; } })()
+                            : {};
+                    return Array.isArray(data.pending_diffs) && data.pending_diffs.length > 0;
+                }
+                if (toolCall.name === 'edit_current_editor_document') {
+                    const data = typeof toolCall.result.data === 'object' && toolCall.result.data !== null
+                        ? toolCall.result.data
+                        : typeof toolCall.result.data === 'string'
+                            ? (() => { try { return JSON.parse(toolCall.result.data); } catch { return {}; } })()
+                            : {};
+                    return !!data.diff_area_id && Array.isArray(data.diffs) && data.diffs.length > 0;
+                }
+                return false;
+            })
+        );
+
+        if (!hasRenderableCandidate) return;
+
+        const agentStore = useAgentStore.getState();
+        const taskId = agentRuntime.currentTask.id;
+        agentStore.setStageState(
+            tabId,
+            createShadowStageState(taskId, 'review_ready', 'candidate_rendered_for_user_review')
+        );
+        agentStore.setConfirmation(
+            tabId,
+            createPendingConfirmationRecord(taskId, 'awaiting_user_review')
+        );
+    }, [agentRuntime?.currentTask?.id, agentRuntime?.stageState.stage, messages, tabId]);
     
     // ⚠️ 关键修复：跟踪用户是否手动滚动过，以及是否应该自动滚动
     const userScrolledRef = useRef<boolean>(false);
@@ -236,6 +290,91 @@ export const ChatMessages: React.FC<ChatMessagesProps> = ({
         }
     };
 
+    const renderKnowledgeAugmentation = (
+        slices: KnowledgeInjectionSlice[] | undefined,
+        decisionReason?: string | null,
+        warnings?: { code: string; message: string }[],
+        metadata?: {
+            effectiveStrategy: string;
+            rerankEnabled: boolean;
+            verifiedOnlyApplied: boolean;
+        } | null,
+    ) => {
+        const safeSlices = slices ?? [];
+        const safeWarnings = warnings ?? [];
+        if (safeSlices.length === 0 && safeWarnings.length === 0 && !decisionReason) {
+            return null;
+        }
+
+        return (
+            <div className="mb-3 rounded-lg border border-sky-200 bg-sky-50/80 px-3 py-2 text-xs text-sky-900 dark:border-sky-900/60 dark:bg-sky-950/20 dark:text-sky-100">
+                <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-semibold">知识补强</span>
+                    {decisionReason && (
+                        <span className="rounded-full bg-white/80 px-2 py-0.5 text-[11px] dark:bg-sky-900/40">
+                            decision={decisionReason}
+                        </span>
+                    )}
+                    {metadata?.effectiveStrategy && (
+                        <span className="rounded-full bg-white/80 px-2 py-0.5 text-[11px] dark:bg-sky-900/40">
+                            strategy={metadata.effectiveStrategy}
+                        </span>
+                    )}
+                    {metadata?.rerankEnabled && (
+                        <span className="rounded-full bg-white/80 px-2 py-0.5 text-[11px] dark:bg-sky-900/40">
+                            rerank
+                        </span>
+                    )}
+                    {metadata?.verifiedOnlyApplied && (
+                        <span className="rounded-full bg-white/80 px-2 py-0.5 text-[11px] dark:bg-sky-900/40">
+                            verified-only
+                        </span>
+                    )}
+                    <span className="rounded-full bg-white/80 px-2 py-0.5 text-[11px] dark:bg-sky-900/40">
+                        slices={safeSlices.length}
+                    </span>
+                </div>
+                {safeSlices.length > 0 && (
+                    <div className="mt-2 space-y-1">
+                        {safeSlices.slice(0, 3).map((slice) => (
+                            <div key={slice.sliceId} className="rounded-md bg-white/70 px-2 py-1 dark:bg-sky-900/30">
+                                <div className="font-medium">{slice.title}</div>
+                                <div className="mt-0.5 flex flex-wrap gap-1 text-[11px] text-sky-700 dark:text-sky-200">
+                                    <span>{slice.sourceRole === 'structure_reference' ? '结构参考' : '知识补强'}</span>
+                                    <span>{slice.retrievalMode}</span>
+                                    {slice.citation && <span>v{slice.citation.version}</span>}
+                                    {slice.riskFlags.slice(0, 3).map((flag) => (
+                                        <span key={flag} className="rounded-full bg-sky-100 px-1.5 py-0.5 dark:bg-sky-900/50">
+                                            {flag}
+                                        </span>
+                                    ))}
+                                </div>
+                                {slice.sourceRole === 'structure_reference' && slice.structureMetadata?.sectionOutlineSummary && (
+                                    <div className="mt-1 text-[11px] text-sky-800 dark:text-sky-100">
+                                        {slice.structureMetadata.sectionOutlineSummary}
+                                    </div>
+                                )}
+                            </div>
+                        ))}
+                    </div>
+                )}
+                {safeWarnings.length > 0 && (
+                    <div className="mt-2 flex flex-wrap gap-1">
+                        {safeWarnings.map((warning) => (
+                            <span
+                                key={`${warning.code}:${warning.message}`}
+                                className="rounded-full bg-amber-100 px-2 py-0.5 text-[11px] text-amber-800 dark:bg-amber-900/40 dark:text-amber-200"
+                                title={warning.message}
+                            >
+                                {warning.code}
+                            </span>
+                        ))}
+                    </div>
+                )}
+            </div>
+        );
+    };
+
     // 渲染内容块
     const renderContentBlock = (block: any, _index: number, message: ChatMessage) => {
         switch (block.type) {
@@ -353,6 +492,7 @@ export const ChatMessages: React.FC<ChatMessagesProps> = ({
                                     <DiffCard
                                         key={entry.diffId}
                                         diff={entry}
+                                        chatTabId={tabId}
                                         filePath={diffTab.filePath}
                                         workspacePath={workspacePath}
                                         lineStart={lineStart}
@@ -395,6 +535,7 @@ export const ChatMessages: React.FC<ChatMessagesProps> = ({
                                                     status: 'expired',
                                                     expireReason: reason,
                                                 });
+                                                markAgentInvalidated(tabId, entry.agentTaskId, reason);
                                                 if (
                                                     reason === 'document_revision_mismatch' ||
                                                     reason === 'content_snapshot_mismatch' ||
@@ -416,6 +557,7 @@ export const ChatMessages: React.FC<ChatMessagesProps> = ({
                                                     status: 'expired',
                                                     expireReason: 'apply_replace_failed',
                                                 });
+                                                markAgentInvalidated(tabId, entry.agentTaskId, 'apply_replace_failed');
                                                 return;
                                             }
                                             diffStore.acceptDiff(diffTab.filePath, entry.diffId, {
@@ -423,6 +565,8 @@ export const ChatMessages: React.FC<ChatMessagesProps> = ({
                                                 to: inserted.insertTo,
                                             });
                                             updateTabContent(diffTab.id, editor.getHTML());
+                                            markAgentUserConfirmed(tabId, entry.agentTaskId, 'diff_card_accept_confirmed');
+                                            markAgentStageComplete(tabId, entry.agentTaskId, 'editor_revision_advanced');
                                         }}
                                         onReject={() => {
                                             diffStore.rejectDiff(diffTab.filePath, entry.diffId);
@@ -546,6 +690,14 @@ export const ChatMessages: React.FC<ChatMessagesProps> = ({
                             `}
                             onContextMenu={(e) => handleContextMenu(e, message)}
                         >
+                            {message.role === 'assistant' &&
+                                renderKnowledgeAugmentation(
+                                    message.knowledgeInjectionSlices,
+                                    message.knowledgeDecisionReason,
+                                    message.knowledgeQueryWarnings,
+                                    message.knowledgeQueryMetadata,
+                                )}
+
                             {/* 如果有 contentBlocks，使用新的渲染方式 */}
                             {message.contentBlocks && message.contentBlocks.length > 0 ? (
                                 <div>

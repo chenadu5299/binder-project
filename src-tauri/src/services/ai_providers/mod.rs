@@ -81,6 +81,52 @@ pub trait AIProvider: Send + Sync {
     context: &str,
   ) -> Result<String, AIError>;
 
+  /// Simple non-streaming chat for background tasks (memory extraction etc.).
+  /// Default: collect text from chat_stream using deepseek-chat.
+  async fn chat_simple(
+    &self,
+    prompt: &str,
+    max_tokens: u32,
+  ) -> Result<String, AIError> {
+    self.chat_with_model(prompt, max_tokens, "deepseek-chat").await
+  }
+
+  /// Non-streaming chat with explicit model override (used by ExtractionConfig).
+  async fn chat_with_model(
+    &self,
+    prompt: &str,
+    max_tokens: u32,
+    model: &str,
+  ) -> Result<String, AIError> {
+    use tokio_stream::StreamExt;
+    let messages = vec![ChatMessage {
+      role: "user".to_string(),
+      content: Some(prompt.to_string()),
+      tool_calls: None,
+      tool_call_id: None,
+      name: None,
+    }];
+    let config = ModelConfig {
+      model: model.to_string(),
+      max_tokens: max_tokens as usize,
+      temperature: 0.3,
+      top_p: 1.0,
+    };
+    let (_, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    let stream = self
+      .chat_stream(&messages, &config, &mut cancel_rx, None)
+      .await?;
+    let mut stream = Box::into_pin(stream);
+    let mut result = String::new();
+    while let Some(chunk) = stream.next().await {
+      match chunk? {
+        ChatChunk::Text(t) => result.push_str(&t),
+        _ => {}
+      }
+    }
+    Ok(result)
+  }
+
   /// 聊天（流式响应）
   /// 返回一个异步流，每个 item 是一个 chunk 或工具调用
   async fn chat_stream(

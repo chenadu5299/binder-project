@@ -5,6 +5,7 @@ export interface ToolCall {
     name: string;
     arguments: Record<string, any>;
     status: 'pending' | 'executing' | 'completed' | 'failed';
+    agentTaskId?: string;
     result?: ToolResult;
     error?: string;
     timestamp: number;
@@ -15,6 +16,7 @@ export interface ToolResult {
     data?: any;
     error?: string;
     message?: string;
+    meta?: ToolResultMeta;
     display_error?: string;        // 新增：用户可读的中文错误文案
     error_kind?: 'Retryable' | 'Skippable' | 'Fatal';  // 新增：与后端对齐
     // 文档编辑工具返回（与后端 tool_service 一致）
@@ -23,6 +25,38 @@ export interface ToolResult {
     new_content?: string;
     oldContent?: string;
     newContent?: string;
+}
+
+export interface ToolResultMeta {
+    gate?: ToolGateMeta;
+    artifact?: ToolArtifactMeta;
+    verification?: ToolVerificationMeta;
+    confirmation?: ToolConfirmationMeta;
+}
+
+export interface ToolGateMeta {
+    status?: 'pending' | 'passed' | 'failed' | 'not_required' | 'candidate_ready' | 'no_op';
+    stage?: string;
+    summary?: string;
+}
+
+export interface ToolArtifactMeta {
+    kind?: string;
+    artifactId?: string;
+    status?: 'draft' | 'active' | 'consumed' | 'archived' | 'pending_review';
+    summary?: string;
+}
+
+export interface ToolVerificationMeta {
+    status?: 'pending' | 'passed' | 'failed' | 'not_required';
+    recordId?: string;
+    summary?: string;
+}
+
+export interface ToolConfirmationMeta {
+    status?: 'pending' | 'confirmed' | 'rejected' | 'not_required';
+    recordId?: string;
+    summary?: string;
 }
 
 export interface ToolDefinition {
@@ -81,4 +115,3 @@ export interface AuthorizationRequest {
     operation: string;
     details: Record<string, any>;
 }
-

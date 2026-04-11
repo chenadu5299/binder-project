@@ -11,7 +11,6 @@ import { useFileStore } from '../../stores/fileStore';
 import { fileService } from '../../services/fileService';
 import { toast } from '../Common/Toast';
 import InputDialog from './InputDialog';
-import { addHistoryRecord } from './HistorySection';
 
 interface ResourceToolbarProps {
   onSearch?: () => void;
@@ -115,21 +114,9 @@ const ResourceToolbar: React.FC<ResourceToolbarProps> = ({ onSearch, onRefresh }
       if (fileType === 'folder') {
         await fileService.createFolder(filePath);
         toast.success('文件夹创建成功');
-        // 记录历史
-        addHistoryRecord({
-          type: 'create_folder',
-          target: filePath,
-          success: true,
-        });
       } else {
         await fileService.createFile(filePath, fileType);
         toast.success('文件创建成功');
-        // 记录历史
-        addHistoryRecord({
-          type: 'create_file',
-          target: filePath,
-          success: true,
-        });
 
         // 与 NewFileButton 一致：记录元数据，便于从文件树打开时进入编辑模式
         const { normalizePath, normalizeWorkspacePath } = await import('../../utils/pathUtils');
@@ -159,13 +146,6 @@ const ResourceToolbar: React.FC<ResourceToolbarProps> = ({ onSearch, onRefresh }
       console.error('创建失败:', error);
       const errorMessage = error instanceof Error ? error.message : String(error);
       toast.error(`创建失败: ${errorMessage}`);
-      // 记录失败历史
-      addHistoryRecord({
-        type: fileType === 'folder' ? 'create_folder' : 'create_file',
-        target: filePath,
-        success: false,
-        error: errorMessage,
-      });
     }
   };
 
@@ -310,4 +290,3 @@ const ResourceToolbar: React.FC<ResourceToolbarProps> = ({ onSearch, onRefresh }
 };
 
 export default ResourceToolbar;
-

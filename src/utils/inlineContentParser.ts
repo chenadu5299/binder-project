@@ -390,6 +390,11 @@ export function getReferenceDisplayText(ref: Reference): string {
             const linkRef = ref as import('../types/reference').LinkReference;
             return linkRef.title || linkRef.url.substring(0, 30) + (linkRef.url.length > 30 ? '...' : '');
         }
+
+        case ReferenceType.KNOWLEDGE_BASE: {
+            const knowledgeRef = ref as import('../types/reference').KnowledgeBaseReference;
+            return knowledgeRef.entryTitle || knowledgeRef.kbName || '知识库条目';
+        }
         
         default:
             return '引用';
@@ -422,4 +427,3 @@ export function getReferenceIcon(ref: Reference): string {
             return '📎';
     }
 }
-

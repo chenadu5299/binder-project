@@ -1,11 +1,28 @@
 import { create } from 'zustand';
+import { createJSONStorage, persist } from 'zustand/middleware';
 import { invoke } from '@tauri-apps/api/core';
 import { useFileStore } from './fileStore';
 import { useEditorStore } from './editorStore';
 import { useDiffStore } from './diffStore';
+import { useAgentStore } from './agentStore';
 
 import { ToolCall, MessageContentBlock } from '../types/tool';
+import type { KnowledgeInjectionSlice } from '../types/ai';
+import type { KnowledgeQueryMetadata, KnowledgeQueryWarning } from '../types/knowledge';
 import type { DisplayNode } from '../utils/inlineContentParser';
+import {
+    createPendingConfirmationRecord,
+    createPendingVerificationRecord,
+    createShadowStageState,
+    createShadowTaskRecord,
+} from '../types/agent_state';
+
+/**
+ * Phase 1 边界说明：
+ * - chatStore 继续负责聊天消息、流式展示、工具块展示
+ * - agentStore 作为 L3 Agent 正式状态对象的预留承接位
+ * - 本阶段不迁移主执行闭环，只做边界冻结和轻量接线
+ */
 
 export interface ChatMessage {
     id: string;
@@ -20,9 +37,13 @@ export interface ChatMessage {
     toolCalls?: ToolCall[];  // 工具调用列表（保留用于兼容）
     // 新增：内容块列表（按时间顺序）
     contentBlocks?: MessageContentBlock[];
+    knowledgeInjectionSlices?: KnowledgeInjectionSlice[];
+    knowledgeQueryWarnings?: KnowledgeQueryWarning[];
+    knowledgeQueryMetadata?: KnowledgeQueryMetadata | null;
+    knowledgeDecisionReason?: string | null;
 }
 
-export type ChatMode = 'agent' | 'chat' | 'edit'; // Agent 模式：可调用工具；Chat 模式：仅对话；Edit 模式：编辑模式
+export type ChatMode = 'agent' | 'chat'; // Agent 模式：可调用工具；Chat 模式：仅对话
 
 export interface ChatTab {
     id: string;
@@ -35,9 +56,6 @@ export interface ChatTab {
     // 新增字段：聊天记录绑定工作区
     workspacePath: string | null; // 绑定的工作区路径，null 表示临时状态
     isTemporary: boolean; // 是否为临时聊天（未绑定工作区）
-    // 编辑模式字段（可选）
-    editModeFile?: string; // 编辑模式下的文件路径
-    editModeContent?: string; // 编辑模式下的文件内容
 }
 
 interface ChatState {
@@ -57,6 +75,16 @@ interface ChatState {
     // 内容块管理
     addContentBlock: (tabId: string, messageId: string, block: MessageContentBlock) => void;
     updateContentBlock: (tabId: string, messageId: string, blockId: string, updates: Partial<MessageContentBlock>) => void;
+    setKnowledgeAugmentation: (
+        tabId: string,
+        messageId: string,
+        payload: {
+            slices?: KnowledgeInjectionSlice[];
+            warnings?: KnowledgeQueryWarning[];
+            metadata?: KnowledgeQueryMetadata | null;
+            decisionReason?: string | null;
+        },
+    ) => void;
     setModel: (tabId: string, model: string) => void;
     setMode: (tabId: string, mode: ChatMode) => void; // 设置聊天模式
     clearMessages: (tabId: string) => void;
@@ -75,7 +103,21 @@ interface ChatState {
     refreshPositioningContextForEditor: (filePath: string) => void;
 }
 
-export const useChatStore = create<ChatState>((set, get) => {
+type PersistedChatTab = Omit<ChatTab, 'messages'>;
+
+function generateStableUuid(): string {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+        return crypto.randomUUID();
+    }
+    // RFC 4122 v4 fallback（极端环境）
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+        const r = (Math.random() * 16) | 0;
+        const v = c === 'x' ? r : (r & 0x3) | 0x8;
+        return v.toString(16);
+    });
+}
+
+export const useChatStore = create<ChatState>()(persist((set, get) => {
     // ⚠️ 关键修复：正确初始化事件监听（在 store 外部初始化）
     // 注意：事件监听应该在组件中初始化，而不是在 store 中
     // 这里先移除，在 ChatPanel 组件中初始化
@@ -85,7 +127,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         activeTabId: null,
         
         createTab: (title?: string, mode: ChatMode = 'agent') => {
-            const tabId = `chat-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+            const tabId = generateStableUuid();
             
             // 检查是否有工作区
             let currentWorkspace: string | null = null;
@@ -108,6 +150,14 @@ export const useChatStore = create<ChatState>((set, get) => {
                 workspacePath: currentWorkspace, // 工作区路径
                 isTemporary: !currentWorkspace, // 没有工作区时为临时聊天
             };
+
+            // Phase 1：先建立 agentStore 运行态壳，不改变现有聊天行为。
+            useAgentStore.getState().ensureRuntimeForTab(tabId, mode);
+
+            // Phase 8：有 workspace 且 agent 模式时，异步恢复持久化的活跃任务
+            if (currentWorkspace && mode === 'agent') {
+                useAgentStore.getState().loadTasksFromDb(tabId).catch(() => {});
+            }
             
             set({
                 tabs: [...get().tabs, newTab],
@@ -126,7 +176,22 @@ export const useChatStore = create<ChatState>((set, get) => {
         
         deleteTab: (tabId: string) => {
             const { tabs, activeTabId } = get();
+            // P1: 触发 tab 删除升格链（fire-and-forget）
+            const tab = tabs.find(t => t.id === tabId);
+            if (tab) {
+                const userMsgCount = tab.messages.filter((m) => {
+                    if (m.role !== 'user') return false;
+                    const content = (m.content || '').trimStart();
+                    return !content.startsWith('[NEXT_ACTION]') && !content.startsWith('[TOOL_RESULTS]');
+                }).length;
+                invoke('on_tab_deleted_cmd', {
+                    tabId,
+                    userMessageCount: userMsgCount,
+                    workspacePath: tab.workspacePath ?? null,
+                }).catch((e: unknown) => console.warn('[memory] on_tab_deleted_cmd failed:', e));
+            }
             useDiffStore.getState().cleanupDiffsForChatTab(tabId);
+            useAgentStore.getState().dropRuntimeForTab(tabId);
             const newTabs = tabs.filter(t => t.id !== tabId);
             
             set({
@@ -325,6 +390,31 @@ export const useChatStore = create<ChatState>((set, get) => {
                 ),
             });
         },
+
+        setKnowledgeAugmentation: (tabId, messageId, payload) => {
+            const { tabs } = get();
+            set({
+                tabs: tabs.map(t =>
+                    t.id === tabId
+                        ? {
+                            ...t,
+                            messages: t.messages.map(m =>
+                                m.id === messageId
+                                    ? {
+                                        ...m,
+                                        knowledgeInjectionSlices: payload.slices ?? m.knowledgeInjectionSlices,
+                                        knowledgeQueryWarnings: payload.warnings ?? m.knowledgeQueryWarnings,
+                                        knowledgeQueryMetadata: payload.metadata ?? m.knowledgeQueryMetadata,
+                                        knowledgeDecisionReason: payload.decisionReason ?? m.knowledgeDecisionReason,
+                                    }
+                                    : m
+                            ),
+                            updatedAt: Date.now(),
+                        }
+                        : t
+                ),
+            });
+        },
         
         setModel: (tabId: string, model: string) => {
             const { tabs } = get();
@@ -346,6 +436,8 @@ export const useChatStore = create<ChatState>((set, get) => {
                 console.warn('⚠️ 聊天已开始，无法切换模式');
                 return;
             }
+
+            useAgentStore.getState().setChatModeBoundary(tabId, mode);
             
             set({
                 tabs: tabs.map(t =>
@@ -384,38 +476,35 @@ export const useChatStore = create<ChatState>((set, get) => {
             });
         },
 
-        setTabMode: (tabId: string, mode: 'chat' | 'edit') => {
-            const { tabs } = get();
-            set({
-                tabs: tabs.map(t =>
-                    t.id === tabId
-                        ? { ...t, mode, updatedAt: Date.now() }
-                        : t
-                ),
-            });
-        },
-        
-        setEditModeFile: (tabId: string, filePath: string, content: string) => {
-            const { tabs } = get();
-            set({
-                tabs: tabs.map(t =>
-                    t.id === tabId
-                        ? {
-                            ...t,
-                            mode: 'edit',
-                            editModeFile: filePath,
-                            editModeContent: content,
-                            updatedAt: Date.now(),
-                        }
-                        : t
-                ),
-            });
-        },
         
         sendMessage: async (tabId: string, content: string, options?: { validRefIds?: string[]; displayNodes?: DisplayNode[]; displayContent?: string }) => {
             const { tabs, addMessage, setMessageLoading } = get();
             const tab = tabs.find(t => t.id === tabId);
             if (!tab) return;
+
+            if (tab.mode === 'agent') {
+                const agentStore = useAgentStore.getState();
+                const shadowTask = createShadowTaskRecord(tabId, content);
+                agentStore.setCurrentTask(tabId, shadowTask);
+                agentStore.setStageState(
+                    tabId,
+                    createShadowStageState(shadowTask.id, 'structured', 'user_message_received'),
+                );
+                agentStore.setVerification(
+                    tabId,
+                    createPendingVerificationRecord(shadowTask.id, 'shadow_registry_initialized'),
+                );
+                agentStore.setConfirmation(
+                    tabId,
+                    createPendingConfirmationRecord(shadowTask.id, 'awaiting_candidate_generation'),
+                );
+                import('../services/agentTaskPersistence').then(({ persistAgentTask }) => {
+                    persistAgentTask(
+                        shadowTask.id, tabId, content,
+                        shadowTask.lifecycle, 'structured', 'user_message_received',
+                    );
+                }).catch(() => {});
+            }
             
             // 添加用户消息（displayNodes 用于消息记录以标签形式展示）
             addMessage(tabId, {
@@ -456,8 +545,8 @@ export const useChatStore = create<ChatState>((set, get) => {
                         content: m.content,
                     }));
                 
-                // 获取当前工作区路径（用于判断是否启用工具）
-                const { currentWorkspace } = (await import('./fileStore')).useFileStore.getState();
+                // 绑定工作区优先：记忆链与工具链都以 tab.workspacePath 为准，避免跨工作区污染
+                const tabWorkspacePath = currentTab.workspacePath;
                 
                 // P3 + §十三：注入 tab 与 RequestContext 同源（determineInjectionEditorTab）
                 const { getActiveTab, getTabByFilePath } = useEditorStore.getState();
@@ -473,7 +562,7 @@ export const useChatStore = create<ChatState>((set, get) => {
                 const { determineInjectionEditorTab, buildPositioningRequestContext, setPositioningRequestContextForChat } =
                     await import('../utils/requestContext');
                 const { injectionTab, fileRefsForInjection } = determineInjectionEditorTab(
-                    currentWorkspace,
+                    tabWorkspacePath,
                     activeEditorTab,
                     refs,
                     getTabByFilePath
@@ -578,7 +667,7 @@ export const useChatStore = create<ChatState>((set, get) => {
                     tabId, 
                     messageCount: messages.length,
                     allMessagesCount: allMessages.length,
-                    hasWorkspace: !!currentWorkspace,
+                    hasWorkspace: !!tabWorkspacePath,
                     mode: currentTab.mode,
                     isTemporary: currentTab.isTemporary,
                     currentFile: currentFile,
@@ -592,19 +681,19 @@ export const useChatStore = create<ChatState>((set, get) => {
                 const { buildReferencesForProtocol } = await import('../utils/referenceProtocolAdapter');
                 const references = await buildReferencesForProtocol(refs, currentFile, validRefIdSet);
 
-                const enableTools = currentTab.mode === 'agent' && !!currentWorkspace;
+                const enableTools = currentTab.mode === 'agent' && !!tabWorkspacePath;
 
                 // primaryEditTarget：仅自动推导（§6.9），不由用户点选；意图识别交给模型与提示词在后续优化
                 // 规则：恰好一个文件引用且与当前活动编辑器文档不是同一文件 → 传工作区相对路径，后端跳过向 edit_current_editor_document 注入当前编辑器内容
                 // primaryEditTarget：与**活动**编辑器文档比较（非注入后 currentFile），供后端在「仅引用、目标未打开」时跳过错误注入
                 let primaryEditTarget: string | undefined;
-                if (currentWorkspace && activeEditorTab?.filePath) {
+                if (tabWorkspacePath && activeEditorTab?.filePath) {
                     if (fileRefsForInjection.length === 1) {
                         const { normalizePath, normalizeWorkspacePath, getAbsolutePath, getRelativePath, isSameDocumentForEdit } =
                             await import('../utils/pathUtils');
                         const refPath = fileRefsForInjection[0].path;
                         if (!isSameDocumentForEdit(refPath, activeEditorTab.filePath)) {
-                            const wsNorm = normalizeWorkspacePath(currentWorkspace);
+                            const wsNorm = normalizeWorkspacePath(tabWorkspacePath);
                             const absRef = getAbsolutePath(normalizePath(refPath), wsNorm);
                             primaryEditTarget = getRelativePath(absRef, wsNorm);
                         }
@@ -621,6 +710,7 @@ export const useChatStore = create<ChatState>((set, get) => {
                         max_tokens: 2000,
                     },
                     enableTools: enableTools, // Agent 模式且有工作区时启用工具，否则禁用
+                    workspacePath: tabWorkspacePath, // 绑定工作区作用域（memory/tool 主链一致）
                     currentFile: currentFile, // ⚠️ 关键修复：传递当前编辑器打开的文件路径
                     selectedText: selectedText, // ⚠️ 关键修复：传递当前选中的文本
                     currentEditorContent: currentEditorContent, // ⚠️ 文档编辑功能：传递当前编辑器内容
@@ -637,6 +727,10 @@ export const useChatStore = create<ChatState>((set, get) => {
                     // §7.1：光标坐标
                     ...(cursorBlockId != null ? { cursorBlockId } : {}),
                     ...(cursorOffset != null ? { cursorOffset } : {}),
+                    // Phase 6: shadow task ID — 让后端写 candidate_ready/review_ready 到正确的 agent_task 记录
+                    ...(useAgentStore.getState().runtimesByTab[tabId]?.currentTask?.id != null
+                        ? { agentTaskId: useAgentStore.getState().runtimesByTab[tabId]!.currentTask!.id }
+                        : {}),
                 });
             } catch (error) {
                 console.error('发送消息失败:', error);
@@ -751,4 +845,28 @@ export const useChatStore = create<ChatState>((set, get) => {
             });
         },
     };
-});
+}, {
+    name: 'binder-chat-tabs-storage',
+    storage: createJSONStorage(() => localStorage),
+    partialize: (state) => ({
+        tabs: state.tabs.map(({ messages, ...meta }) => meta as PersistedChatTab),
+        activeTabId: state.activeTabId,
+    }),
+    onRehydrateStorage: () => (state) => {
+        if (!state) return;
+        state.tabs = state.tabs.map((tab) => ({
+            ...tab,
+            messages: Array.isArray(tab.messages) ? tab.messages : [],
+        }));
+        if (state.activeTabId && !state.tabs.some((t) => t.id === state.activeTabId)) {
+            state.activeTabId = state.tabs.length > 0 ? state.tabs[0].id : null;
+        }
+        try {
+            state.tabs.forEach((tab) => {
+                useAgentStore.getState().ensureRuntimeForTab(tab.id, tab.mode);
+            });
+        } catch (e) {
+            console.warn('[chatStore] rehydrate: ensureRuntimeForTab failed', e);
+        }
+    },
+}));

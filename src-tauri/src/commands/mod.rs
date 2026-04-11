@@ -4,6 +4,7 @@ pub mod positioning_snapshot;
 pub mod ai_commands;
 pub mod search_commands;
 pub mod memory_commands;
+pub mod knowledge_commands;
 pub mod classifier_commands;
 pub mod tool_commands;
-
+pub mod template_commands;

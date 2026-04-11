@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
-import { Reference, ReferenceType, TextReference, FileReference, ImageReference, MemoryReference, LinkReference } from '../types/reference';
+import { Reference, ReferenceType, TextReference, FileReference, ImageReference, MemoryReference, LinkReference, KnowledgeBaseReference, TemplateReference } from '../types/reference';
 
 interface ReferenceState {
     // 当前聊天标签页的引用列表（按 tabId 组织）
@@ -38,6 +38,14 @@ export const useReferenceStore = create<ReferenceState>((set, get) => {
             case ReferenceType.LINK:
                 const linkRef = ref as LinkReference;
                 return `[链接引用] ${linkRef.url}`;
+
+            case ReferenceType.KNOWLEDGE_BASE:
+                const knowledgeRef = ref as KnowledgeBaseReference;
+                return `[知识库引用] ${knowledgeRef.entryTitle || knowledgeRef.kbName}\n命中 ${knowledgeRef.itemCount || knowledgeRef.injectionSlices?.length || 0} 个片段`;
+
+            case ReferenceType.TEMPLATE:
+                const templateRef = ref as TemplateReference;
+                return `[工作流模板引用] ${templateRef.templateName}\n模板ID: ${templateRef.templateId}`;
             
             default:
                 return '';
@@ -132,4 +140,3 @@ export const useReferenceStore = create<ReferenceState>((set, get) => {
         },
     };
 });
-

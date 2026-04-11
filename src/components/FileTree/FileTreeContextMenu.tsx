@@ -1,5 +1,11 @@
 import React, { useEffect, useRef } from 'react';
-import { PencilIcon, TrashIcon, DocumentDuplicateIcon, SparklesIcon } from '@heroicons/react/24/outline';
+import {
+  BookOpenIcon,
+  DocumentDuplicateIcon,
+  PencilIcon,
+  SparklesIcon,
+  TrashIcon,
+} from '@heroicons/react/24/outline';
 
 interface FileTreeContextMenuProps {
   x: number;
@@ -10,6 +16,7 @@ interface FileTreeContextMenuProps {
   onDelete: () => void;
   onDuplicate?: () => void;
   onOrganize?: () => void;
+  onStoreToKnowledge?: () => void;
   onClose: () => void;
 }
 
@@ -22,6 +29,7 @@ const FileTreeContextMenu: React.FC<FileTreeContextMenuProps> = ({
   onDelete,
   onDuplicate,
   onOrganize,
+  onStoreToKnowledge,
   onClose,
 }) => {
   const menuRef = useRef<HTMLDivElement>(null);
@@ -130,6 +138,19 @@ const FileTreeContextMenu: React.FC<FileTreeContextMenuProps> = ({
         </>
       )}
 
+      {onStoreToKnowledge && !isDirectory && (
+        <button
+          onClick={() => {
+            onStoreToKnowledge();
+            onClose();
+          }}
+          className="w-full text-left px-4 py-2 hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2 text-sm text-blue-600 dark:text-blue-400"
+        >
+          <BookOpenIcon className="w-4 h-4" />
+          存入知识库
+        </button>
+      )}
+
       <div className="border-t border-gray-200 dark:border-gray-700 my-1" />
 
       <button
@@ -149,4 +170,3 @@ const FileTreeContextMenu: React.FC<FileTreeContextMenuProps> = ({
 };
 
 export default FileTreeContextMenu;
-

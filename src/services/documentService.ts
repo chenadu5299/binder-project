@@ -709,6 +709,8 @@ export const documentService = {
   async saveFile(filePath: string, content: string): Promise<void> {
     try {
       const ext = filePath.split('.').pop()?.toLowerCase();
+      const activeTab = useEditorStore.getState().getTabByFilePath(filePath);
+      const beforeContent = activeTab?.lastSavedContent ?? '';
 
       let htmlForWorkspaceCache = content;
       if (ext === 'docx') {
@@ -736,6 +738,17 @@ export const documentService = {
           });
         } catch (e) {
           console.warn('[documentService] 保存后同步 workspace 缓存失败（可忽略）:', e);
+        }
+
+        try {
+          await invoke<boolean>('record_saved_file_timeline_node', {
+            workspacePath: ws,
+            fileAbsolutePath: filePath,
+            beforeContent,
+            afterContent: htmlForWorkspaceCache,
+          });
+        } catch (e) {
+          console.warn('[documentService] 保存后写入时间轴失败（不影响保存）:', e);
         }
       }
     } catch (error) {

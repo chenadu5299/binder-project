@@ -1,65 +1,115 @@
 import { invoke } from '@tauri-apps/api/core';
 
-export interface Memory {
+// ── 类型定义（与 Rust 后端对称，A-AST-M-S-02 §1.3） ──────────────────────────
+
+export interface MemoryItem {
     id: string;
-    document_path: string;
-    entity_type: string;
-    entity_name: string;
+    layer: 'tab' | 'content' | 'workspace_long_term' | 'user';
+    scopeType: 'tab' | 'workspace' | 'user';
+    scopeId: string;
+    entityType: string;
+    entityName: string;
     content: string;
-    metadata: any;
-    source: string;
+    summary: string;
+    tags: string;
+    sourceKind: string;
+    sourceRef: string;
     confidence: number;
+    freshnessStatus: 'fresh' | 'stale' | 'expired' | 'superseded';
+    readonly: boolean;
+    accessCount: number;
+    lastAccessedAt?: number;
+    createdAt: number;
+    updatedAt: number;
 }
+
+export interface SearchMemoriesParams {
+    query: string;
+    tabId?: string;
+    workspacePath?: string;
+    scope?: 'tab' | 'content' | 'workspace_long_term' | 'user' | 'all';
+    limit?: number;
+    entityTypes?: string[];
+    includeUserMemory?: boolean;
+}
+
+export interface MemorySearchResult {
+    item: MemoryItem;
+    relevanceScore: number;
+    sourceLabel: string;
+}
+
+export interface MemorySearchResponse {
+    items: MemorySearchResult[];
+    totalFound: number;
+    scopeUsed: string[];
+    timedOut: boolean;
+}
+
+// ── 服务方法 ──────────────────────────────────────────────────────────────────
 
 export const memoryService = {
     /**
-     * 获取所有记忆
+     * 检索记忆库（P0 FTS5 检索，500ms 超时降级）
      */
-    async getAllMemories(workspacePath: string): Promise<Memory[]> {
-        return await invoke<Memory[]>('get_all_memories', { workspacePath });
+    async searchMemories(params: SearchMemoriesParams): Promise<MemorySearchResponse> {
+        return invoke<MemorySearchResponse>('search_memories_cmd', {
+            query: params.query,
+            tabId: params.tabId ?? null,
+            workspacePath: params.workspacePath ?? null,
+            scope: params.scope ?? 'all',
+            limit: params.limit ?? 10,
+            entityTypes: params.entityTypes ?? null,
+            includeUserMemory: params.includeUserMemory ?? null,
+        });
     },
 
     /**
-     * 搜索记忆
+     * 标记孤立 tab 记忆为 stale（P0.5 启动清理）
      */
-    async searchMemories(query: string, workspacePath: string): Promise<Memory[]> {
-        return await invoke<Memory[]>('search_memories', { query, workspacePath });
+    async markOrphanTabMemoriesStale(
+        activeTabIds: string[],
+        workspacePath: string,
+    ): Promise<number> {
+        return invoke<number>('mark_orphan_tab_memories_stale', {
+            activeTabIds,
+            workspacePath,
+        });
     },
 
     /**
-     * 根据实体名称查找记忆
+     * P2: 将指定记忆项标记为 expired（用户主动屏蔽）
      */
-    async findMemoryByName(entityName: string, workspacePath: string): Promise<Memory | null> {
-        const memories = await this.getAllMemories(workspacePath);
-        return memories.find(m => m.entity_name === entityName) || null;
+    async expireMemoryItem(memoryId: string, workspacePath: string): Promise<void> {
+        return invoke<void>('expire_memory_item', {
+            memoryId,
+            workspacePath,
+        });
     },
 
     /**
-     * 跳转到记忆库并选中指定记忆项
+     * P2: 批量屏蔽指定 layer 的所有记忆
      */
-    async jumpToMemory(memoryId: string, _workspacePath: string): Promise<void> {
-        // 确保聊天面板显示并切换到记忆库标签
-        const { useLayoutStore } = await import('../stores/layoutStore');
-        const layoutStore = useLayoutStore.getState();
-        
-        // 显示聊天面板（包含记忆库）
-        if (!layoutStore.chat.visible) {
-            layoutStore.setChatVisible(true);
-        }
+    async expireMemoryLayer(layer: string, workspacePath: string): Promise<number> {
+        return invoke<number>('expire_memory_layer', { layer, workspacePath });
+    },
 
-        // 切换到记忆库标签（需要在 ChatPanel 中实现）
-        // 由于 ChatPanel 使用本地状态，我们需要通过事件或全局状态来实现
-        // 暂时通过 window 对象暴露的方法来实现
-        if ((window as any).scrollToMemory) {
-            (window as any).scrollToMemory(memoryId);
-        } else {
-            // 如果方法不存在，等待一下再试
-            setTimeout(() => {
-                if ((window as any).scrollToMemory) {
-                    (window as any).scrollToMemory(memoryId);
-                }
-            }, 500);
-        }
+    /**
+     * P2: 获取用户 ID 和 user_memory.db 路径
+     */
+    async getMemoryUserData(): Promise<{ userId: string; userDbPath: string }> {
+        return invoke<{ userId: string; userDbPath: string }>('get_memory_user_data');
+    },
+
+    /**
+     * 获取所有记忆（兼容旧接口，使用空 query 检索全部）
+     */
+    async getAllMemories(workspacePath: string): Promise<MemoryItem[]> {
+        const resp = await this.searchMemories({
+            query: ' ',
+            workspacePath,
+            limit: 200,
+        });
+        return resp.items.map(r => r.item);
     },
 };
-

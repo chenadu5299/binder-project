@@ -21,9 +21,9 @@ pub struct LoopDetector {
 
 /// 工具调用记录
 #[derive(Debug, Clone, PartialEq)]
-struct ToolCallRecord {
-  tool_name: String,
-  arguments: String,
+pub struct ToolCallRecord {
+  pub tool_name: String,
+  pub arguments: String,
 }
 
 impl LoopDetector {

@@ -13,6 +13,19 @@ import { useEditorStore } from '../../stores/editorStore';
 import { useFileStore } from '../../stores/fileStore';
 import { useChatStore } from '../../stores/chatStore';
 import { toast } from '../Common/Toast';
+import { markAgentStageComplete, markAgentUserConfirmed } from '../../utils/agentShadowLifecycle';
+
+function completeAgentPairs(pairs: Array<{ chatTabId?: string; agentTaskId?: string }>, reason: string) {
+  const seen = new Set<string>();
+  for (const pair of pairs) {
+    if (!pair.chatTabId || !pair.agentTaskId) continue;
+    const key = `${pair.chatTabId}:${pair.agentTaskId}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    markAgentUserConfirmed(pair.chatTabId, pair.agentTaskId, 'bulk_accept_confirmed');
+    markAgentStageComplete(pair.chatTabId, pair.agentTaskId, reason);
+  }
+}
 
 const SCOPE_LABELS: Record<DiffBulkScope, string> = {
   current_chat_tab: '本对话',
@@ -119,6 +132,12 @@ export const DiffAllActionsBar: React.FC = () => {
         expired += result.expired;
         if (result.anyApplied) refreshFilePaths.add(tabFp);
         updateTabContent(tab.id, tab.editor.getHTML());
+        if (result.anyApplied) {
+          completeAgentPairs(entries.map((entry) => ({
+            chatTabId: entry.chatTabId,
+            agentTaskId: entry.agentTaskId,
+          })), 'editor_revision_advanced');
+        }
         tab.editor.view.dispatch(tab.editor.state.tr);
       }
       // 所有文件批量处理完成后统一刷新一次，避免中途刷新导致后续同轮批量误判。
@@ -135,6 +154,10 @@ export const DiffAllActionsBar: React.FC = () => {
         const indices = entries.map((e) => e.diff_index);
         await acceptFileDiffs(filePath, currentWorkspace, indices);
         applied += entries.length;
+        completeAgentPairs(entries.map((entry) => ({
+          chatTabId: entry.chatTabId,
+          agentTaskId: entry.agentTaskId,
+        })), 'workspace_file_written');
       }
       if (skippedFiles > 0) {
         toast.info(

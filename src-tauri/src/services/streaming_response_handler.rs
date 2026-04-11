@@ -97,29 +97,6 @@ impl StreamingResponseHandler {
     Some(text.to_string())
   }
 
-  /// 检测工具调用（从流式响应中提取）
-  pub fn detect_tool_call(chunk: &ChatChunk) -> Option<ToolCallInfo> {
-    match chunk {
-      ChatChunk::ToolCall {
-        id,
-        name,
-        arguments,
-        is_complete,
-      } => {
-        if *is_complete {
-          Some(ToolCallInfo {
-            id: id.clone(),
-            name: name.clone(),
-            arguments: arguments.clone(),
-          })
-        } else {
-          None
-        }
-      }
-      _ => None,
-    }
-  }
-
   /// 清空累积文本（用于新的一轮对话）
   pub fn clear_accumulated(&mut self, tab_id: &str) {
     self.accumulated_texts.remove(tab_id);
@@ -133,14 +110,6 @@ impl StreamingResponseHandler {
       .cloned()
       .unwrap_or_default()
   }
-}
-
-/// 工具调用信息
-#[derive(Debug, Clone)]
-pub struct ToolCallInfo {
-  pub id: String,
-  pub name: String,
-  pub arguments: String,
 }
 
 /// 安全地截取字符串，确保在字符边界处截取

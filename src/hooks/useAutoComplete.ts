@@ -1,5 +1,9 @@
 /**
  * 辅助续写 Hook：Cmd+J 触发，调用 ai_autocomplete，返回建议列表供 AutoCompletePopover 展示
+ *
+ * 边界说明：
+ * - 这是层次一独立链路
+ * - Phase 1 起继续共用后端命令层，但不得反向污染 L3 Agent 主链状态/PromptPackage
  */
 import { useState, useCallback, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';

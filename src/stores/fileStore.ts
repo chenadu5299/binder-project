@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { invoke } from '@tauri-apps/api/core';
 import { FileTreeNode } from '../types/file';
 
 interface FileState {
@@ -29,7 +30,25 @@ export const useFileStore = create<FileState>((set) => ({
   lastEditorSaveAt: 0,
   lastEditorSaveWorkspace: null,
 
-  setCurrentWorkspace: (path) => set({ currentWorkspace: path }),
+  setCurrentWorkspace: (path) => {
+    set({ currentWorkspace: path });
+    // P0.5: 工作区加载完成后异步清理孤立 tab 记忆（fire-and-forget）
+    if (path) {
+      void import('./chatStore')
+        .then(({ useChatStore }) => {
+          const activeTabIds = useChatStore
+            .getState()
+            .tabs
+            .filter((t: { workspacePath: string | null }) => t.workspacePath === path)
+            .map((t: { id: string }) => t.id);
+          return invoke('mark_orphan_tab_memories_stale', { activeTabIds, workspacePath: path });
+        })
+        .catch((e: unknown) => console.warn('mark_orphan_tab_memories_stale failed:', e));
+      // P1: 启动时清理过期记忆（fire-and-forget）
+      invoke('startup_memory_maintenance', { workspacePath: path })
+        .catch((e: unknown) => console.warn('startup_memory_maintenance failed:', e));
+    }
+  },
   setFileTree: (tree) => set({ fileTree: tree }),
   setSelectedFile: (path) => set({ selectedFile: path }),
   addOpenFile: (path) =>

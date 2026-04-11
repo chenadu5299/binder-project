@@ -3,7 +3,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { PaperClipIcon, ChevronDownIcon } from '@heroicons/react/24/outline';
 import { useReferenceStore } from '../../stores/referenceStore';
-import { Reference } from '../../types/reference';
+import { KnowledgeBaseReference, Reference, ReferenceType } from '../../types/reference';
 import { getReferenceIcon, getReferenceDisplayText } from '../../utils/inlineContentParser';
 
 interface ReferenceManagerButtonProps {
@@ -123,19 +123,24 @@ export const ReferenceManagerButton: React.FC<ReferenceManagerButtonProps> = ({
                                             className="reference-item"
                                             onClick={() => handleInsert(ref.id)}
                                         >
-                                            <span className="ref-icon">
-                                                {getReferenceIcon(ref)}
-                                            </span>
-                                            <span className="ref-label">
-                                                {getReferenceDisplayText(ref)}
-                                            </span>
-                                            <button
-                                                className="ref-remove-btn-small"
-                                                onClick={(e) => handleRemove(e, ref.id)}
-                                                title="移除引用"
-                                            >
-                                                ×
-                                            </button>
+                                            <div className="flex-1 min-w-0">
+                                                <div className="flex items-center gap-2">
+                                                    <span className="ref-icon">
+                                                        {getReferenceIcon(ref)}
+                                                    </span>
+                                                    <span className="ref-label">
+                                                        {getReferenceDisplayText(ref)}
+                                                    </span>
+                                                    <button
+                                                        className="ref-remove-btn-small"
+                                                        onClick={(e) => handleRemove(e, ref.id)}
+                                                        title="移除引用"
+                                                    >
+                                                        ×
+                                                    </button>
+                                                </div>
+                                                {renderKnowledgeMeta(ref)}
+                                            </div>
                                         </div>
                                     ))}
                                 </div>
@@ -163,3 +168,29 @@ function getTypeLabel(type: string): string {
     return labels[type] || '📎 引用';
 }
 
+function renderKnowledgeMeta(ref: Reference): React.ReactNode {
+    if (ref.type !== ReferenceType.KNOWLEDGE_BASE) return null;
+    const knowledgeRef = ref as KnowledgeBaseReference;
+    const firstSlice = knowledgeRef.injectionSlices?.[0];
+    const riskFlags = firstSlice?.riskFlags ?? [];
+    const warningText = knowledgeRef.warnings?.map((warning) => warning.code).join(', ');
+    const retrievalStrategy = knowledgeRef.queryMetadata?.effectiveStrategy;
+
+    if (!firstSlice && !warningText && !retrievalStrategy) {
+        return null;
+    }
+
+    return (
+        <div className="mt-1 space-y-1 text-[11px] text-gray-500 dark:text-gray-400">
+            {firstSlice && (
+                <div>
+                    role={firstSlice.sourceRole}
+                    {firstSlice.citation ? ` · citation=${firstSlice.citation.status}` : ''}
+                    {riskFlags.length > 0 ? ` · risk=${riskFlags.join(', ')}` : ''}
+                </div>
+            )}
+            {retrievalStrategy && <div>strategy={retrievalStrategy}</div>}
+            {warningText && <div>warnings={warningText}</div>}
+        </div>
+    );
+}

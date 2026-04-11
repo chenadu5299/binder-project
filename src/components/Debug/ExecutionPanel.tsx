@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useChatStore } from '../../stores/chatStore';
+import { useAgentStore } from '../../stores/agentStore';
 import {
   ExecutionExposure,
   extractExecutionExposuresFromToolResultData,
@@ -68,6 +69,7 @@ export const ExecutionPanel: React.FC = () => {
   const storeExposures = useDiffStore((s) => s.executionExposures);
   const chatTabs = useChatStore((s) => s.tabs);
   const activeTabId = useChatStore((s) => s.activeTabId);
+  const activeRuntime = useAgentStore((s) => (activeTabId ? s.runtimesByTab[activeTabId] : undefined));
   const backendExposures = useMemo(
     () => collectBackendExposuresFromActiveTab(chatTabs, activeTabId),
     [chatTabs, activeTabId]
@@ -82,8 +84,17 @@ export const ExecutionPanel: React.FC = () => {
   return (
     <div className="fixed bottom-3 right-3 z-[1200] w-[540px] max-w-[calc(100vw-24px)] max-h-[42vh] overflow-hidden rounded-lg border border-gray-300 bg-white shadow-lg dark:border-gray-700 dark:bg-gray-900">
       <div className="flex items-center justify-between border-b border-gray-200 px-3 py-2 dark:border-gray-700">
-        <div className="text-xs font-semibold text-gray-700 dark:text-gray-200">
-          ExecutionExposure ({merged.length})
+        <div>
+          <div className="text-xs font-semibold text-gray-700 dark:text-gray-200">
+            ExecutionExposure ({merged.length})
+          </div>
+          {activeRuntime?.currentTask && (
+            <div className="mt-1 text-[10px] text-gray-500 dark:text-gray-400">
+              stage={activeRuntime.stageState.stage}
+              {activeRuntime.verification ? ` · verification=${activeRuntime.verification.status}` : ''}
+              {activeRuntime.confirmation ? ` · confirmation=${activeRuntime.confirmation.status}` : ''}
+            </div>
+          )}
         </div>
         <button
           type="button"

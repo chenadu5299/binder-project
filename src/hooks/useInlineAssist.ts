@@ -2,6 +2,11 @@ import { useState, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Editor } from '@tiptap/react';
 
+/**
+ * 边界说明：
+ * - 这是层次二独立链路
+ * - 继续共用 ai_commands.rs，但不得反向承担 L3 Agent 状态、artifact、plan 主链职责
+ */
 export type InlineAssistMessageRole = 'user' | 'assistant';
 export type InlineAssistMessageKind = 'reply' | 'edit';
 
@@ -290,4 +295,3 @@ export function useInlineAssist(editor: Editor | null) {
         applyEdit,
     };
 }
-

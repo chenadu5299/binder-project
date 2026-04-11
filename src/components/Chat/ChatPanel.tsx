@@ -18,6 +18,38 @@ import { convertLegacyDiffsToEntriesWithFallback } from '../../utils/diffFormatA
 import { resolveEditorTabForEditResultWithRequestContext, inferPositioningPath } from '../../utils/editToolTabResolve';
 import { sha256HexUtf8, blockOrderSnapshotHashFromHtml } from '../../utils/contentSnapshotHash';
 import { needsAuthorization } from '../../utils/toolDescription';
+import { useAgentStore } from '../../stores/agentStore';
+import type { KnowledgeInjectionSlice, KnowledgeQueryMetadata, KnowledgeQueryWarning } from '../../types/knowledge';
+import {
+    createPassedVerificationRecord,
+    createPendingConfirmationRecord,
+    createShadowStageState,
+} from '../../types/agent_state';
+
+function normalizeToolResultData(result: any): Record<string, any> {
+    if (!result) return {};
+    if (typeof result.data === 'object' && result.data !== null) return result.data;
+    if (typeof result.data === 'string') {
+        try {
+            return JSON.parse(result.data);
+        } catch {
+            return {};
+        }
+    }
+    return typeof result === 'object' && result !== null ? result : {};
+}
+
+function hasCandidatePayload(toolName: string, result: any): boolean {
+    if (!result?.success) return false;
+    const resultData = normalizeToolResultData(result);
+    if (toolName === 'update_file') {
+        return Array.isArray(resultData.pending_diffs) && resultData.pending_diffs.length > 0;
+    }
+    if (toolName === 'edit_current_editor_document') {
+        return !!resultData.diff_area_id && Array.isArray(resultData.diffs) && resultData.diffs.length > 0;
+    }
+    return false;
+}
 
 /** 计算累积文本末尾与 chunk 开头的最大重叠长度，用于流式去重（避免「我我理解理解」式重复） */
 function getOverlapLength(accumulated: string, chunk: string): number {
@@ -79,11 +111,19 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                             result?: any;
                             error?: string;
                         };
+                        knowledge_retrieval?: {
+                            triggered: boolean;
+                            decision_reason?: string | null;
+                            injection_slices?: KnowledgeInjectionSlice[];
+                            warnings?: KnowledgeQueryWarning[];
+                            metadata?: KnowledgeQueryMetadata | null;
+                        };
                     };
                     
                     // 关键修复：过滤空 chunk，避免处理空事件
                     const chunk = (payload.chunk || '').toString();
-                    const isEmptyChunk = !payload.tool_call && chunk.length === 0 && !payload.done && !payload.error;
+                    const hasKnowledgePayload = !!payload.knowledge_retrieval;
+                    const isEmptyChunk = !payload.tool_call && !hasKnowledgePayload && chunk.length === 0 && !payload.done && !payload.error;
                     
                     if (isEmptyChunk) {
                         // 跳过空 chunk，不记录日志，避免日志污染
@@ -104,7 +144,7 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                         has_tool_call: !!payload.tool_call
                     });
                     
-                    const { tabs, appendToMessage, updateMessage, setMessageLoading, addToolCall, updateToolCall, addContentBlock, updateContentBlock } = useChatStore.getState();
+                    const { tabs, appendToMessage, updateMessage, setMessageLoading, addToolCall, updateToolCall, addContentBlock, updateContentBlock, setKnowledgeAugmentation } = useChatStore.getState();
                     const tab = tabs.find(t => t.id === payload.tab_id);
                     if (!tab) {
                         // ⚠️ 关键修复：如果找不到 tab，可能是 tab 被删除了，或者 tab_id 不匹配
@@ -133,6 +173,15 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                     if (!lastMessage) {
                         console.warn('⚠️ 标签页没有消息:', payload.tab_id);
                         return;
+                    }
+
+                    if (payload.knowledge_retrieval) {
+                        setKnowledgeAugmentation(payload.tab_id, lastMessage.id, {
+                            slices: payload.knowledge_retrieval.injection_slices ?? [],
+                            warnings: payload.knowledge_retrieval.warnings ?? [],
+                            metadata: payload.knowledge_retrieval.metadata ?? null,
+                            decisionReason: payload.knowledge_retrieval.decision_reason ?? null,
+                        });
                     }
                     
                     // ⚠️ 关键修复：先检查 done，再检查 error
@@ -329,6 +378,7 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                                 name: toolCall.name,
                                 arguments: parsedArguments,
                                 status: toolCallStatus,
+                                agentTaskId: useAgentStore.getState().runtimesByTab[payload.tab_id]?.currentTask?.id,
                                 timestamp: Date.now(),
                                 result: toolCall.result,
                                 error: toolCall.error,
@@ -439,6 +489,26 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                                         status: 'completed',
                                         result: toolCall.result,
                                     });
+                                    if (hasCandidatePayload(toolCallObj.name, toolCall.result)) {
+                                        const agentStore = useAgentStore.getState();
+                                        const runtime = agentStore.runtimesByTab[payload.tab_id];
+                                        const taskId = runtime?.currentTask?.id ?? null;
+                                        const currentStage = runtime?.stageState.stage;
+                                        if (taskId && ['draft', 'structured', 'candidate_ready'].includes(currentStage ?? 'draft')) {
+                                            agentStore.setStageState(
+                                                payload.tab_id,
+                                                createShadowStageState(taskId, 'candidate_ready', `${toolCallObj.name}:candidate_emitted`)
+                                            );
+                                            agentStore.setVerification(
+                                                payload.tab_id,
+                                                createPassedVerificationRecord(taskId, `${toolCallObj.name}:candidate_verified`)
+                                            );
+                                            agentStore.setConfirmation(
+                                                payload.tab_id,
+                                                createPendingConfirmationRecord(taskId, `${toolCallObj.name}:awaiting_review_render`)
+                                            );
+                                        }
+                                    }
                                     // AI 通过 create_file/update_file 创建或更新文件时，立即记录元数据（便于从文件树打开时进入编辑模式）
                                     if (
                                         (toolCallObj.name === 'create_file' || toolCallObj.name === 'update_file') &&
@@ -496,6 +566,7 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                                                         chatTabId: payload.tab_id,
                                                         sourceToolCallId: toolCallObj.id,
                                                         messageId: lastMessage.id,
+                                                        agentTaskId: toolCallObj.agentTaskId,
                                                     });
                                                     const tab = useEditorStore.getState().tabs.find((t) => t.filePath === filePath);
                                                     if (tab?.editor?.state?.doc) {
@@ -545,6 +616,7 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                                                             lastMessage.id,
                                                             {
                                                                 sourceLabel: `助手消息 · ${toolCallObj.name}`,
+                                                                agentTaskId: toolCallObj.agentTaskId,
                                                                 documentRevision: docRev,
                                                                 currentTabRevision: curRev,
                                                                 positioningPath: inferPositioningPath(toolCallObj),
@@ -783,7 +855,75 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
             accumulatedTextRef.current.clear();
         };
     }, []); // 只在组件挂载时初始化一次
-    
+
+    // Phase 6: 监听后端 stage 变更事件，同步更新 agentStore shadow 状态
+    useEffect(() => {
+        let cancelled = false;
+        let unlistenFn: (() => void) | null = null;
+
+        listen('ai-agent-stage-changed', (event: any) => {
+            const { tabId, taskId, stage, stageReason } = event.payload as {
+                tabId: string;
+                taskId: string;
+                stage: string;
+                stageReason?: string;
+            };
+            const agentStore = useAgentStore.getState();
+            const runtime = agentStore.runtimesByTab[tabId];
+            if (!runtime?.currentTask) return;
+            // 只在 task ID 匹配时更新（避免跨任务污染）
+            if (runtime.currentTask.id !== taskId && !taskId.startsWith('shadow-tab:')) return;
+            agentStore.setStageState(tabId, {
+                taskId: runtime.currentTask.id,
+                stage: stage as any,
+                updatedAt: Date.now(),
+                stageReason: stageReason,
+            });
+        }).then(unlisten => {
+            if (cancelled) {
+                unlisten();
+            } else {
+                unlistenFn = unlisten;
+            }
+        });
+
+        return () => {
+            cancelled = true;
+            unlistenFn?.();
+        };
+    }, []);
+
+    useEffect(() => {
+        let cancelled = false;
+        let unlistenFn: (() => void) | null = null;
+
+        listen('ai-workflow-execution-updated', (event: any) => {
+            const { tabId, taskId, runtime } = event.payload as {
+                tabId: string;
+                taskId: string;
+                runtime: any;
+            };
+            const agentStore = useAgentStore.getState();
+            const currentRuntime = agentStore.runtimesByTab[tabId];
+            if (!currentRuntime?.currentTask) return;
+            if (currentRuntime.currentTask.id !== taskId && !taskId.startsWith('shadow-tab:')) {
+                return;
+            }
+            agentStore.setWorkflowExecution(tabId, runtime);
+        }).then(unlisten => {
+            if (cancelled) {
+                unlisten();
+            } else {
+                unlistenFn = unlisten;
+            }
+        });
+
+        return () => {
+            cancelled = true;
+            unlistenFn?.();
+        };
+    }, []);
+
     // 按照文档：清理已完成消息的累积文本
     useEffect(() => {
         tabs.forEach(tab => {
@@ -951,7 +1091,7 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                                 messages={activeTab.messages}
                                 onCopy={handleCopy}
                                 tabId={activeTab.id}
-                                mode={activeTab.mode === 'edit' ? 'agent' : activeTab.mode}
+                                mode={activeTab.mode}
                                 onRegenerate={() => {
                                     const { regenerate } = useChatStore.getState();
                                     regenerate(activeTab.id);

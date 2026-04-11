@@ -7,9 +7,11 @@
 import React from 'react';
 import { CheckIcon, XMarkIcon } from '@heroicons/react/24/outline';
 import type { FileDiffEntry } from '../../stores/diffStore';
+import { AgentShadowStateSummary } from './AgentShadowStateSummary';
 
 interface FileDiffCardProps {
   entry: FileDiffEntry;
+  chatTabId?: string;
   filePath: string;
   workspacePath?: string | null;
   index: number;
@@ -38,6 +40,7 @@ function getRelativePathDisplay(filePath: string, workspacePath: string | null):
 
 export const FileDiffCard: React.FC<FileDiffCardProps> = ({
   entry,
+  chatTabId,
   filePath,
   workspacePath = null,
   index,
@@ -143,6 +146,11 @@ export const FileDiffCard: React.FC<FileDiffCardProps> = ({
       {entry.messageId != null && (
         <div className="text-[9px] text-gray-400 dark:text-gray-500 px-2 py-0.5 border-b border-gray-100 dark:border-gray-700">
           来源消息 · {entry.messageId.slice(-8)}
+        </div>
+      )}
+      {chatTabId && (
+        <div className="px-2 py-1 border-b border-gray-100 dark:border-gray-700">
+          <AgentShadowStateSummary chatTabId={chatTabId} compact />
         </div>
       )}
       {titleBar}

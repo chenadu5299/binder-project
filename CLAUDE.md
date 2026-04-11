@@ -196,7 +196,7 @@ The following issues are confirmed by current source-code review. Do not work ar
 
 ## Unimplemented Features (Design Exists, Code Missing)
 
-Features with design documents but not yet implemented. Grouped by development phase from `docs/AI功能优化开发计划*.md` and `docs/Workspace改造可落地实施方案.md`.
+Features with design documents but not yet implemented. Grouped by development phase from `docs/A-DE-X-L-01_对话编辑落地开发计划.md` and `docs/R-WS-M-R-02_Workspace改造可落地实施方案.md`.
 
 ### Phase 0 — Foundation (blocks Phase 1+ work)
 
@@ -215,16 +215,16 @@ Features with design documents but not yet implemented. Grouped by development p
 
 | Feature | Doc Reference |
 |---------|--------------|
-| `AutoCompletePopover` replacing `GhostTextExtension` (3 suggestions, Tab/Enter/Esc) | Phase 1a; `docs/辅助续写悬浮卡实现规范.md` |
-| `InlineAssistPanel` diff preview + conversation history | Phase 1b; `docs/局部修改弹窗实现说明.md` |
+| `AutoCompletePopover` replacing `GhostTextExtension` (3 suggestions, Tab/Enter/Esc) | Phase 1a; `docs/R-DE-M-R-08_辅助续写悬浮卡实现规范.md` |
+| `InlineAssistPanel` diff preview + conversation history | Phase 1b; `docs/R-DE-M-R-07_局部修改弹窗实现说明.md` |
 
 ### Phase 2–3 — Diff Workflow
 
 | Feature | Doc Reference |
 |---------|--------------|
-| `edit_current_editor_document` emitting blockId+offset diffs (not line-based) | Phase 2a; `docs/对话编辑-主控设计文档.md`（第九、十三节） |
-| `DiffDecorationExtension` with ProseMirror Mapping tracking | Phase 2b; `docs/对话编辑-主控设计文档.md`（第七、十四节） |
-| `getLogicalContent` = baseline + accepted diffs (correct implementation) | Phase 2b; `docs/文档逻辑状态传递规范.md` |
+| `edit_current_editor_document` emitting blockId+offset diffs (not line-based) | Phase 2a; `docs/R-DE-M-R-01_对话编辑-主控设计文档.md`（第九、十三节） |
+| `DiffDecorationExtension` with ProseMirror Mapping tracking | Phase 2b; `docs/R-DE-M-R-01_对话编辑-主控设计文档.md`（第七、十四节） |
+| `getLogicalContent` = baseline + accepted diffs (correct implementation) | Phase 2b; `docs/R-DE-M-R-03_文档逻辑状态传递规范.md` |
 | Multi-card diff display + bulk accept/reject (`DiffAllActionsBar`) | Phase 3 |
 | `expired` diff visual feedback to user | Phase 3 |
 
@@ -232,7 +232,7 @@ Features with design documents but not yet implemented. Grouped by development p
 
 | Feature | Doc Reference | Status |
 |---------|--------------|--------|
-| `workspace.db` full infrastructure (file_cache, pending_diffs, file_dependencies) | `docs/Workspace改造可落地实施方案.md` Phase 0 | ✅ file_cache 已覆盖全文件类型 |
+| `workspace.db` full infrastructure (file_cache, pending_diffs, file_dependencies) | `docs/R-WS-M-R-02_Workspace改造可落地实施方案.md` Phase 0 | ✅ file_cache 已覆盖全文件类型 |
 | `diffStore` keyed by file path (multi-file diff) | Phase 2 | ✅ 已完成 |
 | `PendingDiffPanel` UI | Phase 2–3 | ✅ 已实现 |
 | `accept_file_diffs` applying diffs in reverse order then writing to disk | Phase 3 | ✅ 已实现 |
@@ -254,7 +254,7 @@ These rules come from the design specification documents and must be respected i
 
 ### Positioning & BlockId
 
-> ⚠️ 以下约束已被 `docs/对话编辑-主控设计文档.md` 取代，以主控文档为准。保留此处仅供历史参考。
+> ⚠️ 以下约束已被 `docs/R-DE-M-R-01_对话编辑-主控设计文档.md` 取代，以主控文档为准。保留此处仅供历史参考。
 
 - **Single source of truth `L`**: `current_editor_content`, `positioning_resolver`, block parsing, and diff validation must all use the same serialized HTML. Never derive positions from different snapshots.
 - **Stable block IDs**: When a user edit does not touch a block, that block's `data-block-id` must not change. Do not regenerate all UUIDs on every transaction.
@@ -263,9 +263,9 @@ These rules come from the design specification documents and must be respected i
 
 ### Diff Protocol
 
-> ⚠️ 以下约束已被 `docs/对话编辑-主控设计文档.md` 取代，以主控文档为准。保留此处仅供历史参考。
+> ⚠️ 以下约束已被 `docs/R-DE-M-R-01_对话编辑-主控设计文档.md` 取代，以主控文档为准。保留此处仅供历史参考。
 
-The authoritative diff format (from `docs/对话编辑-主控设计文档.md` §9 / §2.2 canonical output):
+The authoritative diff format (from `docs/R-DE-M-R-01_对话编辑-主控设计文档.md` §9 / §2.2 canonical output):
 ```json
 {
   "diffId": "<uuid-v4>",
@@ -318,25 +318,24 @@ The authoritative diff format (from `docs/对话编辑-主控设计文档.md` §
 | Document | Reason |
 |----------|--------|
 | `docs/第一/二/三/四/五阶段开发计划.md` | Old phase structure; replaced by Phase 0–3 plans |
-| `docs/AI功能文档清单.md` | Replaced by `AI功能优化开发计划-对齐检查报告.md` |
+| `docs/X-AG-M-R-20_AI功能文档清单.md` | Replaced by `AI功能优化开发计划-对齐检查报告.md` |
 | `docs/Binder AI 方案落地拆解文档.md` (v1.0) | Superseded by v1.1 |
 | `docs/基础环境与协议差距分析.md` (v1.0–1.2) | Current version is v1.3 |
 | `docs/Binder 层次三 AI 工作机制系统设计.md` (v1.0–1.2) | Current version is v1.3 (English prompts) |
-| `docs/精确定位系统方案.md` | 已删除；内容合并进 `docs/对话编辑-主控设计文档.md` |
-| `docs/精准定位系统-统一优化开发步骤.md` | 已删除；内容合并进 `docs/对话编辑-主控设计文档.md` |
+| `docs/精确定位系统方案.md` | 已删除；内容合并进 `docs/R-DE-M-R-01_对话编辑-主控设计文档.md` |
+| `docs/精准定位系统-统一优化开发步骤.md` | 已删除；内容合并进 `docs/R-DE-M-R-01_对话编辑-主控设计文档.md` |
 | `docs/对话编辑 Diff 数据格式规范.md` | 已删除；要点见主控文档第九、十三节 |
 | `docs/对话编辑 Diff 前端实现规范.md` | 已删除；要点见主控文档第七、十四节 |
 
 ### Current authoritative documents (use these)
 | Topic | Document |
 |-------|----------|
-| Phase 0–1 development plan | `docs/AI功能优化开发计划.md` (v1.1) |
-| Phase 2–3 development plan | `docs/AI功能优化开发计划（下）.md` (v1.1) |
-| Workspace overhaul | `docs/Workspace改造可落地实施方案.md` (v1.2) |
-| 对话编辑（定位、Resolver、工具参数、canonical diff、块列表） | `docs/对话编辑-主控设计文档.md` |
-| Logical state spec (`getLogicalContent`) | `docs/文档逻辑状态传递规范.md`（与主控分工见该文档文头） |
-| Reference feature | `docs/引用功能完整设计文档.md` (v2.1) |
-| Layer 3 AI mechanics | `docs/Binder层次三AI工作机制系统设计.md` (v1.3) |
+| 对话编辑落地开发计划（Phase 1–8） | `docs/A-DE-X-L-01_对话编辑落地开发计划.md` |
+| Workspace overhaul | `docs/R-WS-M-R-02_Workspace改造可落地实施方案.md` (v1.2) |
+| 对话编辑（定位、Resolver、工具参数、canonical diff、块列表） | `docs/R-DE-M-R-01_对话编辑-主控设计文档.md` |
+| Logical state spec (`getLogicalContent`) | `docs/R-DE-M-R-03_文档逻辑状态传递规范.md`（与主控分工见该文档文头） |
+| Reference feature | `docs/R-WS-M-R-03_引用功能完整设计文档.md` (v2.1) |
+| Layer 3 AI mechanics | `docs/A-AG-M-T-04_Binder Agent技术主控文档.md` |
 
 ## Critical Development Rules
 

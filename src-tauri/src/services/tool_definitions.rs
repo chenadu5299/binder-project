@@ -1,10 +1,17 @@
 // 工具定义服务
+// Phase 2: 主源已迁移到 tool_matrix.rs，此处为兼容入口。
 use crate::services::ai_providers::ToolDefinition;
 use serde_json::json;
 
-// 工具定义（英文版，中文注释）
-// 参考void的工具定义方式，使用简洁清晰的描述
+/// 兼容入口：从 tool_matrix 获取工具定义。
+/// 旧静态定义保留在 `get_tool_definitions_legacy` 中作为参照。
 pub fn get_tool_definitions() -> Vec<ToolDefinition> {
+    crate::services::tool_matrix::definitions_from_matrix()
+}
+
+/// 旧静态定义（保留用于参照与回退，不再作为主源）
+#[allow(dead_code)]
+fn get_tool_definitions_legacy() -> Vec<ToolDefinition> {
   vec![
         ToolDefinition {
             name: "read_file".to_string(),

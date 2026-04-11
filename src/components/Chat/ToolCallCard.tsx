@@ -31,6 +31,12 @@ import { DiffCard } from './DiffCard';
 import { FileDiffCard } from './FileDiffCard';
 import type { FileDiffEntry } from '../../stores/diffStore';
 import { toast } from '../Common/Toast';
+import { AgentShadowStateSummary } from './AgentShadowStateSummary';
+import {
+    markAgentInvalidated,
+    markAgentStageComplete,
+    markAgentUserConfirmed,
+} from '../../utils/agentShadowLifecycle';
 
 interface ToolCallCardProps {
     toolCall: ToolCall;
@@ -81,6 +87,7 @@ export const ToolCallCard: React.FC<ToolCallCardProps> = ({ toolCall, chatTabId,
                 chatTabId,
                 sourceToolCallId: toolCall.id,
                 ...(messageId != null ? { messageId } : {}),
+                ...(toolCall.agentTaskId != null ? { agentTaskId: toolCall.agentTaskId } : {}),
             });
             const tab = useEditorStore.getState().tabs.find((t) => t.filePath === filePath);
             if (tab?.editor?.state?.doc) {
@@ -368,6 +375,7 @@ export const ToolCallCard: React.FC<ToolCallCardProps> = ({ toolCall, chatTabId,
                                 <DiffCard
                                     key={entry.diffId}
                                     diff={entry}
+                                    chatTabId={chatTabId}
                                     filePath={filePath}
                                     workspacePath={workspacePath}
                                     lineStart={lineStart}
@@ -405,6 +413,7 @@ export const ToolCallCard: React.FC<ToolCallCardProps> = ({ toolCall, chatTabId,
                                                 status: 'expired',
                                                 expireReason: gate,
                                             });
+                                            markAgentInvalidated(chatTabId ?? '', entry.agentTaskId ?? toolCall.agentTaskId, gate);
                                             toast.warning(userVisibleMessageForSnapshotGate(gate));
                                             return;
                                         }
@@ -423,6 +432,7 @@ export const ToolCallCard: React.FC<ToolCallCardProps> = ({ toolCall, chatTabId,
                                                 status: 'expired',
                                                 expireReason: 'block_resolve_failed',
                                             });
+                                            markAgentInvalidated(chatTabId ?? '', entry.agentTaskId ?? toolCall.agentTaskId, 'block_resolve_failed');
                                             return;
                                         }
                                         const currentText = editor.state.doc.textBetween(r.from, r.to);
@@ -431,6 +441,7 @@ export const ToolCallCard: React.FC<ToolCallCardProps> = ({ toolCall, chatTabId,
                                                 status: 'expired',
                                                 expireReason: 'original_text_mismatch',
                                             });
+                                            markAgentInvalidated(chatTabId ?? '', entry.agentTaskId ?? toolCall.agentTaskId, 'original_text_mismatch');
                                             toast.warning('修改建议已失效：文档内容已被修改，无法应用此处的 AI 建议');
                                             return;
                                         }
@@ -440,6 +451,7 @@ export const ToolCallCard: React.FC<ToolCallCardProps> = ({ toolCall, chatTabId,
                                                 status: 'expired',
                                                 expireReason: 'apply_replace_failed',
                                             });
+                                            markAgentInvalidated(chatTabId ?? '', entry.agentTaskId ?? toolCall.agentTaskId, 'apply_replace_failed');
                                             return;
                                         }
                                         diffStore.acceptDiff(tab.filePath, entry.diffId, {
@@ -447,15 +459,19 @@ export const ToolCallCard: React.FC<ToolCallCardProps> = ({ toolCall, chatTabId,
                                             to: ins.insertTo,
                                         });
                                         updateTabContent(tab.id, editor.getHTML());
+                                        markAgentUserConfirmed(chatTabId ?? '', entry.agentTaskId ?? toolCall.agentTaskId, 'tool_card_accept_confirmed');
                                         if (entry.fileDiffIndex != null) {
                                             (async () => {
                                                 try {
                                                     await diffStore.acceptFileDiffs(filePath, currentWorkspace, [entry.fileDiffIndex!]);
+                                                    markAgentStageComplete(chatTabId ?? '', entry.agentTaskId ?? toolCall.agentTaskId, 'workspace_file_written');
                                                     toast.success('已应用修改并写入文件');
                                                 } catch (e) {
                                                     toast.error(`接受失败: ${e instanceof Error ? e.message : String(e)}`);
                                                 }
                                             })();
+                                        } else {
+                                            markAgentStageComplete(chatTabId ?? '', entry.agentTaskId ?? toolCall.agentTaskId, 'editor_revision_advanced');
                                         }
                                     }}
                                     onReject={() => {
@@ -497,12 +513,15 @@ export const ToolCallCard: React.FC<ToolCallCardProps> = ({ toolCall, chatTabId,
                         <FileDiffCard
                             key={`${entry.id}-${entry.diff_index}`}
                             entry={entry}
+                            chatTabId={chatTabId}
                             filePath={filePath}
                             workspacePath={workspacePath}
                             index={idx}
                             onAccept={async () => {
                                 try {
                                     await diffStore.acceptFileDiffs(filePath, currentWorkspace, [entry.diff_index]);
+                                    markAgentUserConfirmed(chatTabId ?? '', entry.agentTaskId ?? toolCall.agentTaskId, 'file_diff_accept_confirmed');
+                                    markAgentStageComplete(chatTabId ?? '', entry.agentTaskId ?? toolCall.agentTaskId, 'workspace_file_written');
                                     toast.success('已应用修改并写入文件');
                                 } catch (e) {
                                     toast.error(`接受失败: ${e instanceof Error ? e.message : String(e)}`);
@@ -591,6 +610,12 @@ export const ToolCallCard: React.FC<ToolCallCardProps> = ({ toolCall, chatTabId,
                 )}
             </div>
 
+            {chatTabId && (
+                <div className="mb-3">
+                    <AgentShadowStateSummary chatTabId={chatTabId} compact />
+                </div>
+            )}
+
             <div className="text-xs text-gray-600 dark:text-gray-400 mb-2">
                 <div className="space-y-1">
                     {formattedArgs && Object.keys(formattedArgs).length > 0 ? (
@@ -641,6 +666,39 @@ export const ToolCallCard: React.FC<ToolCallCardProps> = ({ toolCall, chatTabId,
                             <div className="font-medium">✅ 执行成功</div>
                             {toolCall.result.message && (
                                 <div className="mt-1 text-sm">{toolCall.result.message}</div>
+                            )}
+                            {toolCall.result.meta && (
+                                <div className="mt-1.5 flex flex-wrap gap-1.5">
+                                    {toolCall.result.meta.gate?.status && (
+                                        <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium ${
+                                            toolCall.result.meta.gate.status === 'candidate_ready' ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300'
+                                            : toolCall.result.meta.gate.status === 'no_op' ? 'bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-400'
+                                            : 'bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-400'
+                                        }`}>
+                                            {toolCall.result.meta.gate.status === 'candidate_ready' ? '📋 候选就绪' : toolCall.result.meta.gate.status === 'no_op' ? '⏭ 无变更' : toolCall.result.meta.gate.status}
+                                        </span>
+                                    )}
+                                    {toolCall.result.meta.verification?.status && (
+                                        <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium ${
+                                            toolCall.result.meta.verification.status === 'passed' ? 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300'
+                                            : toolCall.result.meta.verification.status === 'failed' ? 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300'
+                                            : 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-300'
+                                        }`}>
+                                            {toolCall.result.meta.verification.status === 'passed' ? '✓ 验证通过' : toolCall.result.meta.verification.status === 'failed' ? '✗ 验证失败' : '⏳ 验证中'}
+                                        </span>
+                                    )}
+                                    {toolCall.result.meta.confirmation?.status && (
+                                        <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium ${
+                                            toolCall.result.meta.confirmation.status === 'confirmed' ? 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300'
+                                            : toolCall.result.meta.confirmation.status === 'rejected' ? 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300'
+                                            : 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300'
+                                        }`}>
+                                            {toolCall.result.meta.confirmation.status === 'confirmed' ? '✓ 已确认'
+                                            : toolCall.result.meta.confirmation.status === 'rejected' ? '✗ 已拒绝'
+                                            : '⏳ 待确认'}
+                                        </span>
+                                    )}
+                                </div>
                             )}
                             {toolCall.result.data && (
                                 <div className="mt-2">

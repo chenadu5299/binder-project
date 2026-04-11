@@ -21,6 +21,7 @@ import {
   editorMatchesContentSnapshot,
   editorMatchesBlockOrderSnapshot,
 } from '../utils/contentSnapshotHash';
+import { markAgentInvalidated, markAgentRejected } from '../utils/agentShadowLifecycle';
 
 export type DiffEntryStatus = 'pending' | 'accepted' | 'rejected' | 'expired';
 export type DiffEntryType = 'replace' | 'delete' | 'insert';
@@ -79,6 +80,20 @@ const EXECUTION_ERROR_CODE_SET: ReadonlySet<string> = new Set([
   'E_BLOCKTREE_STALE',
   'E_BLOCKTREE_BUILD_FAILED',
 ]);
+
+function forEachUniqueAgentPair(
+  entries: Array<{ chatTabId?: string; agentTaskId?: string }>,
+  visitor: (chatTabId: string, agentTaskId: string) => void,
+) {
+  const seen = new Set<string>();
+  for (const entry of entries) {
+    if (!entry.chatTabId || !entry.agentTaskId) continue;
+    const key = `${entry.chatTabId}:${entry.agentTaskId}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    visitor(entry.chatTabId, entry.agentTaskId);
+  }
+}
 
 export function normalizeExecutionErrorCode(code: string | undefined): string {
   if (!code) return 'E_REFRESH_FAILED';
@@ -148,6 +163,8 @@ export interface FileDiffEntry {
   messageId?: string;
   /** Phase B/C：未能映射到编辑器装饰时保留在 byFilePath，供聊天内接受与「重新解析」 */
   resolveUnmapped?: boolean;
+  /** Phase 2：候选归属的 Agent task id，用于确认/完成状态闭合 */
+  agentTaskId?: string;
 }
 
 export interface DiffEntry {
@@ -169,6 +186,8 @@ export interface DiffEntry {
   toolCallId?: string;
   /** 归属的聊天 tab（与 editor tabId 不同；批量操作按此过滤） */
   chatTabId?: string;
+  /** Phase 2：候选归属的 Agent task id，用于确认/完成状态闭合 */
+  agentTaskId?: string;
   /** 归属助手消息 id */
   messageId?: string;
   /** Phase C：展示用来源说明（消息/工具/轮次） */
@@ -510,12 +529,18 @@ async function executeAcceptAllForPending(
 
   for (const f of failed) {
     updateDiff(filePath, f.diff.diffId, { status: 'expired', expireReason: f.reason });
+    if (f.diff.chatTabId && f.diff.agentTaskId) {
+      markAgentInvalidated(f.diff.chatTabId, f.diff.agentTaskId, `accept_all_${f.reason}`);
+    }
   }
   for (const row of overlapExpired) {
     updateDiff(filePath, row.diff.diffId, {
       status: 'expired',
       expireReason: 'overlapping_range',
     });
+    if (row.diff.chatTabId && row.diff.agentTaskId) {
+      markAgentInvalidated(row.diff.chatTabId, row.diff.agentTaskId, 'accept_all_overlapping_range');
+    }
   }
 
   const sortedApply = [...executable].sort(compareAcceptWriteOrder);
@@ -532,6 +557,9 @@ async function executeAcceptAllForPending(
     if (!inserted) {
       console.warn('[对话编辑] acceptAll: applyDiffReplaceInEditor 失败', { diffId: row.diff.diffId });
       updateDiff(filePath, row.diff.diffId, { status: 'expired', expireReason: 'apply_replace_failed' });
+      if (row.diff.chatTabId && row.diff.agentTaskId) {
+        markAgentInvalidated(row.diff.chatTabId, row.diff.agentTaskId, 'accept_all_apply_failed');
+      }
       expired++;
       continue;
     }
@@ -569,6 +597,7 @@ export interface DiffStoreState {
     meta?: {
       sourceLabel?: string;
       batchVersion?: number;
+      agentTaskId?: string;
       documentRevision?: number;
       positioningPath?: 'Anchor' | 'Resolver' | 'Legacy';
       /** 写入时编辑器 tab 当前版本；与 documentRevision 不一致则本条标 expired */
@@ -634,7 +663,7 @@ export interface DiffStoreState {
   setFilePathDiffs: (
     filePath: string,
     pendingDiffs: FileDiffEntry[],
-    options?: { chatTabId?: string; sourceToolCallId?: string; messageId?: string }
+    options?: { chatTabId?: string; sourceToolCallId?: string; messageId?: string; agentTaskId?: string }
   ) => void;
   /** Phase 2：获取有 pending diff 的文件数量 */
   getPendingFileCount: () => number;
@@ -788,6 +817,10 @@ export const useDiffStore = create<DiffStoreState>((set, get) => ({
         messageId,
       });
     }
+    const snapRev = meta?.documentRevision;
+    const tabRev = meta?.currentTabRevision;
+    const snapStale = snapRev != null && tabRev != null && snapRev !== tabRev;
+
     set((state) => {
       const tab = state.byTab[filePath] ?? { baseline: null, baselineSetAt: 0, diffs: new Map() };
       const newMap = new Map(tab.diffs);
@@ -801,10 +834,6 @@ export const useDiffStore = create<DiffStoreState>((set, get) => ({
         }
       }
       const baseTime = Date.now();
-      const snapRev = meta?.documentRevision;
-      const tabRev = meta?.currentTabRevision;
-      const snapStale =
-        snapRev != null && tabRev != null && snapRev !== tabRev;
       entries.forEach((e, i) => {
         const normalizedExposure = normalizeExecutionExposure(e.executionExposure);
         const staleExposure = snapStale
@@ -818,6 +847,7 @@ export const useDiffStore = create<DiffStoreState>((set, get) => ({
           ...e,
           toolCallId,
           chatTabId: chatTabId ?? e.chatTabId,
+          agentTaskId: meta?.agentTaskId ?? e.agentTaskId,
           messageId: messageId ?? e.messageId,
           sourceLabel: meta?.sourceLabel ?? e.sourceLabel,
           batchVersion: bv,
@@ -840,6 +870,14 @@ export const useDiffStore = create<DiffStoreState>((set, get) => ({
         executionExposures: dedupeExecutionExposures(state.executionExposures, exposureBatch),
       };
     });
+
+    if (snapStale) {
+      const resolvedChatTabId = chatTabId ?? entries[0]?.chatTabId;
+      const resolvedAgentTaskId = meta?.agentTaskId ?? entries[0]?.agentTaskId;
+      if (resolvedChatTabId && resolvedAgentTaskId) {
+        markAgentInvalidated(resolvedChatTabId, resolvedAgentTaskId, 'diff_batch_stale_revision');
+      }
+    }
   },
 
   setBaseline: (filePath, html) => {
@@ -876,17 +914,21 @@ export const useDiffStore = create<DiffStoreState>((set, get) => ({
   },
 
   rejectDiff: (filePath, diffId) => {
+    const entry = get().byTab[filePath]?.diffs.get(diffId);
     set((state) => {
       const tab = state.byTab[filePath];
       if (!tab) return state;
-      const entry = tab.diffs.get(diffId);
-      if (!entry) return state;
+      const current = tab.diffs.get(diffId);
+      if (!current) return state;
       const newMap = new Map(tab.diffs);
-      newMap.set(diffId, { ...entry, status: 'rejected' });
+      newMap.set(diffId, { ...current, status: 'rejected' });
       return {
         byTab: { ...state.byTab, [filePath]: { ...tab, diffs: newMap } },
       };
     });
+    if (entry?.chatTabId && entry.agentTaskId) {
+      markAgentRejected(entry.chatTabId, entry.agentTaskId, 'diff_rejected');
+    }
   },
 
   getPendingDiffs: (filePath, toolCallId?: string) => {
@@ -960,10 +1002,28 @@ export const useDiffStore = create<DiffStoreState>((set, get) => ({
   },
 
   markExpired: (filePath, diffId) => {
+    const entry = get().byTab[filePath]?.diffs.get(diffId);
     get().updateDiff(filePath, diffId, { status: 'expired' });
+    if (entry?.chatTabId && entry.agentTaskId) {
+      markAgentInvalidated(entry.chatTabId, entry.agentTaskId, 'diff_expired');
+    }
   },
 
   expirePendingForStaleRevision: (filePath, currentDocumentRevision) => {
+    // Collect entries that will be expired before mutating state,
+    // so we can call markAgentInvalidated (LEG-016 补齐: stale-revision expire 路径)
+    const tab = get().byTab[filePath];
+    if (!tab) return;
+    const toInvalidate: Array<{ chatTabId: string; agentTaskId: string }> = [];
+    for (const [, e] of tab.diffs.entries()) {
+      if (e.status !== 'pending') continue;
+      if (e.documentRevision != null && e.documentRevision !== currentDocumentRevision) {
+        if (e.chatTabId && e.agentTaskId) {
+          toInvalidate.push({ chatTabId: e.chatTabId, agentTaskId: e.agentTaskId });
+        }
+      }
+    }
+
     set((state) => {
       const tab = state.byTab[filePath];
       if (!tab) return state;
@@ -994,6 +1054,11 @@ export const useDiffStore = create<DiffStoreState>((set, get) => ({
         executionExposures: dedupeExecutionExposures(state.executionExposures, newExposureBatch),
       };
     });
+
+    // Shadow invalidation after state update
+    for (const { chatTabId, agentTaskId } of toInvalidate) {
+      markAgentInvalidated(chatTabId, agentTaskId, 'diff_expired_stale_revision');
+    }
   },
 
   acceptAll: async (filePath, editor, toolCallId, tabDocumentRevision) => {
@@ -1050,11 +1115,13 @@ export const useDiffStore = create<DiffStoreState>((set, get) => ({
     const chatTabId = options?.chatTabId;
     const sourceToolCallId = options?.sourceToolCallId;
     const messageId = options?.messageId;
+    const agentTaskId = options?.agentTaskId;
     const tagged = pendingDiffs.map((row) => ({
       ...row,
       ...(chatTabId != null ? { chatTabId } : {}),
       ...(sourceToolCallId != null ? { sourceToolCallId } : {}),
       ...(messageId != null ? { messageId } : {}),
+      ...(agentTaskId != null ? { agentTaskId } : {}),
     }));
     set((state) => ({
       byFilePath: { ...state.byFilePath, [filePath]: tagged },
@@ -1178,6 +1245,24 @@ export const useDiffStore = create<DiffStoreState>((set, get) => ({
     if ((import.meta as any).env?.DEV) {
       console.debug('[diffStore] DIFF_LIFECYCLE_CLEANUP message', { chatTabId, messageId });
     }
+    const toInvalidate: Array<{ chatTabId: string; agentTaskId: string }> = [];
+    const { byTab, byFilePath } = get();
+    for (const tab of Object.values(byTab)) {
+      if (!tab) continue;
+      for (const e of tab.diffs.values()) {
+        if (e.chatTabId === chatTabId && e.messageId === messageId && e.status === 'pending') {
+          if (e.agentTaskId) toInvalidate.push({ chatTabId, agentTaskId: e.agentTaskId });
+        }
+      }
+    }
+    for (const rows of Object.values(byFilePath)) {
+      for (const e of rows ?? []) {
+        if (e.chatTabId === chatTabId && e.messageId === messageId) {
+          if (e.agentTaskId) toInvalidate.push({ chatTabId, agentTaskId: e.agentTaskId });
+        }
+      }
+    }
+
     set((state) => {
       const nextByTab = { ...state.byTab };
       for (const [fp, tab] of Object.entries(nextByTab)) {
@@ -1206,12 +1291,34 @@ export const useDiffStore = create<DiffStoreState>((set, get) => ({
       }
       return { byTab: nextByTab, byFilePath: nextByFilePath, byFilePathResolveStats: nextStats };
     });
+
+    forEachUniqueAgentPair(toInvalidate, (cid, aid) => {
+      markAgentInvalidated(cid, aid, 'diff_cleanup_message_deleted');
+    });
   },
 
   cleanupDiffsForChatTab: (chatTabId) => {
     if ((import.meta as any).env?.DEV) {
       console.debug('[diffStore] DIFF_LIFECYCLE_CLEANUP chatTab', { chatTabId });
     }
+    const toInvalidate: Array<{ chatTabId: string; agentTaskId: string }> = [];
+    const { byTab, byFilePath } = get();
+    for (const tab of Object.values(byTab)) {
+      if (!tab) continue;
+      for (const e of tab.diffs.values()) {
+        if (e.chatTabId === chatTabId && e.status === 'pending') {
+          if (e.agentTaskId) toInvalidate.push({ chatTabId, agentTaskId: e.agentTaskId });
+        }
+      }
+    }
+    for (const rows of Object.values(byFilePath)) {
+      for (const e of rows ?? []) {
+        if (e.chatTabId === chatTabId) {
+          if (e.agentTaskId) toInvalidate.push({ chatTabId, agentTaskId: e.agentTaskId });
+        }
+      }
+    }
+
     set((state) => {
       const nextByTab = { ...state.byTab };
       for (const [fp, tab] of Object.entries(nextByTab)) {
@@ -1235,6 +1342,10 @@ export const useDiffStore = create<DiffStoreState>((set, get) => ({
         }
       }
       return { byTab: nextByTab, byFilePath: nextByFilePath, byFilePathResolveStats: nextStats };
+    });
+
+    forEachUniqueAgentPair(toInvalidate, (cid, aid) => {
+      markAgentInvalidated(cid, aid, 'diff_cleanup_chat_tab_closed');
     });
   },
 
@@ -1367,6 +1478,7 @@ export const useDiffStore = create<DiffStoreState>((set, get) => ({
   },
 
   rejectFileDiffs: async (filePath, workspacePath) => {
+    const entries = get().byFilePath[filePath] ?? [];
     const ws = normalizeWorkspacePath(workspacePath);
     const relPath = getRelativePath(filePath, ws);
     await invoke('reject_file_diffs', { workspacePath: ws, filePath: relPath });
@@ -1391,15 +1503,19 @@ export const useDiffStore = create<DiffStoreState>((set, get) => ({
       }
       return { byTab: next };
     });
+    forEachUniqueAgentPair(entries, (chatTabId, agentTaskId) => {
+      markAgentRejected(chatTabId, agentTaskId, 'file_diffs_rejected');
+    });
   },
 
   isFileDiffsCleared: (filePath) => clearedFilePaths.has(filePath),
 
   removeFileDiffEntry: (filePath, diffIndex) => {
+    const row = get().byFilePath[filePath]?.find((e) => e.diff_index === diffIndex);
     set((state) => {
       const entries = state.byFilePath[filePath] ?? [];
-      const row = entries.find((e) => e.diff_index === diffIndex);
-      const workspaceKey = makeWorkspacePendingToolCallId(filePath, row?.sourceToolCallId);
+      const currentRow = entries.find((e) => e.diff_index === diffIndex);
+      const workspaceKey = makeWorkspacePendingToolCallId(filePath, currentRow?.sourceToolCallId);
       const filtered = entries.filter((e) => e.diff_index !== diffIndex);
       const nextByFilePath = { ...state.byFilePath };
       const nextStats = { ...state.byFilePathResolveStats };
@@ -1431,6 +1547,9 @@ export const useDiffStore = create<DiffStoreState>((set, get) => ({
       }
       return { byFilePath: nextByFilePath, byFilePathResolveStats: nextStats, byTab: nextByTab };
     });
+    if (row?.chatTabId && row.agentTaskId) {
+      markAgentRejected(row.chatTabId, row.agentTaskId, 'file_diff_entry_rejected');
+    }
   },
 
   markReviewConfirmed: (filePath?: string) => {

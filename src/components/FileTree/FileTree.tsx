@@ -2,6 +2,7 @@ import { useState, useEffect, useImperativeHandle, forwardRef } from 'react';
 import { useFileStore, shouldIgnoreFileTreeRefresh } from '../../stores/fileStore';
 import { fileService } from '../../services/fileService';
 import { documentService } from '../../services/documentService';
+import { knowledgeService } from '../../services/knowledge/knowledgeService';
 import FileTreeNode from './FileTreeNode';
 import OrganizeFilesDialog from './OrganizeFilesDialog';
 import LoadingSpinner from '../Common/LoadingSpinner';
@@ -324,6 +325,25 @@ const FileTree = forwardRef<FileTreeRef>((_props, ref) => {
     setOrganizeFiles([filePath]);
   };
 
+  const handleStoreToKnowledge = async (filePath: string) => {
+    if (!currentWorkspace) {
+      toast.warning('请先选择工作区');
+      return;
+    }
+
+    try {
+      const response = await knowledgeService.upsertWorkspaceSnapshot(currentWorkspace, {
+        sourcePath: filePath,
+      });
+      const version = response.document?.version ?? 1;
+      toast.success(`${version > 1 ? '已替换知识版本' : '已存入知识库'}: ${response.entry.title} (v${version})`);
+      window.dispatchEvent(new CustomEvent('binder-knowledge-changed'));
+    } catch (error) {
+      console.error('存入知识库失败:', error);
+      toast.error(`存入知识库失败: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
   // 处理文件移动（拖拽）
   const handleMoveFile = async (sourcePath: string, destinationPath: string) => {
     if (!currentWorkspace) {
@@ -382,6 +402,7 @@ const FileTree = forwardRef<FileTreeRef>((_props, ref) => {
             onDelete={handleDelete}
             onDuplicate={handleDuplicate}
             onOrganize={handleOrganize}
+            onStoreToKnowledge={handleStoreToKnowledge}
             onMoveFile={handleMoveFile}
           />
         ) : (
@@ -408,4 +429,3 @@ const FileTree = forwardRef<FileTreeRef>((_props, ref) => {
 FileTree.displayName = 'FileTree';
 
 export default FileTree;
-

@@ -2,6 +2,10 @@ import React, { useState } from 'react';
 import { CheckIcon, XMarkIcon, DocumentIcon, GlobeAltIcon } from '@heroicons/react/24/outline';
 import { WorkPlan } from '../../utils/workPlanParser';
 
+/**
+ * 兼容展示组件。
+ * Phase 1 起保留 UI 呈现，但不再承接 Agent 正式 `plan` 主链状态。
+ */
 interface WorkPlanCardProps {
     plan: WorkPlan;
     onConfirm: () => void;
@@ -99,4 +103,3 @@ export const WorkPlanCard: React.FC<WorkPlanCardProps> = ({ plan, onConfirm, onC
         </div>
     );
 };
-

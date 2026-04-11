@@ -5,6 +5,9 @@ use crate::workspace::canonical_html::{
   should_run_workspace_canonical_pipeline,
 };
 use crate::workspace::diff_engine;
+use crate::workspace::timeline_support::{
+  record_file_content_timeline_node, record_resource_structure_timeline_node,
+};
 use crate::workspace::workspace_db::WorkspaceDb;
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
@@ -28,6 +31,65 @@ pub enum ToolErrorKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolGateMeta {
+  #[serde(skip_serializing_if = "Option::is_none", default)]
+  pub status: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none", default)]
+  pub stage: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none", default)]
+  pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolArtifactMeta {
+  #[serde(skip_serializing_if = "Option::is_none", default)]
+  pub kind: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none", default)]
+  pub artifact_id: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none", default)]
+  pub status: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none", default)]
+  pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolVerificationMeta {
+  #[serde(skip_serializing_if = "Option::is_none", default)]
+  pub status: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none", default)]
+  pub record_id: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none", default)]
+  pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolConfirmationMeta {
+  #[serde(skip_serializing_if = "Option::is_none", default)]
+  pub status: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none", default)]
+  pub record_id: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none", default)]
+  pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolResultMeta {
+  #[serde(skip_serializing_if = "Option::is_none", default)]
+  pub gate: Option<ToolGateMeta>,
+  #[serde(skip_serializing_if = "Option::is_none", default)]
+  pub artifact: Option<ToolArtifactMeta>,
+  #[serde(skip_serializing_if = "Option::is_none", default)]
+  pub verification: Option<ToolVerificationMeta>,
+  #[serde(skip_serializing_if = "Option::is_none", default)]
+  pub confirmation: Option<ToolConfirmationMeta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResult {
   pub success: bool,
   pub data: Option<serde_json::Value>,
@@ -39,6 +101,76 @@ pub struct ToolResult {
   /// 用户可读的中文错误文案
   #[serde(skip_serializing_if = "Option::is_none", default)]
   pub display_error: Option<String>,
+  /// Phase 2：shadow meta 骨架，暂不改变主闭环，仅预留统一回流位
+  #[serde(skip_serializing_if = "Option::is_none", default)]
+  pub meta: Option<ToolResultMeta>,
+}
+
+/// Phase 5: 为变更类工具构造统一的 candidate_ready meta。
+/// 两条编辑链（edit_current_editor_document / update_file+use_diff）复用同一语义。
+fn build_candidate_meta(tool_name: &str, file_path: &str, diff_count: usize) -> ToolResultMeta {
+  ToolResultMeta {
+    gate: Some(ToolGateMeta {
+      status: Some("candidate_ready".to_string()),
+      stage: Some("review".to_string()),
+      summary: Some(format!(
+        "{}: {} diff(s) queued for {}",
+        tool_name, diff_count, file_path
+      )),
+    }),
+    artifact: Some(ToolArtifactMeta {
+      kind: Some("diff_candidate".to_string()),
+      artifact_id: None,
+      status: Some("pending_review".to_string()),
+      summary: Some(format!("{} diff(s) awaiting user confirmation", diff_count)),
+    }),
+    verification: Some(ToolVerificationMeta {
+      status: Some("passed".to_string()),
+      record_id: None,
+      summary: Some("diff generated successfully".to_string()),
+    }),
+    confirmation: Some(ToolConfirmationMeta {
+      status: Some("pending".to_string()),
+      record_id: None,
+      summary: Some("awaiting user accept/reject".to_string()),
+    }),
+  }
+}
+
+/// Phase 5: 为 NO_OP 结果构造 meta（无变化时验证通过但无候选）
+fn build_noop_meta(tool_name: &str) -> ToolResultMeta {
+  ToolResultMeta {
+    gate: Some(ToolGateMeta {
+      status: Some("no_op".to_string()),
+      stage: None,
+      summary: Some(format!("{}: content unchanged, no diff generated", tool_name)),
+    }),
+    artifact: None,
+    verification: Some(ToolVerificationMeta {
+      status: Some("passed".to_string()),
+      record_id: None,
+      summary: Some("content comparison passed, no changes needed".to_string()),
+    }),
+    confirmation: None,
+  }
+}
+
+/// Phase 5: 为错误返回路径构造 meta，标记 verification.status=failed。
+fn build_failure_meta(tool_name: &str, reason: &str) -> ToolResultMeta {
+  ToolResultMeta {
+    gate: Some(ToolGateMeta {
+      status: Some("no_op".to_string()),
+      stage: None,
+      summary: Some(format!("{}: failed — {}", tool_name, reason)),
+    }),
+    artifact: None,
+    verification: Some(ToolVerificationMeta {
+      status: Some("failed".to_string()),
+      record_id: None,
+      summary: Some(reason.to_string()),
+    }),
+    confirmation: None,
+  }
 }
 
 impl Default for ToolResult {
@@ -50,6 +182,7 @@ impl Default for ToolResult {
       message: None,
       error_kind: None,
       display_error: None,
+      meta: None,
     }
   }
 }
@@ -57,14 +190,14 @@ impl Default for ToolResult {
 pub const E_ROUTE_MISMATCH: &str = "E_ROUTE_MISMATCH";
 pub const E_TARGET_NOT_READY: &str = "E_TARGET_NOT_READY";
 pub const E_RANGE_UNRESOLVABLE: &str = "E_RANGE_UNRESOLVABLE";
-pub const E_ORIGINALTEXT_MISMATCH: &str = "E_ORIGINALTEXT_MISMATCH";
-pub const E_PARTIAL_OVERLAP: &str = "E_PARTIAL_OVERLAP";
-pub const E_BASELINE_MISMATCH: &str = "E_BASELINE_MISMATCH";
-pub const E_APPLY_FAILED: &str = "E_APPLY_FAILED";
 pub const E_REFRESH_FAILED: &str = "E_REFRESH_FAILED";
 pub const E_BLOCKTREE_NODE_MISSING: &str = "E_BLOCKTREE_NODE_MISSING";
 pub const E_BLOCKTREE_STALE: &str = "E_BLOCKTREE_STALE";
 pub const E_BLOCKTREE_BUILD_FAILED: &str = "E_BLOCKTREE_BUILD_FAILED";
+pub const E_ORIGINALTEXT_MISMATCH: &str = "E_ORIGINALTEXT_MISMATCH";
+pub const E_PARTIAL_OVERLAP: &str = "E_PARTIAL_OVERLAP";
+pub const E_BASELINE_MISMATCH: &str = "E_BASELINE_MISMATCH";
+pub const E_APPLY_FAILED: &str = "E_APPLY_FAILED";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -109,7 +242,7 @@ pub struct ExecutionExposure {
 /// 块结构条目（Resolver Step 1 输出）
 struct BlockEntry {
   block_id: String,
-  /// HTML tag name: p | h1 | h2 | h3 | li | ...
+  #[allow(dead_code)]
   block_type: String,
   /// strip 标签后的纯文本
   text_content: String,
@@ -242,6 +375,7 @@ impl ToolService {
         message: None,
         error_kind: None,
         display_error: None,
+        meta: None,
       });
     }
 
@@ -266,6 +400,7 @@ impl ToolService {
           message: None,
           error_kind: None,
           display_error: None,
+          meta: None,
         });
       }
 
@@ -290,6 +425,7 @@ impl ToolService {
             )),
             error_kind: None,
             display_error: None,
+            meta: None,
           })
         }
         Err(e) => Ok(ToolResult {
@@ -299,6 +435,7 @@ impl ToolService {
           message: None,
           error_kind: None,
           display_error: None,
+          meta: None,
         }),
       }
     } else {
@@ -315,6 +452,7 @@ impl ToolService {
           message: Some(format!("成功读取文件: {}", file_path)),
           error_kind: None,
           display_error: None,
+          meta: None,
         }),
         Err(e) => Ok(ToolResult {
           success: false,
@@ -323,6 +461,7 @@ impl ToolService {
           message: None,
           error_kind: None,
           display_error: None,
+          meta: None,
         }),
       }
     }
@@ -396,6 +535,7 @@ impl ToolService {
         message: None,
         error_kind: None,
         display_error: None,
+        meta: None,
       });
     }
 
@@ -409,6 +549,7 @@ impl ToolService {
           message: None,
           error_kind: None,
           display_error: None,
+          meta: None,
         });
       }
     }
@@ -434,22 +575,36 @@ impl ToolService {
           message: None,
           error_kind: None,
           display_error: None,
+          meta: None,
         });
       }
 
       // 将内容（Markdown 或 HTML）转换为 DOCX
       match pandoc_service.convert_html_to_docx(&content, &full_path) {
-        Ok(_) => Ok(ToolResult {
-          success: true,
-          data: Some(serde_json::json!({
-              "path": file_path,
-              "format": "docx",
-          })),
-          error: None,
-          message: Some(format!("成功创建 DOCX 文件: {}", file_path)),
-          error_kind: None,
-          display_error: None,
-        }),
+        Ok(_) => {
+          let db = WorkspaceDb::new(workspace_path)
+            .map_err(|e| format!("WorkspaceDb 初始化失败: {}", e))?;
+          let _ = record_resource_structure_timeline_node(
+            &db,
+            workspace_path,
+            "create_file",
+            &format!("AI 创建文件：{}", file_path),
+            "ai",
+            &[full_path.clone()],
+          )?;
+          Ok(ToolResult {
+            success: true,
+            data: Some(serde_json::json!({
+                "path": file_path,
+                "format": "docx",
+            })),
+            error: None,
+            message: Some(format!("成功创建 DOCX 文件: {}", file_path)),
+            error_kind: None,
+            display_error: None,
+            meta: None,
+          })
+        }
         Err(e) => Ok(ToolResult {
           success: false,
           data: None,
@@ -457,22 +612,36 @@ impl ToolService {
           message: None,
           error_kind: None,
           display_error: None,
+          meta: None,
         }),
       }
     } else {
       // 其他文件：直接写入文本内容
       match self.atomic_write_file(&full_path, content.as_bytes()) {
-        Ok(_) => Ok(ToolResult {
-          success: true,
-          data: Some(serde_json::json!({
-              "path": file_path,
-              "size": content.len(),
-          })),
-          error: None,
-          message: Some(format!("成功创建文件: {}", file_path)),
-          error_kind: None,
-          display_error: None,
-        }),
+        Ok(_) => {
+          let db = WorkspaceDb::new(workspace_path)
+            .map_err(|e| format!("WorkspaceDb 初始化失败: {}", e))?;
+          let _ = record_resource_structure_timeline_node(
+            &db,
+            workspace_path,
+            "create_file",
+            &format!("AI 创建文件：{}", file_path),
+            "ai",
+            &[full_path.clone()],
+          )?;
+          Ok(ToolResult {
+            success: true,
+            data: Some(serde_json::json!({
+                "path": file_path,
+                "size": content.len(),
+            })),
+            error: None,
+            message: Some(format!("成功创建文件: {}", file_path)),
+            error_kind: None,
+            display_error: None,
+            meta: None,
+          })
+        }
         Err(e) => Ok(ToolResult {
           success: false,
           data: None,
@@ -480,6 +649,7 @@ impl ToolService {
           message: None,
           error_kind: None,
           display_error: None,
+          meta: None,
         }),
       }
     }
@@ -541,8 +711,69 @@ impl ToolService {
         message: None,
         error_kind: None,
         display_error: None,
+        meta: Some(build_failure_meta("update_file", "file not found")),
       });
     }
+
+    let db =
+      WorkspaceDb::new(workspace_path).map_err(|e| format!("WorkspaceDb 初始化失败: {}", e))?;
+
+    let mtime = std::fs::metadata(&full_path)
+      .and_then(|m| m.modified())
+      .map(|t| {
+        t.duration_since(std::time::UNIX_EPOCH)
+          .unwrap_or_default()
+          .as_secs() as i64
+      })
+      .unwrap_or(0);
+
+    let file_type = full_path
+      .extension()
+      .and_then(|e| e.to_str())
+      .unwrap_or("txt")
+      .to_lowercase();
+
+    let old_content = match db.get_file_cache(file_path)? {
+      Some(entry) if entry.mtime == mtime => materialize_cached_body_if_stale_hash(
+        &db,
+        file_path,
+        &file_type,
+        entry.cached_content.clone(),
+        entry.content_hash.clone(),
+        mtime,
+      )?,
+      _ => {
+        let raw = if file_type == "docx" {
+          use crate::services::pandoc_service::PandocService;
+          let pandoc = PandocService::new();
+          if pandoc.is_available() {
+            pandoc
+              .convert_document_to_html(&full_path, full_path.parent())
+              .map_err(|e| format!("读取 DOCX 失败: {}", e))?
+          } else {
+            return Ok(ToolResult {
+              success: false,
+              data: None,
+              error: Some("Pandoc 不可用，无法读取 DOCX".to_string()),
+              message: None,
+              error_kind: None,
+              display_error: None,
+              meta: Some(build_failure_meta("update_file", "pandoc unavailable")),
+            });
+          }
+        } else {
+          std::fs::read_to_string(&full_path).map_err(|e| format!("读取文件失败: {}", e))?
+        };
+        if should_run_workspace_canonical_pipeline(&file_type) {
+          let (html, hash) = canonical_html_for_workspace_cache(&raw);
+          db.upsert_file_cache(file_path, &file_type, Some(&html), Some(hash.as_str()), mtime)?;
+          html
+        } else {
+          db.upsert_file_cache(file_path, &file_type, Some(&raw), None, mtime)?;
+          raw
+        }
+      }
+    };
 
     // use_diff：生成 pending diffs，不写盘
     let use_diff = tool_call
@@ -552,70 +783,6 @@ impl ToolService {
       .unwrap_or(true);
 
     if use_diff {
-      let db =
-        WorkspaceDb::new(workspace_path).map_err(|e| format!("WorkspaceDb 初始化失败: {}", e))?;
-
-      let mtime = std::fs::metadata(&full_path)
-        .and_then(|m| m.modified())
-        .map(|t| {
-          t.duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64
-        })
-        .unwrap_or(0);
-
-      let file_type = full_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("txt")
-        .to_lowercase();
-
-      let old_content = match db.get_file_cache(file_path)? {
-        Some(entry) if entry.mtime == mtime => materialize_cached_body_if_stale_hash(
-          &db,
-          file_path,
-          &file_type,
-          entry.cached_content.clone(),
-          entry.content_hash.clone(),
-          mtime,
-        )?,
-        _ => {
-          let raw = if file_type == "docx" {
-            use crate::services::pandoc_service::PandocService;
-            let pandoc = PandocService::new();
-            if pandoc.is_available() {
-              pandoc
-                .convert_document_to_html(&full_path, full_path.parent())
-                .map_err(|e| format!("读取 DOCX 失败: {}", e))?
-            } else {
-              return Ok(ToolResult {
-                success: false,
-                data: None,
-                error: Some("Pandoc 不可用，无法读取 DOCX".to_string()),
-                message: None,
-                error_kind: None,
-                display_error: None,
-              });
-            }
-          } else {
-            std::fs::read_to_string(&full_path).map_err(|e| format!("读取文件失败: {}", e))?
-          };
-          if should_run_workspace_canonical_pipeline(&file_type) {
-            let (html, hash) = canonical_html_for_workspace_cache(&raw);
-            db.upsert_file_cache(
-              file_path,
-              &file_type,
-              Some(&html),
-              Some(hash.as_str()),
-              mtime,
-            )?;
-            html
-          } else {
-            db.upsert_file_cache(file_path, &file_type, Some(&raw), None, mtime)?;
-            raw
-          }
-        }
-      };
 
       let diffs =
         diff_engine::generate_pending_diffs_for_file_type(&old_content, content, &file_type);
@@ -641,6 +808,7 @@ impl ToolService {
         })
         .collect();
 
+      let diff_count = entries.len();
       return Ok(ToolResult {
         success: true,
         data: Some(serde_json::json!({
@@ -651,26 +819,41 @@ impl ToolService {
         error: None,
         message: Some(format!(
           "已生成 {} 处待确认修改，请用户确认后写盘",
-          entries.len()
+          diff_count
         )),
         error_kind: None,
         display_error: None,
+        meta: Some(build_candidate_meta("update_file", file_path, diff_count)),
       });
     }
 
     // 原子写入文件
     match self.atomic_write_file(&full_path, content.as_bytes()) {
-      Ok(_) => Ok(ToolResult {
-        success: true,
-        data: Some(serde_json::json!({
-            "path": file_path,
-            "size": content.len(),
-        })),
-        error: None,
-        message: Some(format!("成功更新文件: {}", file_path)),
-        error_kind: None,
-        display_error: None,
-      }),
+      Ok(_) => {
+        let _ = record_file_content_timeline_node(
+          &db,
+          workspace_path,
+          file_path,
+          &file_type,
+          "update_file",
+          &format!("AI 直接更新文件：{}", file_path),
+          "ai",
+          &old_content,
+          content,
+        )?;
+        Ok(ToolResult {
+          success: true,
+          data: Some(serde_json::json!({
+              "path": file_path,
+              "size": content.len(),
+          })),
+          error: None,
+          message: Some(format!("成功更新文件: {}", file_path)),
+          error_kind: None,
+          display_error: None,
+          meta: None,
+        })
+      }
       Err(e) => Ok(ToolResult {
         success: false,
         data: None,
@@ -678,6 +861,7 @@ impl ToolService {
         message: None,
         error_kind: None,
         display_error: None,
+        meta: Some(build_failure_meta("update_file", "write failed")),
       }),
     }
   }
@@ -732,6 +916,7 @@ impl ToolService {
         message: None,
         error_kind: None,
         display_error: None,
+        meta: None,
       });
     }
 
@@ -746,6 +931,7 @@ impl ToolService {
           message: None,
           error_kind: None,
           display_error: None,
+          meta: None,
         });
       }
     };
@@ -760,25 +946,38 @@ impl ToolService {
     };
 
     match result {
-      Ok(_) => Ok(ToolResult {
-        success: true,
-        data: Some(serde_json::json!({
-            "path": file_path,
-            "type": if metadata.is_dir() { "folder" } else { "file" },
-        })),
-        error: None,
-        message: Some(format!(
-          "成功删除{}: {}",
-          if metadata.is_dir() {
-            "文件夹"
-          } else {
-            "文件"
-          },
-          file_path
-        )),
-        error_kind: None,
-        display_error: None,
-      }),
+      Ok(_) => {
+        let db = WorkspaceDb::new(workspace_path)
+          .map_err(|e| format!("WorkspaceDb 初始化失败: {}", e))?;
+        let _ = record_resource_structure_timeline_node(
+          &db,
+          workspace_path,
+          "delete_file",
+          &format!("AI 删除资源：{}", file_path),
+          "ai",
+          &[full_path.clone()],
+        )?;
+        Ok(ToolResult {
+          success: true,
+          data: Some(serde_json::json!({
+              "path": file_path,
+              "type": if metadata.is_dir() { "folder" } else { "file" },
+          })),
+          error: None,
+          message: Some(format!(
+            "成功删除{}: {}",
+            if metadata.is_dir() {
+              "文件夹"
+            } else {
+              "文件"
+            },
+            file_path
+          )),
+          error_kind: None,
+          display_error: None,
+          meta: None,
+        })
+      }
       Err(e) => Ok(ToolResult {
         success: false,
         data: None,
@@ -794,6 +993,7 @@ impl ToolService {
         message: None,
         error_kind: None,
         display_error: None,
+        meta: None,
       }),
     }
   }
@@ -832,6 +1032,7 @@ impl ToolService {
         message: None,
         error_kind: None,
         display_error: None,
+        meta: None,
       });
     }
 
@@ -864,6 +1065,7 @@ impl ToolService {
           message: Some(format!("成功列出目录: {}", dir_path)),
           error_kind: None,
           display_error: None,
+          meta: None,
         })
       }
       Err(e) => Ok(ToolResult {
@@ -873,6 +1075,7 @@ impl ToolService {
         message: None,
         error_kind: None,
         display_error: None,
+        meta: None,
       }),
     }
   }
@@ -903,6 +1106,7 @@ impl ToolService {
       message: Some(format!("找到 {} 个匹配的文件", results.len())),
       error_kind: None,
       display_error: None,
+      meta: None,
     })
   }
 
@@ -980,6 +1184,7 @@ impl ToolService {
         message: None,
         error_kind: None,
         display_error: None,
+        meta: None,
       });
     }
 
@@ -992,6 +1197,7 @@ impl ToolService {
         message: None,
         error_kind: None,
         display_error: None,
+        meta: None,
       });
     }
 
@@ -1005,23 +1211,37 @@ impl ToolService {
           message: None,
           error_kind: None,
           display_error: None,
+          meta: None,
         });
       }
     }
 
     // 移动文件
     match std::fs::rename(&source_full, &dest_full) {
-      Ok(_) => Ok(ToolResult {
-        success: true,
-        data: Some(serde_json::json!({
-            "source": source_path,
-            "destination": dest_path,
-        })),
-        error: None,
-        message: Some(format!("成功移动文件: {} -> {}", source_path, dest_path)),
-        error_kind: None,
-        display_error: None,
-      }),
+      Ok(_) => {
+        let db = WorkspaceDb::new(workspace_path)
+          .map_err(|e| format!("WorkspaceDb 初始化失败: {}", e))?;
+        let _ = record_resource_structure_timeline_node(
+          &db,
+          workspace_path,
+          "move_file",
+          &format!("AI 移动资源：{} -> {}", source_path, dest_path),
+          "ai",
+          &[source_full.clone(), dest_full.clone()],
+        )?;
+        Ok(ToolResult {
+          success: true,
+          data: Some(serde_json::json!({
+              "source": source_path,
+              "destination": dest_path,
+          })),
+          error: None,
+          message: Some(format!("成功移动文件: {} -> {}", source_path, dest_path)),
+          error_kind: None,
+          display_error: None,
+          meta: None,
+        })
+      }
       Err(e) => Ok(ToolResult {
         success: false,
         data: None,
@@ -1029,6 +1249,7 @@ impl ToolService {
         message: None,
         error_kind: None,
         display_error: None,
+        meta: None,
       }),
     }
   }
@@ -1077,6 +1298,7 @@ impl ToolService {
         message: None,
         error_kind: None,
         display_error: None,
+        meta: None,
       });
     }
 
@@ -1095,6 +1317,7 @@ impl ToolService {
         message: None,
         error_kind: None,
         display_error: None,
+        meta: None,
       });
     }
 
@@ -1108,6 +1331,17 @@ impl ToolService {
           .and_then(|p| p.to_str())
           .unwrap_or("");
 
+        let db = WorkspaceDb::new(workspace_path)
+          .map_err(|e| format!("WorkspaceDb 初始化失败: {}", e))?;
+        let _ = record_resource_structure_timeline_node(
+          &db,
+          workspace_path,
+          "rename_file",
+          &format!("AI 重命名资源：{} -> {}", file_path, new_name),
+          "ai",
+          &[full_path.clone(), new_path.clone()],
+        )?;
+
         Ok(ToolResult {
           success: true,
           data: Some(serde_json::json!({
@@ -1119,6 +1353,7 @@ impl ToolService {
           message: Some(format!("成功重命名文件: {} -> {}", file_path, new_name)),
           error_kind: None,
           display_error: None,
+          meta: None,
         })
       }
       Err(e) => Ok(ToolResult {
@@ -1128,6 +1363,7 @@ impl ToolService {
         message: None,
         error_kind: None,
         display_error: None,
+        meta: None,
       }),
     }
   }
@@ -1165,6 +1401,8 @@ impl ToolService {
       return Err("路径不安全".to_string());
     }
 
+    let existed_before = full_path.exists();
+
     // 检查文件夹是否已存在
     if full_path.exists() {
       if full_path.is_dir() {
@@ -1175,22 +1413,24 @@ impl ToolService {
               "path": folder_path,
               "full_path": full_path.to_string_lossy().to_string(),
               "message": "文件夹已存在",
-          })),
-          error: None,
-          message: Some(format!("文件夹已存在: {}", folder_path)),
-          error_kind: None,
-          display_error: None,
-        });
+            })),
+            error: None,
+            message: Some(format!("文件夹已存在: {}", folder_path)),
+            error_kind: None,
+            display_error: None,
+            meta: None,
+          });
       } else {
         eprintln!("❌ 路径已存在但不是文件夹: {:?}", full_path);
         return Ok(ToolResult {
           success: false,
           data: None,
-          error: Some(format!("路径已存在但不是文件夹: {}", folder_path)),
-          message: None,
-          error_kind: None,
-          display_error: None,
-        });
+            error: Some(format!("路径已存在但不是文件夹: {}", folder_path)),
+            message: None,
+            error_kind: None,
+            display_error: None,
+            meta: None,
+          });
       }
     }
 
@@ -1201,6 +1441,18 @@ impl ToolService {
         eprintln!("✅ 文件夹创建成功: {:?}", full_path);
         // 验证文件夹是否真的创建成功
         if full_path.exists() && full_path.is_dir() {
+          if !existed_before {
+            let db = WorkspaceDb::new(workspace_path)
+              .map_err(|e| format!("WorkspaceDb 初始化失败: {}", e))?;
+            let _ = record_resource_structure_timeline_node(
+              &db,
+              workspace_path,
+              "create_folder",
+              &format!("AI 创建文件夹：{}", folder_path),
+              "ai",
+              &[full_path.clone()],
+            )?;
+          }
           Ok(ToolResult {
             success: true,
             data: Some(serde_json::json!({
@@ -1211,6 +1463,7 @@ impl ToolService {
             message: Some(format!("成功创建文件夹: {}", folder_path)),
             error_kind: None,
             display_error: None,
+            meta: None,
           })
         } else {
           eprintln!("⚠️ 文件夹创建后验证失败: {:?}", full_path);
@@ -1221,6 +1474,7 @@ impl ToolService {
             message: None,
             error_kind: None,
             display_error: None,
+            meta: None,
           })
         }
       }
@@ -1233,6 +1487,7 @@ impl ToolService {
           message: None,
           error_kind: None,
           display_error: None,
+          meta: None,
         })
       }
     }
@@ -1252,6 +1507,7 @@ impl ToolService {
       message: Some("当前编辑器打开的文件信息会通过引用系统提供".to_string()),
       error_kind: None,
       display_error: None,
+      meta: None,
     })
   }
 
@@ -1562,6 +1818,7 @@ impl ToolService {
       message: None,
       error_kind: Some(error_kind),
       display_error: Some(display_error),
+      meta: None,
     }
   }
 
@@ -1979,6 +2236,7 @@ impl ToolService {
       error: Some(message),
       error_kind: Some(ToolErrorKind::Fatal),
       display_error: Some("编辑参数格式有误，AI 正在重试。".to_string()),
+      meta: None,
     };
 
     let deprecated_fields = [
@@ -2184,7 +2442,13 @@ impl ToolService {
     };
 
     match Self::resolve(resolver_input) {
-      Err(tool_result) => Ok(tool_result),
+      Err(mut tool_result) => {
+        if tool_result.meta.is_none() {
+          let reason = tool_result.error.as_deref().unwrap_or("resolve failed");
+          tool_result.meta = Some(build_failure_meta("edit_current_editor_document", reason));
+        }
+        Ok(tool_result)
+      }
       Ok(cd) => {
         let doc_rev = tool_call
           .arguments
@@ -2226,6 +2490,7 @@ impl ToolService {
             message: Some("edit_current_editor_document: NO_OP（内容无变化，未生成 diff）".to_string()),
             error_kind: None,
             display_error: None,
+            meta: Some(build_noop_meta("edit_current_editor_document")),
           })
         } else {
           let diff_type = cd.diff_type.clone();
@@ -2287,6 +2552,7 @@ impl ToolService {
             )),
             error_kind: None,
             display_error: None,
+            meta: Some(build_candidate_meta("edit_current_editor_document", current_file_new, 1)),
           })
         }
       }
@@ -2337,6 +2603,7 @@ impl ToolService {
       message: Some("依赖关系已保存".to_string()),
       error_kind: None,
       display_error: None,
+      meta: None,
     })
   }
 

@@ -563,15 +563,13 @@ Do not treat all docs in `docs/` as equally valid.
 
 Current authoritative references include:
 
-- `docs/AI功能优化开发计划.md`
-- `docs/AI功能优化开发计划（下）.md`
-- `docs/Workspace改造可落地实施方案.md`
-- `docs/对话编辑-主控设计文档.md`
-- `docs/文档逻辑状态传递规范.md`
-- `docs/对话编辑-代码实现对照.md`
-- `docs/引用功能完整设计文档.md`
-- `docs/Binder层次三AI工作机制系统设计.md`
-- `docs/代码现状问题清单-经代码核验.md`
+- `docs/A-DE-X-L-01_对话编辑落地开发计划.md`
+- `docs/R-WS-M-R-02_Workspace改造可落地实施方案.md`
+- `docs/R-DE-M-R-01_对话编辑-主控设计文档.md`
+- `docs/R-DE-M-R-03_文档逻辑状态传递规范.md`
+- `docs/R-WS-M-R-03_引用功能完整设计文档.md`
+- `docs/A-AG-M-T-04_Binder Agent技术主控文档.md`
+- `docs/A-VAL-X-R-02_代码遗留与清理台账.md`
 
 When docs and code disagree:
 

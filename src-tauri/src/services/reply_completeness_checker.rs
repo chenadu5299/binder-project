@@ -46,21 +46,6 @@ impl ReplyCompletenessChecker {
     text.len() < self.min_reply_length
   }
 
-  /// 检查回复是否缺少结束标记
-  pub fn missing_end_marker(&self, text: &str) -> bool {
-    let trimmed = text.trim();
-    !trimmed.ends_with('。')
-      && !trimmed.ends_with('.')
-      && !trimmed.ends_with('！')
-      && !trimmed.ends_with('!')
-      && !trimmed.ends_with('？')
-      && !trimmed.ends_with('?')
-      && !text.contains("已完成")
-      && !text.contains("完成")
-      && !text.contains("完毕")
-      && !text.contains("结束")
-  }
-
   /// 检查是否有总结内容
   pub fn has_summary(&self, text: &str) -> bool {
     text.len() > 50

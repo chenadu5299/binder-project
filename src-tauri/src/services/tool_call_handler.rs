@@ -86,6 +86,7 @@ impl ToolCallHandler {
         message: None,
         error_kind: None,
         display_error: None,
+        meta: None,
       },
       max_retries,
     )
@@ -278,29 +279,6 @@ impl ToolCallHandler {
     }
   }
 
-  /// 检查操作是否需要用户确认
-  pub fn requires_confirmation(tool_name: &str, arguments: &serde_json::Value) -> bool {
-    match tool_name {
-      "delete_file" | "delete_folder" => true,
-      "edit_current_editor_document" => true,
-      "move_file" => {
-        // 批量操作需要确认（超过10个）
-        // 这里简化处理，实际应该统计批量操作数量
-        false // 暂时不确认，因为无法准确统计
-      }
-      "create_file" => {
-        // 检查是否覆盖现有文件
-        if let Some(path) = arguments.get("path").and_then(|p| p.as_str()) {
-          // 这里应该检查文件是否存在，但需要文件系统访问
-          // 暂时不确认，由工具执行时检查
-          false
-        } else {
-          false
-        }
-      }
-      _ => false,
-    }
-  }
 }
 
 impl Default for ToolCallHandler {

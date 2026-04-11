@@ -54,7 +54,7 @@ export const MentionSelector: React.FC<MentionSelectorProps> = ({
     // 字符匹配模式：跨五类 Fuse 搜索
     const allItems = React.useMemo(() => {
         const list: MentionItem[] = [];
-        (['file', 'memory', 'chat'] as MentionCategory[]).forEach(cat => {
+        (['file', 'memory', 'kb', 'template', 'chat'] as MentionCategory[]).forEach(cat => {
             list.push(...(itemsByCategory[cat] || []));
         });
         return list;
@@ -180,6 +180,8 @@ export const MentionSelector: React.FC<MentionSelectorProps> = ({
         switch (item.type) {
             case 'file': return <DocumentIcon className="w-4 h-4 flex-shrink-0" />;
             case 'memory': return <BookOpenIcon className="w-4 h-4 flex-shrink-0" />;
+            case 'kb': return <CubeIcon className="w-4 h-4 flex-shrink-0" />;
+            case 'template': return <SparklesIcon className="w-4 h-4 flex-shrink-0" />;
             case 'chat': return <ChatBubbleLeftIcon className="w-4 h-4 flex-shrink-0" />;
             default: return <DocumentIcon className="w-4 h-4 flex-shrink-0" />;
         }

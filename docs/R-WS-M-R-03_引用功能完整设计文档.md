@@ -1,0 +1,482 @@
+# 引用系统完整设计文档
+
+## 文档头
+
+- 结构编码：`WS-M-R-03`
+- 文档属性：`参考`
+- 主责模块：`WS`
+- 文档职责：`引用功能完整设计文档 / 参考、研究或索引文档`
+- 上游约束：`CORE-C-D-04`, `SYS-C-T-01`, `WS-C-T-01`, `WS-C-T-02`, `WS-C-T-03`, `WS-M-D-01`
+- 直接承接：无
+- 接口耦合：`AST-M-P-01`, `AG-M-P-01`, `SYS-I-P-01`
+- 汇聚影响：`CORE-C-R-01`, `WS-C-T-01`, `WS-M-D-01`
+- 扩散检查：`WS-M-T-01`, `WS-M-T-02`, `WS-M-T-03`, `WS-M-T-04`, `WS-M-T-05`
+- 使用边界：`仅作参考，不直接替代主结构文档、协议文档和执行文档`
+- 变更要求：`修改本文后，必须复核：上游约束、直接承接、接口耦合、汇聚影响、扩散检查文档`
+
+---
+> 版本：v2.1 | 更新日期：2026年3月
+> 
+> 目的：定义 Binder 引用系统为一套独立、完整的功能体系，覆盖所有引用形式、输入方式、处理逻辑与降级策略
+> 
+> 关联文档：Binder记忆库需求文档、Binder知识库需求文档、Binder模板库需求文档、AI与其他功能交互规范、Workspace改造可落地实施方案
+
+---
+
+## 一、引用系统定位与设计原则
+
+### 1.1 系统定位
+
+引用系统是 Binder 对话编辑（层次三）的**核心输入增强层**，使用户能将文件、选区、记忆、知识、模板、链接等结构化地传入 AI 对话，并保证 AI 能准确理解与使用这些引用。
+
+**与上下游的关系**：
+- **上游**：文件树、编辑器选区、记忆库面板、知识库面板、模板库面板、外部拖入、剪贴板
+- **下游**：`ai_chat_stream` 的 `references` 参数、`build_reference_prompt`、`edit_target`（可编辑场景）；整文档编辑的定位由 Workspace/文档层（para_index+originalText）处理
+
+### 1.2 设计原则
+
+| 原则 | 说明 |
+|------|------|
+| **统一入口** | 所有引用形式均通过「输入框引用层」进入，统一解析、统一传递 |
+| **多通道输入** | 支持 @ 快捷选择、拖拽、复制粘贴、自动识别（链接）等多种输入方式 |
+| **用途区分** | 可编辑 / 只读 / 信息获取 三类，处理逻辑明确分离；引用层**只传内容**，意图判断交给 AI |
+| **降级一致** | 用户删除 @ 或引用标记后，一律降级为普通文本，无副作用 |
+| **定位信息** | 可编辑引用须携带选区定位信息，供编辑系统精确定位 |
+| **允许重复** | 同文件/资源可多次引用；引用影响语义，既是资源也是内容 |
+
+### 1.3 上下文优先级（CCE）
+
+```
+用户引用 > 当前文档/选区 > 工作区相关 > 标签记忆 > 项目内容记忆 > 长期记忆 > 知识库 > 聊天历史
+```
+
+---
+
+## 二、引用输入通道设计
+
+### 2.1 @ 快捷选择（主通道）
+
+**候选来源**：**仅限工作区内可引用对象**，外部文件、外部链接等**不入 @ 列表**。五类：工作区文件、记忆库、知识库、模板库、聊天标签。
+
+**两条处理逻辑**（互斥）：
+
+| 逻辑 | 触发 | 行为 | 说明 |
+|------|------|------|------|
+| **点选** | 用户输入 `@` 后默认展示 | 弹出五类树状列表，点击/展开某类时懒加载该类项；用户从列表选择 | 初始仅展示 5 个类目，展开时加载 |
+| **字符匹配** | 用户 `@` 后继续输入内容（非空格） | 放弃点选，切换为树状字符级匹配（跨五类），仅展示与输入匹配的项 | 表示用户倾向搜索，匹配后列表更短 |
+
+**切换时机**：**输入 `@` 后第一个非空格字符触发字符匹配模式**。逻辑最简单，实现无歧义；MentionSelector 状态机可据此设计为同一组件的两种 mode。（若有特殊原因需延迟切换，在此补充）
+
+**激活与取消规则**：
+
+| 规则 | 说明 |
+|------|------|
+| **默认激活** | 用户输入 `@` 时弹出列表（仅**输入** @ 激活） |
+| **空格取消** | 输入空格 → 取消/关闭列表 |
+| **只激活一次** | 列表在同一轮输入中仅激活一次 |
+| **回删不激活** | 任何回删形成的 `@` **不**激活列表（含：空格回删、有内容回删、连续 @ 回删等） |
+
+**UI 规范**：
+- 列表以**浮动层**形式出现在光标上方，避免遮挡输入
+- 支持键盘上下选择、**Tab 作用于候选项**（在候选项间切换）、Enter 确认、Esc 关闭
+- 选择后插入引用标签（非纯文本），并关闭列表
+- 字符匹配无结果时**展示空**（空状态）
+- 若用户删除 `@` 及后续字符直至引用标签消失，则**降级为普通文本**
+
+**当前实现与差异**：
+- ChatInput 已有 @ 检测和 MentionSelector，但仅支持 file 与 memory
+- InlineChatInput 使用 contentEditable，当前**无 @ 触发列表**
+- **需求缺口**：五类树状 + 两条逻辑 + 激活规则；InlineChatInput 也需支持
+
+---
+
+### 2.2 拖拽引用（并行通道）
+
+**统一逻辑**：工作区内的可引用对象（文件树、记忆库、知识库、模板库）支持从对应面板拖入聊天输入框；**外部文件**仅支持从**系统外部**（如文件管理器、桌面）拖入聊天窗口。**选区引用**以复制粘贴为主路径，**不实现选区拖拽**（稳定性优先）。
+
+| 拖拽源 | 行为 | 实现复杂度 |
+|--------|------|------------|
+| **文件树节点** | 工作区文件树拖入 → FileReference / FolderReference | 低 |
+| **记忆库面板** | 记忆项/节点/整库拖入 → MemoryReference | 中 |
+| **知识库面板** | 条目/分类拖入 → KnowledgeBaseReference | 中 |
+| **模板库面板** | 工作流模板拖入 → TemplateReference | 中 |
+| **聊天标签** | 标签拖入 → ChatReference | 中 |
+| **外部文件** | **仅**从系统外部（文件管理器、桌面等）拖入聊天窗口 → 上传至缓存/临时存储 → FileReference | 中高 |
+
+**外部文件拖拽**：
+- 检测 `e.dataTransfer.files`，若 path 不在 workspace 内，则调用上传接口写入**缓存或后端临时存储**
+- 不写入工作区、不展示于前端文件树，仅供本引用使用
+- 上传完成后创建 FileReference，path 指向临时存储标识（或缓存 key）
+
+---
+
+### 2.3 复制粘贴引用（并行通道）
+
+**与复制粘贴内容一致**：当剪贴板含 Binder 引用元数据时，粘贴后生成引用标签而非纯文本。
+
+| 来源 | 元数据格式 | 目标引用类型 |
+|------|------------|--------------|
+| 编辑器选区复制 | `__binderClipboardSource` 或 `application/x-binder-source`，含 editTarget、filePath | TextReference |
+| 表格/Excel 复制 | 含 tableData、sourceFile | TableReference |
+| 外部链接粘贴 | 无 Binder 元数据，但 Clipboard 含 URL 文本 | 见 2.4 |
+
+**当前实现**：CopyReferenceExtension 在复制时写入 sourceData；ChatInput / InlineChatInput 在 paste 时检查 `__binderClipboardSource`，存在则创建 TextReference 并插入引用标签。✅ 已实现。
+
+---
+
+### 2.4 链接自动识别
+
+**触发**：用户粘贴或输入的内容中包含 URL 文本。
+
+**处理**：解析 URL，若为有效 http(s) 链接，自动创建 LinkReference 并展示为引用标签。**链接不入 @ 列表**，仅通过粘贴/输入自动识别。
+
+**当前实现**：ChatInput 有 `extractUrls` + `addReference(linkRef)`，在 input 变化时检测。需与 InlineChatInput 对齐。
+
+---
+
+### 2.5 降级为文本
+
+**定义**：用户手动删除引用中的 `@` 符号或引用标记后，该引用**降级为普通文本**，不再作为结构化引用传递。
+
+**实现方式**：
+- 引用标签展示形态见 2.6，内容为 `@displayText`；若用户将 `@` 删除，解析器应将该节点视为普通文本
+- 引用标签用 `inline-reference-tag` 包裹；当用户执行「删除 @」操作导致内容变为纯 displayText（无 @）时，将整个标签替换为纯文本节点
+- 在 `parseEditorContent` 或 `formatNodesForAI` 中判断：若 refId 对应标签的 textContent 不含 `@`，则按纯文本输出，不加入 references
+
+**与需求对齐**：明确「删除 @ 后降级为文本」，实现时需在解析/格式化环节做一致性判断。
+
+---
+
+### 2.6 引用标签显示样式
+
+**原则**：引用标签在**聊天输入框**与**聊天窗口（对话记录）**中的展示**一致**，均以**标签形式**呈现（@displayText），不展示完整路径或精确定位。**消息记录内不展开为完整内容**，仅展示引用标签。
+
+| 引用类型 | 展示内容 | 说明 |
+|----------|----------|------|
+| **内容引用**（TextReference） | 文档名 + 位置信息 | 文档名（不含路径）；位置信息为简化描述（如「第 3 段」「行 10–15」），非完整路径与精确定位 |
+| **文件引用**（FileReference） | 文件名 | 仅文件名（含扩展名），不含路径 |
+| **文件夹引用**（FolderReference） | 文件夹名 | 仅文件夹名或相对路径最后一段 |
+| **记忆库 / 知识库 / 模板库** | 来源名称 | 记忆库名、知识库名、模板名称等 |
+| **聊天标签** | 聊天名称 | 被引用标签的名称 |
+| **链接** | 链接标题或域名 | 有 title 用 title，否则用域名或截断 URL |
+| **图片 / 表格** | 名称或类型标识 | 图片名、表格描述等 |
+
+**示例**：
+- 内容引用：`@报告.docx (第 2 段)` 或 `@报告.docx 行 10–15`
+- 文件引用：`@需求规格说明书.pdf`
+- 记忆库：`@记忆库:项目术语`
+
+---
+
+## 三、引用类型与处理逻辑总览
+
+### 3.1 类型体系
+
+| 类型 | 用途 | 来源 | 关键字段 | 传递 content |
+|------|------|------|----------|---------------|
+| Text | 可编辑 | 选区复制粘贴（**不实现选区拖拽**） | sourceFile, content, editTarget（选区定位） | 是，完整文本 |
+| File | 只读（path 可信） | @（工作区）、文件树拖拽、粘贴；**外部文件仅拖拽** | path, content? | 是（或摘要） |
+| Folder | 只读 | @、拖拽 | path | 文件列表+预览 |
+| Image | 信息获取 | 拖拽、粘贴图片 | path, base64? | 路径或描述 |
+| Table | 只读 | 选区、复制 | tableData, sourceFile | 是 |
+| Memory | 只读 | @、拖拽 | memoryId, items | 是（检索或传入） |
+| KnowledgeBase | 只读 | @、拖拽 | kbId, entryId? | 是（检索结果） |
+| Template | 只读/格式约束 | @、拖拽 | templateId, templateType | 是（结构或 content） |
+| Chat | 只读 | @ | chatTabId, messageIds | 是（消息内容） |
+| Link | 信息获取 | 粘贴、自动识别（**不入 @ 列表**） | url, title?, preview? | URL+可选摘要 |
+
+### 3.2 用途与 AI 行为
+
+| 用途 | AI 行为 | 数据要求 |
+|------|---------|----------|
+| **可编辑** | 调用编辑工具时传入 editTarget，精确定位选区 | sourceFile, content, editTarget |
+| **只读** | 直接使用，无需 read_file；path 可信，可直接操作 | type, source, content |
+| **信息获取** | 需额外获取（图片描述、链接摘要等） | 占位或延迟处理 |
+
+**说明**：File 的 path 通过引用系统传入即表示已解析、可信；AI 根据用户指令判断是否调用 `update_file`，引用层不做意图预判。
+
+### 3.3 引用内容预算与裁剪
+
+**分工**：引用层做 per-type 基础约束；提示词构建层做总预算与裁剪策略。
+
+| 层级 | 职责 | 示例 |
+|------|------|------|
+| **引用层** | 各类型 content 上限、截断策略 | File >10MB 仅传 path；Memory/KB/Template 单条 token 上限；按类型截断（head/tail/摘要） |
+| **提示词构建层** | 总 token 预算、超限时按优先级裁剪 | references 与 messages 共享预算；扩展 TruncationStrategy；用户明确引用 > 自动注入 |
+
+**引用层基础约束**（待细化）：
+
+| 类型 | 约束 |
+|------|------|
+| File | >10MB 仅 path，提示 AI read_file |
+| Memory/KB/Template | 单条 content 上限（如 2000 字符或等效 token） |
+| Chat | 消息条数或总字符上限 |
+| Folder | 前 N 个文件预览 |
+
+**提示词构建层**：在 `build_reference_prompt` 或 `build_multi_layer_prompt` 中实现总预算控制；超限时按优先级裁剪，参考 `context_manager` 的 TruncationStrategy 扩展。
+
+**关联**：Workspace 改造方案 Phase 0.5 已有 TruncationStrategy 与 truncate_with_strategy，可扩展至 references。
+
+---
+
+## 四、各引用形式详细规范
+
+### 4.1 文本引用（TextReference）— 可编辑
+
+| 项 | 规范 |
+|----|------|
+| 输入方式 | 编辑器选区复制粘贴（**主路径**；不实现选区拖拽） |
+| 数据结构 | content, sourceFile, editTarget（选区定位，供编辑系统使用） |
+| 消息格式 | `[文本引用: 文件名 (行 X-Y)]\n来源文件: path\n引用内容:\n{content}\n[无需再读]` |
+| references 格式 | `{ type:'text', source: sourceFile, content, editTarget?: { blockId, startOffset, endOffset } }` |
+| 整文档定位 | 选区引用无歧义；整文档编辑（FileReference）的定位由 Workspace/文档层处理（para_index+originalText），引用层仅传递 FileReference |
+| 实现状态 | 复制粘贴已实现 ✅ |
+
+---
+
+### 4.2 文件引用（FileReference）
+
+| 场景 | 用途 | 处理 |
+|------|------|------|
+| 当前打开文件 | 可编辑 | 由 current_file 自动带入，不重复加入 references |
+| **用户主动 @ 当前打开文件** | — | **忽略，不加入 references**；current_file 已包含该文件，重复无意义；不报错、不提示 |
+| 未打开文件（用户 @ 或拖入） | 只读（path 可信） | content 传消息；path 已解析，prompt 统一声明「路径可直接使用，无需 list_files/search_files」 |
+| 大文件 | 只读 | content 传摘要；超 10MB 仅 path，提示 AI 可 read_file |
+
+---
+
+### 4.3 文件夹引用（FolderReference）
+
+| 项 | 规范 |
+|----|------|
+| 输入方式 | @、拖拽 |
+| 处理 | list_folder_files → 文件列表；前 20 个文本文件内容预览 |
+| 实现状态 | formatNodesForAI 已实现 loadFolderContent |
+
+---
+
+### 4.4 图片引用（ImageReference）
+
+| 项 | 规范 |
+|----|------|
+| 输入方式 | 拖拽、粘贴图片 |
+| 当前处理 | path、name、size；粘贴时可用 thumbnail 存 base64 |
+| 延后 | 图片描述（vision）为后续能力；占位说明 |
+
+---
+
+### 4.5 表格引用（TableReference）
+
+| 项 | 规范 |
+|----|------|
+| 输入方式 | 表格选区复制粘贴 |
+| 处理 | tableData 或结构化文本传入 |
+| 实现状态 | reference.ts 有定义；formatNodesForAI 缺 TABLE 分支，需补 |
+
+---
+
+### 4.6 记忆库引用（MemoryReference）
+
+**依据**：Binder记忆库需求文档 七、引用与 @ 交互。
+
+| 项 | 规范 |
+|----|------|
+| 输入方式 | @记忆库:xxx、拖拽记忆项/节点/整库 |
+| 检索协议 | `search_memories(query, options?: { tabId?, workspacePath?, limit?, scope? })`；scope: tab|content|workspace|user|all |
+| 引用格式 | type: 'memory', source: 记忆库名称或记忆项 ID, content: 记忆项完整内容 |
+| 拼接 | 作为「记忆库引用」段落，标注「以下内容已完整传入，无需再读取」 |
+| 拖拽 | 无需检索，内容已完整传入 |
+| 实现状态 | @ 有 mentionType=memory；formatNodesForAI 仅传 name+itemCount，content 未完整传入，需接入 search_memories 或 items |
+
+**确定方案**：
+- 用户 @ 引用时：调用 `search_memories`（scope=tab 或 all），按 query 筛选，将命中项的 content 填入 references 和消息
+- 用户拖拽引用时：拖拽对象已包含记忆项，直接取其 content 传入，无需检索
+- 若记忆库未实现，占位：content 为 `[记忆库功能未实现，占位]`
+
+---
+
+### 4.7 知识库引用（KnowledgeBaseReference）
+
+**依据**：Binder知识库需求文档 六、知识库与 AI 的交互。
+
+| 项 | 规范 |
+|----|------|
+| 输入方式 | @知识库、@ 知识库条目、拖拽条目 |
+| 检索协议 | `query_knowledge_base(kbId, query, options?) → { items: [{ id, content, score?, metadata? }] }` |
+| 引用格式 | type: 'kb', source: kbId 或 entryId, content: 检索到的条目内容 |
+| 与引用关系 | 用户 @ 或拖拽 → 走引用流程，content 完整传入；AI 自动检索 → 走上下文注入 |
+| 实现状态 | 知识库未实现 |
+| **确定方案** | 占位：references 若有 kb 类型，传 `{ type:'kb', source: kbId, content: '[知识库功能未实现]' }`；知识库实现后，@ 时调用 query_knowledge_base，将 items 内容填入；拖拽条目时直接取条目 content |
+
+---
+
+### 4.8 模板库引用（TemplateReference）
+
+**依据**：Binder模板库需求文档 四、与 AI 的交互。
+
+| 项 | 规范 |
+|----|------|
+| 输入方式 | @、拖拽；工作流模板可引用 |
+| 引用格式 | type: 'template', source: 模板 ID 或名称, content: 模板完整内容, templateType?: 'workflow' |
+| 工作流模板 | 注入 goal、steps（Plan JSON） |
+| 检索 | list_templates、search_templates、get_template |
+| 实现状态 | 模板库未实现 |
+| **确定方案** | 占位：references 若有 template 类型，传 `{ type:'template', source: id, content: '[模板库功能未实现]', templateType }`；模板库实现后，@ 时调用 search_templates/list_templates，将模板 content（或 structure/steps）填入；拖拽时直接取模板内容 |
+
+---
+
+### 4.9 聊天标签引用（ChatReference）
+
+| 项 | 规范 |
+|----|------|
+| 输入方式 | @聊天名称 |
+| 处理 | loadChatMessages(chatTabId, messageIds) → 消息内容拼接 |
+| 约束 | 仅当用户主动 @ 时读取；默认不跨标签 |
+| 实现状态 | formatNodesForAI 已实现 loadChatMessages |
+
+---
+
+### 4.10 链接引用（LinkReference）
+
+| 项 | 规范 |
+|----|------|
+| 输入方式 | 粘贴 URL、输入 URL 自动识别 |
+| 处理 | url、title、preview 传入 |
+| 延后 | fetch 摘要、OG 元数据 |
+| 实现状态 | ChatInput 有 extractUrls + addReference |
+
+---
+
+### 4.11 外部文件拖拽
+
+| 项 | 规范 |
+|----|------|
+| 触发范围 | **仅**从系统外部（文件管理器、桌面等）拖入聊天窗口；工作区文件通过文件树拖拽引用 |
+| 行为 | path 不在 workspace → 上传至缓存或后端临时存储 → 创建 FileReference |
+| 存储规则 | 不写入工作区、不展示于文件树；仅供本引用使用 |
+| 实现状态 | 需对接上传流程 |
+| 复杂度 | 中高 |
+
+---
+
+## 五、主处理逻辑与需求对齐
+
+### 5.1 主处理流程（目标态）
+
+```
+用户操作（@ / 拖拽 / 粘贴）
+  → 引用层解析（MentionSelector / onDrop / onPaste）
+  → 生成 Reference 对象
+  → addReference(tabId, ref)
+  → 在输入框展示引用标签
+  → 用户发送
+  → formatNodesForAI / 等效逻辑：将引用 content 写入 references；消息展示以**标签形式**，不展开
+  → getReferences(tabId) → 构造 references 数组（含完整 content，供 AI）
+  → invoke('ai_chat_stream', { ..., references })
+  → 后端 ReferenceInfo → build_reference_prompt
+  → 第三层提示词注入
+```
+
+### 5.2 当前实现与需求差异分析
+
+| 环节 | 需求 | 当前实现 | 差异分析 |
+|------|------|----------|----------|
+| @ 触发列表 | 五类树状、两条逻辑（点选/字符匹配）、激活规则 | ChatInput 有 file+memory；InlineChatInput 无 @ 列表 | 需实现五类树、两条逻辑、激活规则；InlineChatInput 缺 @ 通道 |
+| 列表位置 | 光标上方合适区域，临时选中列表 | MentionSelector 存在，位置可能需优化 | 需确认浮动层位置是否符需求 |
+| 拖拽文件树等 | 文件树、记忆库等拖入 | ChatInput 有 handleDrop（文件）；记忆库、知识库、模板库、聊天拖拽待实现 | 文件已有；其他面板需支持 drag 并 drop 到输入框 |
+| 外部文件拖拽 | 自动上传 | 未实现 | 需上传流程 |
+| 链接自动识别 | 粘贴/输入 URL 自动识别 | ChatInput 有；InlineChatInput 需对齐 | 部分实现 |
+| 降级为文本 | 删除 @ 后降级 | 未明确实现 | 需在解析环节增加判断 |
+| references 传递 | 前端传 references 到 ai_chat_stream | 未传 | **核心缺口** |
+| path 可信声明 | prompt 声明引用 path 已解析、可直接使用 | 未声明 | 需 build_reference_prompt 统一追加 |
+| 记忆库 content | 记忆项完整 content 传入 | 仅 name+itemCount | 需 search_memories 或 items |
+| 知识库 | 占位或检索传入 | 未实现 | 占位 |
+| 模板库 | 占位或模板定义传入 | 未实现 | 占位 |
+
+### 5.3 对齐结论
+
+- **已对齐**：复制粘贴引用、可编辑引用的 editTarget 传递、文件/文件夹/图片/聊天 formatNodesForAI
+- **部分对齐**：@ 列表（有但不完整）、拖拽（仅文件）、链接识别（仅 ChatInput）
+- **未对齐**：references 传递、降级逻辑、外部文件上传、记忆库/知识库/模板库完整引用
+- **已决策**：放弃选区拖拽，以复制粘贴为主路径
+
+---
+
+## 六、references 参数协议
+
+### 6.1 前端 → 后端
+
+```typescript
+references?: Array<{
+  type: 'text' | 'file' | 'folder' | 'image' | 'table' | 'memory' | 'link' | 'chat' | 'kb' | 'template';
+  source: string;
+  content: string;
+  editTarget?: { blockId: string; startOffset: number; endOffset: number };
+  templateType?: 'workflow';
+}>;
+```
+
+### 6.2 后端 build_reference_prompt 规则
+
+- 每个引用：`Reference N: Type (Source: source)\nContent: ...\n`
+- 末尾统一：`以上内容已完整传入，无需再读取。`
+- **含 File 时**：统一追加一句 `以上文件路径均已解析，可直接使用，无需 list_files 或 search_files。`（数据可信度声明，非意图预判；AI 根据用户指令自行判断是否调用 update_file）
+- **Memory**：`来源：记忆库`
+- **KnowledgeBase**：`来源：知识库`
+- **Template**：`来源：模板库 (type: workflow)`
+
+---
+
+## 七、实现优先级与改造清单
+
+| 优先级 | 项 | 说明 |
+|--------|-----|------|
+| P0 | references 传递 | chatStore.sendMessage 取 getReferences，传 ai_chat_stream |
+| P0 | ai_chat_stream 接收 references | 后端增加参数，转 ReferenceInfo |
+| P0 | path 可信声明 | build_reference_prompt 含 File 时统一追加「路径已解析，可直接使用」 |
+| P1 | @ 统一列表 | 五类树状、两条逻辑（点选/字符匹配）、激活规则，InlineChatInput 支持 @ |
+| P1 | 降级逻辑 | 删除 @ 后按纯文本处理 |
+| P1 | 记忆库 content | search_memories 调用或 items 传入 |
+| P1 | 引用层 per-type 约束 | 各类型 content 上限、截断策略（见 3.3） |
+| P2 | 提示词构建层总预算 | build_reference_prompt 或 truncate_with_strategy 扩展至 references |
+| P2 | 拖拽记忆/知识/模板/聊天 | 各面板支持 drag，输入框 drop |
+| P2 | Table 分支 | formatNodesForAI 增加 TABLE |
+| P3 | 外部文件上传 | drop 时检测外部 path，上传至缓存/临时存储（不入文件树） |
+| P3 | 知识库/模板库占位 | 协议占位，便于后续接入 |
+
+---
+
+## 八、附录
+
+### 8.1 参考需求与协议
+
+- **Binder记忆库需求文档** 7.1–7.3：拖拽引用、@ 语法、引用格式协议
+- **Binder知识库需求文档** 6.1–6.3：检索协议、引用方式、与引用关系
+- **Binder模板库需求文档** 4.2–4.3：引用格式、提示词注入
+- **AI与其他功能交互规范**：references 传递、三种用途
+- **Workspace改造可落地实施方案**：整文档 diff、para_index+originalText、TruncationStrategy
+
+### 8.2 已确认规则
+
+| 项 | 说明 |
+|----|------|
+| Tab 键 | 作用于候选项（在候选项间切换） |
+| 空匹配 | 展示空状态 |
+| 切换时机 | **输入 @ 后第一个非空格字符触发字符匹配模式** |
+| 焦点管理 | 列表打开时焦点进入列表，关闭时回到输入框 |
+| 多引用顺序 | 按添加顺序 |
+| 同文件重复引用 | **允许重复**；引用既影响语义也是内容，用户可能有意多次引用同一资源以强调 |
+| 消息记录展示 | 以标签形式展示，**不展开为完整内容**；完整 content 仅传给 AI |
+| **isOperationTarget 删除** | 引用层只传内容，不做意图预判；path 可信度由 prompt 统一声明「路径已解析，可直接使用」 |
+
+### 8.3 待定与实现时确认
+
+| 项 | 说明 |
+|----|------|
+| 引用标签点击交互 | 点击已插入引用标签是否支持跳转、预览等；删除/降级已定义，其余待定 |
+| per-type 具体上限 | Memory/KB/Template 单条 token 或字符上限的数值；待与 context 预算协同确定 |
+| 总预算数值 | references 与 messages 共享时的总 token 上限；与模型 context window 对齐 |
+
+---
+
+**文档结束。**

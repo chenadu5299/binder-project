@@ -2,6 +2,7 @@
 //!
 //! 负责管理对话上下文，构建多层提示词，管理上下文长度
 
+use crate::services::knowledge::KnowledgeInjectionSlice;
 use crate::services::ai_providers::ChatMessage;
 use std::path::PathBuf;
 
@@ -184,6 +185,45 @@ fn contains_file_op_intent(msg: &str) -> bool {
   keywords.iter().any(|k| msg_lower.contains(k))
 }
 
+fn contains_current_doc_only_intent(msg: &str) -> bool {
+  let msg_lower = msg.to_lowercase();
+  let keywords = [
+    "只基于当前文档",
+    "仅基于当前文档",
+    "只看当前文档",
+    "只看当前文件",
+    "仅看当前文件",
+    "不要查知识库",
+    "不要用知识库",
+    "only current document",
+    "only current doc",
+    "only this file",
+    "do not use knowledge base",
+  ];
+  keywords.iter().any(|k| msg_lower.contains(k))
+}
+
+fn contains_current_doc_focus_intent(msg: &str) -> bool {
+  let msg_lower = msg.to_lowercase();
+  let keywords = [
+    "当前文档",
+    "当前文件",
+    "本文件",
+    "这篇文档",
+    "这份文档",
+    "这段",
+    "当前段落",
+    "当前选区",
+    "上面这段",
+    "this document",
+    "current document",
+    "current file",
+    "selected text",
+    "this section",
+  ];
+  keywords.iter().any(|k| msg_lower.contains(k))
+}
+
 pub fn determine_injection_strategy(
   user_message: &str,
   has_edit_target: bool,
@@ -307,6 +347,60 @@ pub struct ContextInfo {
 
   /// 本轮文档版本（RequestContext.revision）
   pub document_revision: Option<u64>,
+
+  /// Agent 任务状态摘要（从 workspace.db 读取，注入 prompt 让模型感知当前任务）
+  pub agent_task_summary: Option<String>,
+  /// Phase 7: Agent artifact 摘要（当前任务的 verification/confirmation 记录，注入 prompt 增强上下文感知）
+  pub agent_artifacts_summary: Option<String>,
+
+  /// L6 augmentation：记忆库检索结果（已格式化为注入字符串，带 [记忆库信息] 标签）
+  pub memory_context: Option<String>,
+  /// L6 augmentation：知识库自动检索结果（augmentation-only，保持结构化直到最终消费）
+  pub knowledge_injection_slices: Vec<KnowledgeInjectionSlice>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KnowledgeRetrievalTriggerReason {
+  Triggered,
+  ExplicitReferencesSufficient,
+  EditingContext,
+  FileOperationIntent,
+  QueryTooShort,
+  CurrentDocumentSufficient,
+  CurrentScopeOnly,
+  AutomaticPolicyBlocked,
+  NoAutomaticCandidates,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct KnowledgeRetrievalContext {
+  pub explicit_reference_count: usize,
+  pub granular_explicit_reference_count: usize,
+  pub automatic_candidate_count: usize,
+  pub automatic_policy_blocked: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct KnowledgeRetrievalDecision {
+  pub should_trigger: bool,
+  pub reason: KnowledgeRetrievalTriggerReason,
+}
+
+/// Phase 3：七层 prompt 语义层。
+/// governance → task → conversation → fact → constraint → augmentation → tool_and_output
+#[derive(Debug, Clone, Default)]
+pub struct PromptPackageLayer {
+  pub key: String,
+  pub title: String,
+  pub content: String,
+}
+
+/// Phase 3：结构化 PromptPackage。
+/// 包含七层语义内容和渲染后的完整 prompt 字符串。
+#[derive(Debug, Clone, Default)]
+pub struct PromptPackage {
+  pub layers: Vec<PromptPackageLayer>,
+  pub rendered_prompt: Option<String>,
 }
 
 /// 编辑器状态
@@ -391,27 +485,188 @@ impl ContextManager {
     }
   }
 
-  /// 构建多层提示词
+  pub fn should_trigger_knowledge_retrieval(
+    &self,
+    context: &ContextInfo,
+    retrieval_context: &KnowledgeRetrievalContext,
+  ) -> KnowledgeRetrievalDecision {
+    let msg = context.user_message.trim();
+    if retrieval_context.automatic_policy_blocked {
+      return KnowledgeRetrievalDecision {
+        should_trigger: false,
+        reason: KnowledgeRetrievalTriggerReason::AutomaticPolicyBlocked,
+      };
+    }
+
+    if retrieval_context.automatic_candidate_count == 0 {
+      return KnowledgeRetrievalDecision {
+        should_trigger: false,
+        reason: KnowledgeRetrievalTriggerReason::NoAutomaticCandidates,
+      };
+    }
+
+    if msg.chars().count() < 5 {
+      return KnowledgeRetrievalDecision {
+        should_trigger: false,
+        reason: KnowledgeRetrievalTriggerReason::QueryTooShort,
+      };
+    }
+
+    if context.edit_target_present || context.selected_text.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false) {
+      return KnowledgeRetrievalDecision {
+        should_trigger: false,
+        reason: KnowledgeRetrievalTriggerReason::EditingContext,
+      };
+    }
+
+    if contains_file_op_intent(msg) {
+      return KnowledgeRetrievalDecision {
+        should_trigger: false,
+        reason: KnowledgeRetrievalTriggerReason::FileOperationIntent,
+      };
+    }
+
+    if retrieval_context.granular_explicit_reference_count > 0 {
+      return KnowledgeRetrievalDecision {
+        should_trigger: false,
+        reason: KnowledgeRetrievalTriggerReason::ExplicitReferencesSufficient,
+      };
+    }
+
+    if contains_current_doc_only_intent(msg) {
+      return KnowledgeRetrievalDecision {
+        should_trigger: false,
+        reason: KnowledgeRetrievalTriggerReason::CurrentScopeOnly,
+      };
+    }
+
+    let current_doc_fact_ready = context
+      .selected_text
+      .as_ref()
+      .map(|value| value.trim().chars().count() >= 20)
+      .unwrap_or(false)
+      || context.edit_target_present
+      || context
+        .current_content
+        .as_ref()
+        .map(|value| value.chars().count() >= 200)
+        .unwrap_or(false);
+
+    if current_doc_fact_ready && contains_current_doc_focus_intent(msg) {
+      return KnowledgeRetrievalDecision {
+        should_trigger: false,
+        reason: KnowledgeRetrievalTriggerReason::CurrentDocumentSufficient,
+      };
+    }
+
+    KnowledgeRetrievalDecision {
+      should_trigger: true,
+      reason: KnowledgeRetrievalTriggerReason::Triggered,
+    }
+  }
+
+  /// 构建多层提示词（兼容接口，渲染为单一字符串）
   pub fn build_multi_layer_prompt(&self, context: &ContextInfo, enable_tools: bool) -> String {
-    let mut prompt = String::new();
+    let package = self.build_prompt_package(context, enable_tools);
+    package.rendered_prompt.unwrap_or_default()
+  }
 
-    // 第一层：基础系统提示词（完整版本）
-    prompt.push_str(&self.build_base_system_prompt(enable_tools));
+  /// Phase 3：七层语义 prompt 装配。
+  /// 层次：governance → task → conversation → fact → constraint → augmentation → tool_and_output
+  pub fn build_prompt_package(
+    &self,
+    context: &ContextInfo,
+    enable_tools: bool,
+  ) -> PromptPackage {
+    let mut layers = Vec::new();
 
-    // 第二层：上下文提示词
-    prompt.push_str(&self.build_context_prompt(context));
+    // L1 governance: 基础系统提示词（角色、规则、行为准则）
+    let governance = self.build_base_system_prompt(enable_tools);
+    if !governance.is_empty() {
+      layers.push(PromptPackageLayer {
+        key: "governance".to_string(),
+        title: "System Governance".to_string(),
+        content: governance,
+      });
+    }
 
-    // 第三层：引用提示词（Phase 2.3：超限时按优先级裁剪）
+    // L2 task: Agent 任务状态上下文（当前任务 + 历史阶段 + artifacts）
+    {
+      let mut task_parts: Vec<String> = Vec::new();
+      if let Some(ref summary) = context.agent_task_summary {
+        task_parts.push(format!("### Task State\n{}", summary));
+      }
+      if let Some(ref artifacts) = context.agent_artifacts_summary {
+        task_parts.push(format!("### Recent Artifacts\n{}", artifacts));
+      }
+      if !task_parts.is_empty() {
+        layers.push(PromptPackageLayer {
+          key: "task".to_string(),
+          title: "Agent Task State".to_string(),
+          content: format!("## Current Agent Task State\n\n{}", task_parts.join("\n\n")),
+        });
+      }
+    }
+
+    // L3 conversation: 由消息历史承载，不注入 system prompt。此层为占位。
+    // （多轮对话历史由 ai_chat_stream 在 messages 数组中管理，不在此处拼装）
+
+    // L4 fact: 文档内容、编辑器状态（当前文件内容、块列表、选区等）
+    let fact = self.build_context_prompt(context);
+    if !fact.is_empty() {
+      layers.push(PromptPackageLayer {
+        key: "fact".to_string(),
+        title: "Document & Editor Context".to_string(),
+        content: fact,
+      });
+    }
+
+    // L5 constraint: 引用资料（文件引用、选区引用，按优先级裁剪）
     if !context.references.is_empty() {
       let truncated = self
         .truncate_references_to_budget(context.references.clone(), context.current_file.as_ref());
-      prompt.push_str(&self.build_reference_prompt(&truncated, context.current_file.as_ref()));
+      let constraint = self.build_reference_prompt(&truncated, context.current_file.as_ref());
+      if !constraint.is_empty() {
+        layers.push(PromptPackageLayer {
+          key: "constraint".to_string(),
+          title: "Reference Materials".to_string(),
+          content: constraint,
+        });
+      }
     }
 
-    // 第四层：工具调用提示词（仅Agent模式）
-    // 注意：工具调用格式要求已包含在第一层中
+    // L6 augmentation: 记忆库注入
+    if let Some(ref mem) = context.memory_context {
+      if !mem.is_empty() {
+        layers.push(PromptPackageLayer {
+          key: "augmentation".to_string(),
+          title: "Memory Augmentation".to_string(),
+          content: mem.clone(),
+        });
+      }
+    }
+    if !context.knowledge_injection_slices.is_empty() {
+      layers.push(PromptPackageLayer {
+        key: "knowledge_augmentation".to_string(),
+        title: "Knowledge Augmentation".to_string(),
+        content: self.build_knowledge_augmentation_prompt(&context.knowledge_injection_slices),
+      });
+    }
 
-    prompt
+    // L7 tool_and_output: 工具定义已通过 provider-side function calling 注入，
+    // 此层为占位，与 governance 中的工具使用指导互补。
+
+    // 渲染：将各层按顺序拼接为最终字符串
+    let rendered = layers
+      .iter()
+      .map(|l| l.content.as_str())
+      .collect::<Vec<_>>()
+      .join("\n\n");
+
+    PromptPackage {
+      layers,
+      rendered_prompt: Some(rendered),
+    }
   }
 
   /// 构建第一层：基础系统提示词
@@ -679,7 +934,7 @@ Only act on the LAST user message. Previous messages are completed history.
         ReferenceType::Chat => "Chat history reference",
         ReferenceType::Link => "Link reference",
         ReferenceType::KnowledgeBase => "Knowledge base reference",
-        ReferenceType::Template => "Template reference",
+        ReferenceType::Template => "Compiled workflow constraint reference",
       };
 
       // 引用格式：Reference N: Type (Source: source)
@@ -849,6 +1104,211 @@ Only act on the LAST user message. Previous messages are completed history.
     messages.clear();
     messages.push(system_msg);
     messages.extend(recent_msgs);
+  }
+
+  fn build_knowledge_augmentation_prompt(
+    &self,
+    slices: &[KnowledgeInjectionSlice],
+  ) -> String {
+    let mut lines = vec![
+      "[知识库补强]".to_string(),
+      "以下内容来自知识库自动检索，仅作 augmentation 补强，不覆盖当前文档、显式引用或当前轮 artifact。".to_string(),
+      String::new(),
+    ];
+
+    for (index, slice) in slices.iter().enumerate() {
+      let source_ref = slice
+        .provenance
+        .source_ref
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+      let risk_flags = if slice.risk_flags.is_empty() {
+        "none".to_string()
+      } else {
+        slice.risk_flags.join(", ")
+      };
+      let source_message = slice
+        .source_status_message
+        .clone()
+        .unwrap_or_else(|| "none".to_string());
+      let source_role_label = match slice.source_role.as_str() {
+        "structure_reference" => "结构参考",
+        _ => "知识补强",
+      };
+
+      lines.push(format!("### {} Slice {}", source_role_label, index + 1));
+      lines.push(format!("title: {}", slice.title));
+      lines.push(format!("source_role: {}", slice.source_role));
+      lines.push(format!("asset_kind: {}", slice.asset_kind));
+      lines.push(format!("source_label: {}", slice.source_label));
+      lines.push(format!("entry_id: {}", slice.entry_id));
+      lines.push(format!("document_id: {}", slice.document_id));
+      lines.push(format!("retrieval_mode: {}", slice.retrieval_mode));
+      if let Some(citation) = slice.citation.as_ref() {
+        lines.push(format!("citation_key: {}", citation.citation_key));
+        lines.push(format!("version: {}", citation.version));
+        lines.push(format!("citation_status: {}", citation.status));
+      } else {
+        lines.push("citation: none".to_string());
+      }
+      lines.push(format!("source_ref: {}", source_ref));
+      lines.push(format!("source_status: {}", slice.source_status));
+      lines.push(format!("source_status_message: {}", source_message));
+      lines.push(format!("risk_flags: {}", risk_flags));
+      if let Some(metadata) = slice.structure_metadata.as_ref() {
+        lines.push(format!("document_form: {}", metadata.document_form));
+        lines.push(format!("structure_purpose: {}", metadata.structure_purpose));
+        lines.push(format!(
+          "section_outline_summary: {}",
+          metadata.section_outline_summary
+        ));
+      }
+      lines.push("content:".to_string());
+      lines.push(slice.content.clone());
+      lines.push(String::new());
+    }
+
+    lines.push("[/知识库补强]".to_string());
+    lines.join("\n")
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{
+    ContextInfo, ContextManager, EditorState, KnowledgeRetrievalContext,
+    KnowledgeRetrievalTriggerReason, ReferenceInfo, ReferenceType,
+  };
+  use std::path::PathBuf;
+
+  fn build_context(user_message: &str, edit_target_present: bool) -> ContextInfo {
+    ContextInfo {
+      current_file: Some("docs/spec.md".to_string()),
+      selected_text: None,
+      workspace_path: PathBuf::from("/tmp/binder-p1-context"),
+      editor_state: EditorState {
+        is_editable: true,
+        file_type: Some("md".to_string()),
+        file_size: None,
+        is_saved: true,
+      },
+      references: vec![ReferenceInfo {
+        ref_type: ReferenceType::File,
+        source: "docs/spec.md".to_string(),
+        content: String::new(),
+      }],
+      current_content: Some("<p data-block-id=\"b1\">Binder context</p>".to_string()),
+      edit_target_present,
+      selection_start_block_id: None,
+      selection_start_offset: None,
+      selection_end_block_id: None,
+      selection_end_offset: None,
+      cursor_block_id: None,
+      cursor_offset: None,
+      user_message: user_message.to_string(),
+      baseline_id: None,
+      document_revision: None,
+      agent_task_summary: None,
+      agent_artifacts_summary: None,
+      memory_context: None,
+      knowledge_injection_slices: Vec::new(),
+    }
+  }
+
+  #[test]
+  fn p1_should_trigger_knowledge_retrieval_for_general_query() {
+    let manager = ContextManager::new(4000);
+    let context = build_context("请结合知识库说明 Binder 的引用稳定性规则", false);
+
+    let decision = manager.should_trigger_knowledge_retrieval(
+      &context,
+      &KnowledgeRetrievalContext {
+        automatic_candidate_count: 1,
+        ..KnowledgeRetrievalContext::default()
+      },
+    );
+
+    assert!(decision.should_trigger);
+    assert_eq!(decision.reason, KnowledgeRetrievalTriggerReason::Triggered);
+  }
+
+  #[test]
+  fn p1_should_block_knowledge_retrieval_for_editing_context() {
+    let manager = ContextManager::new(4000);
+    let context = build_context("帮我改写当前段落", true);
+
+    let decision = manager.should_trigger_knowledge_retrieval(
+      &context,
+      &KnowledgeRetrievalContext {
+        automatic_candidate_count: 1,
+        ..KnowledgeRetrievalContext::default()
+      },
+    );
+
+    assert!(!decision.should_trigger);
+    assert_eq!(decision.reason, KnowledgeRetrievalTriggerReason::EditingContext);
+  }
+
+  #[test]
+  fn p1_should_block_knowledge_retrieval_when_explicit_knowledge_is_sufficient() {
+    let manager = ContextManager::new(4000);
+    let context = build_context("请对照这条知识条目回答", false);
+
+    let decision = manager.should_trigger_knowledge_retrieval(
+      &context,
+      &KnowledgeRetrievalContext {
+        granular_explicit_reference_count: 1,
+        automatic_candidate_count: 2,
+        ..KnowledgeRetrievalContext::default()
+      },
+    );
+
+    assert!(!decision.should_trigger);
+    assert_eq!(
+      decision.reason,
+      KnowledgeRetrievalTriggerReason::ExplicitReferencesSufficient
+    );
+  }
+
+  #[test]
+  fn p1_should_block_knowledge_retrieval_for_current_doc_only_scope() {
+    let manager = ContextManager::new(4000);
+    let context = build_context("只基于当前文档总结这段内容，不要查知识库", false);
+
+    let decision = manager.should_trigger_knowledge_retrieval(
+      &context,
+      &KnowledgeRetrievalContext {
+        automatic_candidate_count: 2,
+        ..KnowledgeRetrievalContext::default()
+      },
+    );
+
+    assert!(!decision.should_trigger);
+    assert_eq!(decision.reason, KnowledgeRetrievalTriggerReason::CurrentScopeOnly);
+  }
+
+  #[test]
+  fn p1_should_block_knowledge_retrieval_when_current_document_is_sufficient() {
+    let manager = ContextManager::new(4000);
+    let mut context = build_context("请基于当前文档总结主要约束", false);
+    context.current_content = Some(format!(
+      "<p data-block-id=\"b1\">{}</p>",
+      "Binder current document facts. ".repeat(20)
+    ));
+
+    let decision = manager.should_trigger_knowledge_retrieval(
+      &context,
+      &KnowledgeRetrievalContext {
+        automatic_candidate_count: 2,
+        ..KnowledgeRetrievalContext::default()
+      },
+    );
+
+    assert!(!decision.should_trigger);
+    assert_eq!(
+      decision.reason,
+      KnowledgeRetrievalTriggerReason::CurrentDocumentSufficient
+    );
   }
 }
 

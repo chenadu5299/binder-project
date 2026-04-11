@@ -2,7 +2,7 @@
  * 分页模式光标扩展：全篇模拟光标（非仅首行）
  * 分页模式下，光标态时始终隐藏原生、显示模拟光标，覆盖文档任意位置。
  * 模拟光标挂载到编辑器滚动容器（scrollContainer ?? body），保持层叠上下文，避免浮在工具栏上方。
- * @see docs/分页模式光标与遮罩完整方案.md
+ * @see docs/R-ED-M-R-10_分页模式光标与遮罩完整方案.md
  */
 
 import { Extension } from '@tiptap/core';

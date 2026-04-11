@@ -2,7 +2,12 @@
 //!
 //! open_file_with_cache、open_docx_with_cache、ai_edit_file_with_diff、accept_file_diffs、reject_file_diffs
 
-use crate::workspace::workspace_db::{WorkspaceDb, PendingDiffEntry};
+use crate::workspace::timeline_support::{
+    payload_differs_from_current, record_file_content_timeline_node, restore_payload,
+};
+use crate::workspace::workspace_db::{
+    PendingDiffEntry, TimelineNodeRecord, TimelineRestorePayloadRecord, WorkspaceDb,
+};
 use crate::workspace::diff_engine;
 use crate::workspace::canonical_html::{
     canonical_html_for_workspace_cache, materialize_cached_body_if_stale_hash,
@@ -14,7 +19,11 @@ use crate::workspace::canonical_service::{
 };
 use crate::commands::file_commands::{read_file_content, open_docx_for_edit};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use serde::{Serialize, Deserialize};
+use tauri::{Emitter, State};
+
+type AIServiceState = Arc<Mutex<crate::services::ai_service::AIService>>;
 
 /// open_file_with_cache 返回结构
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +56,20 @@ pub struct PendingDiffDto {
     pub para_index: i32,
     pub diff_type: String,
     pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineRestorePreview {
+    pub node: TimelineNodeRecord,
+    pub payload_kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineRestoreResult {
+    pub impacted_paths: Vec<String>,
+    pub created_node: bool,
 }
 
 fn resolve_target_file_under_workspace(
@@ -154,6 +177,13 @@ pub async fn open_file_with_cache(
                 if before.total == 0 {
                     loaded = inject_blockids_for_plain_text(&loaded);
                     injected_block_ws = true;
+                    let stats = inspect_block_id_map(&loaded);
+                    if stats.has_duplicates {
+                        return Err(format!(
+                            "E_APPLY_FAILED:DUPLICATE_BLOCK_IDS: path={} total={} unique={}",
+                            file_path, stats.total, stats.unique
+                        ));
+                    }
                     db.upsert_file_cache(&file_path, &file_type, Some(&loaded), None, mtime)?;
                 }
             }
@@ -171,6 +201,13 @@ pub async fn open_file_with_cache(
                 .map_err(|e| format!("读取文件失败: {}", e))?;
             if should_run_workspace_canonical_pipeline(&file_type) {
                 let (html, hash) = canonical_html_for_workspace_cache(&raw);
+                let stats = inspect_block_id_map(&html);
+                if stats.has_duplicates {
+                    return Err(format!(
+                        "E_APPLY_FAILED:DUPLICATE_BLOCK_IDS: path={} total={} unique={}",
+                        file_path, stats.total, stats.unique
+                    ));
+                }
                 db.upsert_file_cache(
                     &file_path,
                     &file_type,
@@ -187,6 +224,13 @@ pub async fn open_file_with_cache(
             } else if should_inject_block_ids_for_plain_text(&file_type) {
                 let injected = inject_blockids_for_plain_text(&raw);
                 injected_block_ws = injected != raw;
+                let stats = inspect_block_id_map(&injected);
+                if stats.has_duplicates {
+                    return Err(format!(
+                        "E_APPLY_FAILED:DUPLICATE_BLOCK_IDS: path={} total={} unique={}",
+                        file_path, stats.total, stats.unique
+                    ));
+                }
                 db.upsert_file_cache(&file_path, &file_type, Some(&injected), None, mtime)?;
                 injected
             } else {
@@ -365,12 +409,16 @@ fn apply_diffs_to_content(content: &str, diffs: &[PendingDiffEntry]) -> Result<S
             let num_old = d.original_text.lines().count().max(1);
             let end = (start + num_old).min(lines.len());
             if start >= lines.len() {
-                return Err(format!("para_index {} 越界", d.para_index));
+                return Err(format!(
+                    "E_APPLY_FAILED: para_index {} out of range (lines={})",
+                    d.para_index,
+                    lines.len()
+                ));
             }
             let old_joined: String = lines[start..end].join("\n");
             if old_joined != d.original_text {
                 return Err(format!(
-                    "original_text 不匹配 at para_index {} (expected {} chars, got {} chars)",
+                    "E_ORIGINALTEXT_MISMATCH: para_index={} expected_len={} actual_len={}",
                     d.para_index,
                     d.original_text.len(),
                     old_joined.len()
@@ -382,7 +430,11 @@ fn apply_diffs_to_content(content: &str, diffs: &[PendingDiffEntry]) -> Result<S
             let new_lines: Vec<String> = d.new_text.lines().map(|s| s.to_string()).collect();
             let pos = d.para_index as usize;
             if pos > lines.len() {
-                return Err(format!("insert para_index {} 越界", d.para_index));
+                return Err(format!(
+                    "E_APPLY_FAILED: insert para_index {} out of range (lines={})",
+                    d.para_index,
+                    lines.len()
+                ));
             }
             for (i, line) in new_lines.into_iter().enumerate() {
                 lines.insert(pos + i, line);
@@ -461,7 +513,7 @@ pub async fn accept_file_diffs(
             );
             (html, Some(hash))
         } else {
-            (final_content, None)
+            (final_content.clone(), None)
         };
 
     if file_type == "docx" {
@@ -489,6 +541,18 @@ pub async fn accept_file_diffs(
         mtime,
     )?;
 
+    let _ = record_file_content_timeline_node(
+        &db,
+        Path::new(&workspace_path),
+        &file_path,
+        &file_type,
+        "accept_file_diffs",
+        &format!("接受待确认修改：{}", file_path),
+        "ai",
+        &base_content,
+        &final_content,
+    )?;
+
     Ok(())
 }
 
@@ -506,7 +570,54 @@ pub async fn sync_workspace_file_cache_after_save(
     workspace_path: String,
     file_absolute_path: String,
     html_content: String,
+    service: State<'_, AIServiceState>,
 ) -> Result<(), String> {
+    // 记忆内容提取（文本文件，60s 节流，fire-and-forget）
+    {
+        let is_text = {
+            let ext = std::path::Path::new(&file_absolute_path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            matches!(ext.as_str(), "md" | "txt" | "html" | "htm" | "rst")
+        };
+        if is_text && !html_content.trim().is_empty() {
+            // 获取 AI provider（fire-and-forget，失败静默）
+            let provider_opt = {
+                let guard = service.lock().ok();
+                guard.and_then(|g| g.get_provider("deepseek").or_else(|| g.get_provider("openai")))
+            };
+            if let Some(provider) = provider_opt {
+                let ws = std::path::PathBuf::from(workspace_path.clone());
+                let fp = file_absolute_path.clone();
+                let html = html_content.clone();
+                tokio::spawn(async move {
+                    // 60s 节流检查
+                    let svc = match crate::services::memory_service::MemoryService::new(&ws) {
+                        Ok(s) => s,
+                        Err(_) => return,
+                    };
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
+                    if let Some(t) = svc.get_last_content_extraction_time(&fp).await {
+                        if now - t < 60 {
+                            eprintln!("[memory] content extraction skipped: cooldown for {}", fp);
+                            return;
+                        }
+                    }
+                    drop(svc); // release before task
+                    eprintln!("[memory] content extraction triggered for {}", fp);
+                    crate::services::memory_service::memory_generation_task_content(
+                        provider, ws, fp, html,
+                    ).await;
+                });
+            }
+        }
+    }
+
     let Some(rel) = relative_path_under_workspace(&workspace_path, &file_absolute_path) else {
         return Ok(());
     };
@@ -579,6 +690,118 @@ fn relative_path_under_workspace(workspace_path: &str, file_path: &str) -> Optio
     None
 }
 
+#[tauri::command]
+pub async fn record_saved_file_timeline_node(
+    workspace_path: String,
+    file_absolute_path: String,
+    before_content: String,
+    after_content: String,
+) -> Result<bool, String> {
+    let db = WorkspaceDb::new(Path::new(&workspace_path))?;
+    let abs = PathBuf::from(&file_absolute_path);
+    let rel = relative_path_under_workspace(&workspace_path, &file_absolute_path)
+        .unwrap_or_else(|| file_absolute_path.replace('\\', "/"));
+    let file_type = abs
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("txt")
+        .to_lowercase();
+
+    record_file_content_timeline_node(
+        &db,
+        Path::new(&workspace_path),
+        &rel,
+        &file_type,
+        "save_file",
+        &format!("保存文件：{}", rel),
+        "user",
+        &before_content,
+        &after_content,
+    )
+}
+
+#[tauri::command]
+pub async fn list_timeline_nodes(
+    workspace_path: String,
+    limit: Option<usize>,
+) -> Result<Vec<TimelineNodeRecord>, String> {
+    let db = WorkspaceDb::new(Path::new(&workspace_path))?;
+    db.list_timeline_nodes(limit.unwrap_or(50))
+}
+
+#[tauri::command]
+pub async fn get_timeline_restore_preview(
+    workspace_path: String,
+    node_id: String,
+) -> Result<TimelineRestorePreview, String> {
+    let db = WorkspaceDb::new(Path::new(&workspace_path))?;
+    let node = db
+        .get_timeline_node(&node_id)?
+        .ok_or_else(|| format!("时间轴节点不存在: {}", node_id))?;
+    let payload = db
+        .get_timeline_restore_payload(&node.restore_payload_id)?
+        .ok_or_else(|| format!("时间轴载荷不存在: {}", node.restore_payload_id))?;
+
+    Ok(TimelineRestorePreview {
+        node,
+        payload_kind: payload.payload_kind,
+    })
+}
+
+#[tauri::command]
+pub async fn restore_timeline_node(
+    workspace_path: String,
+    node_id: String,
+    app: tauri::AppHandle,
+) -> Result<TimelineRestoreResult, String> {
+    let db = WorkspaceDb::new(Path::new(&workspace_path))?;
+    let node = db
+        .get_timeline_node(&node_id)?
+        .ok_or_else(|| format!("时间轴节点不存在: {}", node_id))?;
+    if !node.restorable {
+        return Err("该时间轴节点不可还原".to_string());
+    }
+
+    let payload = db
+        .get_timeline_restore_payload(&node.restore_payload_id)?
+        .ok_or_else(|| format!("时间轴载荷不存在: {}", node.restore_payload_id))?;
+
+    let state_changed = payload_differs_from_current(Path::new(&workspace_path), &node, &payload)?;
+    let impacted_paths = restore_payload(Path::new(&workspace_path), &payload)?;
+    let mut created_node = false;
+
+    if state_changed {
+        let restore_node = TimelineNodeRecord {
+            node_id: uuid::Uuid::new_v4().to_string(),
+            workspace_path: workspace_path.clone(),
+            node_type: "restore_commit".to_string(),
+            operation_type: "restore".to_string(),
+            summary: format!("还原到：{}", node.summary),
+            impact_scope: node.impact_scope.clone(),
+            actor: "system_restore".to_string(),
+            restorable: true,
+            restore_payload_id: uuid::Uuid::new_v4().to_string(),
+            created_at: chrono::Utc::now().timestamp_millis(),
+        };
+        let restore_payload_record = TimelineRestorePayloadRecord {
+            payload_id: restore_node.restore_payload_id.clone(),
+            workspace_path: workspace_path.clone(),
+            payload_kind: payload.payload_kind.clone(),
+            payload_json: payload.payload_json.clone(),
+            created_at: chrono::Utc::now().timestamp_millis(),
+        };
+        db.insert_timeline_node_with_payload(&restore_node, &restore_payload_record, 50)?;
+        created_node = true;
+    }
+
+    let _ = app.emit("file-tree-changed", &workspace_path);
+
+    Ok(TimelineRestoreResult {
+        impacted_paths,
+        created_node,
+    })
+}
+
 /// Phase 5.5：获取工作区内所有文件依赖
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileDependencyDto {
@@ -619,4 +842,104 @@ pub async fn save_file_dependency(
         &dependency_type,
         description.as_deref(),
     )
+}
+
+// ── Agent Tasks / Artifacts 命令 ──
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentTaskDto {
+    pub id: String,
+    pub chat_tab_id: String,
+    pub goal: String,
+    pub lifecycle: String,
+    pub stage: String,
+    pub stage_reason: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentArtifactDto {
+    pub id: String,
+    pub task_id: Option<String>,
+    pub kind: String,
+    pub status: String,
+    pub summary: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[tauri::command]
+pub async fn upsert_agent_task(
+    workspace_path: String,
+    id: String,
+    chat_tab_id: String,
+    goal: String,
+    lifecycle: String,
+    stage: String,
+    stage_reason: Option<String>,
+) -> Result<(), String> {
+    let db = WorkspaceDb::new(Path::new(&workspace_path))?;
+    db.upsert_agent_task(&id, &chat_tab_id, &goal, &lifecycle, &stage, stage_reason.as_deref())
+}
+
+#[tauri::command]
+pub async fn get_agent_tasks_for_chat_tab(
+    workspace_path: String,
+    chat_tab_id: String,
+) -> Result<Vec<AgentTaskDto>, String> {
+    let db = WorkspaceDb::new(Path::new(&workspace_path))?;
+    let rows = db.get_agent_tasks_by_chat_tab(&chat_tab_id)?;
+    Ok(rows.into_iter().map(|r| AgentTaskDto {
+        id: r.id,
+        chat_tab_id: r.chat_tab_id,
+        goal: r.goal,
+        lifecycle: r.lifecycle,
+        stage: r.stage,
+        stage_reason: r.stage_reason,
+        created_at: r.created_at,
+        updated_at: r.updated_at,
+    }).collect())
+}
+
+#[tauri::command]
+pub async fn update_agent_task_stage(
+    workspace_path: String,
+    id: String,
+    stage: String,
+    stage_reason: Option<String>,
+) -> Result<(), String> {
+    let db = WorkspaceDb::new(Path::new(&workspace_path))?;
+    db.update_agent_task_stage(&id, &stage, stage_reason.as_deref())
+}
+
+#[tauri::command]
+pub async fn upsert_agent_artifact(
+    workspace_path: String,
+    id: String,
+    task_id: Option<String>,
+    kind: String,
+    status: String,
+    summary: Option<String>,
+) -> Result<(), String> {
+    let db = WorkspaceDb::new(Path::new(&workspace_path))?;
+    db.upsert_agent_artifact(&id, task_id.as_deref(), &kind, &status, summary.as_deref())
+}
+
+#[tauri::command]
+pub async fn get_agent_artifacts_for_task(
+    workspace_path: String,
+    task_id: String,
+) -> Result<Vec<AgentArtifactDto>, String> {
+    let db = WorkspaceDb::new(Path::new(&workspace_path))?;
+    let rows = db.get_agent_artifacts_by_task(&task_id)?;
+    Ok(rows.into_iter().map(|r| AgentArtifactDto {
+        id: r.id,
+        task_id: r.task_id,
+        kind: r.kind,
+        status: r.status,
+        summary: r.summary,
+        created_at: r.created_at,
+        updated_at: r.updated_at,
+    }).collect())
 }

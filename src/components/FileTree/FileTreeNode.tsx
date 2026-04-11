@@ -13,6 +13,7 @@ interface FileTreeNodeProps {
   onDelete?: (path: string) => void;
   onDuplicate?: (path: string) => void;
   onOrganize?: (path: string) => void;
+  onStoreToKnowledge?: (path: string) => void;
   onMoveFile?: (sourcePath: string, destinationPath: string) => void;
 }
 
@@ -26,6 +27,7 @@ const FileTreeNode: React.FC<FileTreeNodeProps> = ({
   onDelete,
   onDuplicate,
   onOrganize,
+  onStoreToKnowledge,
   onMoveFile,
 }) => {
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
@@ -231,6 +233,7 @@ const FileTreeNode: React.FC<FileTreeNodeProps> = ({
               onDelete={onDelete}
               onDuplicate={onDuplicate}
               onOrganize={onOrganize}
+              onStoreToKnowledge={onStoreToKnowledge}
               onMoveFile={onMoveFile}
             />
           ))}
@@ -238,7 +241,7 @@ const FileTreeNode: React.FC<FileTreeNodeProps> = ({
       )}
       
       {/* 右键菜单 */}
-      {contextMenu && (onRename || onDelete || onDuplicate || onOrganize) && (
+      {contextMenu && (onRename || onDelete || onDuplicate || onOrganize || onStoreToKnowledge) && (
         <FileTreeContextMenu
           x={contextMenu.x}
           y={contextMenu.y}
@@ -248,6 +251,7 @@ const FileTreeNode: React.FC<FileTreeNodeProps> = ({
           onDelete={() => onDelete?.(node.path)}
           onDuplicate={onDuplicate ? () => onDuplicate(node.path) : undefined}
           onOrganize={onOrganize ? () => onOrganize(node.path) : undefined}
+          onStoreToKnowledge={onStoreToKnowledge ? () => onStoreToKnowledge(node.path) : undefined}
           onClose={() => setContextMenu(null)}
         />
       )}
@@ -256,4 +260,3 @@ const FileTreeNode: React.FC<FileTreeNodeProps> = ({
 };
 
 export default FileTreeNode;
-

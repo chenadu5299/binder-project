@@ -28,10 +28,18 @@ export interface ReferenceProtocol {
     type: 'text' | 'file' | 'folder' | 'image' | 'table' | 'memory' | 'link' | 'chat' | 'kb' | 'template';
     source: string;
     content: string;
+    knowledgeBaseId?: string;
+    knowledgeEntryId?: string;
+    knowledgeDocumentId?: string;
+    knowledgeCitationKey?: string;
+    knowledgeRetrievalMode?: 'manual_query' | 'explicit' | 'automatic';
     textReference?: { startBlockId: string; startOffset: number; endBlockId: string; endOffset: number };
     /** 兼容旧后端字段，后续由 textReference 统一替代 */
     editTarget?: { blockId: string; startOffset: number; endOffset: number };
-    templateType?: 'document' | 'workflow' | 'skill';
+    /**
+     * TMP-P0 冻结：模板协议只允许 workflow。
+     */
+    templateType?: 'workflow';
 }
 
 const BIG_FILE_THRESHOLD = 10 * 1024 * 1024; // 10MB
@@ -202,22 +210,35 @@ async function refToProtocol(ref: Reference): Promise<ReferenceProtocol | null> 
 
         case ReferenceType.MEMORY: {
             const r = ref as MemoryReference;
-            let content = '[记忆库功能未实现]';
+            let content = '[记忆内容不可用]';
             if (r.items && r.items.length > 0) {
                 content = r.items
                     .map((item: { content?: string; text?: string }) => item.content ?? item.text ?? '')
                     .filter(Boolean)
                     .join('\n\n');
             } else {
-                // Phase 1.3：无 items 时调用 search_memories 获取 content
+                // 无 items 时优先按真实 memory_id 精确回填，回填失败再走检索兜底
                 try {
                     const { useFileStore } = await import('../stores/fileStore');
                     const workspacePath = useFileStore.getState().currentWorkspace;
                     if (workspacePath) {
                         const { memoryService } = await import('../services/memoryService');
-                        const memories = await memoryService.searchMemories(r.name || r.memoryId, workspacePath);
-                        if (memories.length > 0) {
-                            content = memories.map(m => m.content).filter(Boolean).join('\n\n');
+                        if (r.memoryId) {
+                            const all = await memoryService.getAllMemories(workspacePath);
+                            const exact = all.find((m) => m.id === r.memoryId);
+                            if (exact?.content) {
+                                content = exact.content;
+                            }
+                        }
+                        if (!content || content === '[记忆内容不可用]') {
+                            const resp = await memoryService.searchMemories({
+                                query: r.name || '',
+                                workspacePath,
+                                limit: 5,
+                            });
+                            if (resp.items.length > 0) {
+                                content = resp.items.map(r2 => r2.item.content).filter(Boolean).join('\n\n');
+                            }
                         }
                     }
                 } catch {
@@ -260,10 +281,66 @@ async function refToProtocol(ref: Reference): Promise<ReferenceProtocol | null> 
 
         case ReferenceType.KNOWLEDGE_BASE: {
             const r = ref as KnowledgeBaseReference;
+            if (r.injectionSlices && r.injectionSlices.length > 0) {
+                const firstSlice = r.injectionSlices[0];
+                return {
+                    type: 'kb',
+                    source: r.entryId || r.kbId || r.kbName,
+                    knowledgeBaseId: r.kbId,
+                    knowledgeEntryId: r.entryId,
+                    knowledgeDocumentId: r.documentId || firstSlice?.documentId,
+                    knowledgeCitationKey: r.citation?.citationKey || firstSlice?.citation?.citationKey,
+                    knowledgeRetrievalMode: 'explicit',
+                    content: truncateContent(
+                        r.injectionSlices.map(slice => slice.content).join('\n\n'),
+                        4000
+                    ),
+                };
+            }
+
+            try {
+                const { useFileStore } = await import('../stores/fileStore');
+                const workspacePath = useFileStore.getState().currentWorkspace;
+                if (workspacePath) {
+                    const { knowledgeService } = await import('../services/knowledge/knowledgeService');
+                    const response = await knowledgeService.queryKnowledgeBase(workspacePath, {
+                        knowledgeBaseId: r.kbId || null,
+                        entryId: r.entryId || null,
+                        documentId: r.documentId || null,
+                        query: r.entryId ? (r.query || r.entryTitle || r.kbName) : null,
+                        limit: 5,
+                        intent: r.entryId && r.assetKind !== 'structure_asset' ? 'citation' : 'recall',
+                        queryMode: r.assetKind === 'structure_asset' ? 'structure_reference' : 'content',
+                        assetKindFilter: r.assetKind ?? null,
+                    });
+                    const content = response.injectionSlices.length > 0
+                        ? response.injectionSlices.map(slice => slice.content).join('\n\n')
+                        : response.chunkHits.map(hit => hit.chunk.chunkText).join('\n\n');
+
+                    return {
+                        type: 'kb',
+                        source: r.entryId || r.kbId || r.kbName,
+                        knowledgeBaseId: r.kbId,
+                        knowledgeEntryId: r.entryId,
+                        knowledgeDocumentId: r.documentId || response.injectionSlices[0]?.documentId,
+                        knowledgeCitationKey: r.citation?.citationKey || response.injectionSlices[0]?.citation?.citationKey,
+                        knowledgeRetrievalMode: 'explicit',
+                        content: truncateContent(content || '[知识库未命中结果]', 4000),
+                    };
+                }
+            } catch {
+                // 保持占位
+            }
+
             return {
                 type: 'kb',
-                source: r.kbId || r.kbName,
-                content: '[知识库功能未实现]',
+                source: r.entryId || r.kbId || r.kbName,
+                knowledgeBaseId: r.kbId,
+                knowledgeEntryId: r.entryId,
+                knowledgeDocumentId: r.documentId,
+                knowledgeCitationKey: r.citation?.citationKey,
+                knowledgeRetrievalMode: 'explicit',
+                content: '[知识库内容暂不可用]',
             };
         }
 
@@ -272,8 +349,11 @@ async function refToProtocol(ref: Reference): Promise<ReferenceProtocol | null> 
             return {
                 type: 'template',
                 source: r.templateId || r.templateName,
-                content: '[模板库功能未实现]',
-                templateType: r.templateType,
+                content: truncateContent(
+                    `workflow_template_ref\nname: ${r.templateName}\ntemplate_id: ${r.templateId}\nnote: workflow template refs must be compiled into RuntimeWorkflowPlan before execution.`,
+                    500,
+                ),
+                templateType: 'workflow',
             };
         }
 

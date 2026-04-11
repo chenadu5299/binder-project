@@ -58,7 +58,8 @@ pub async fn execute_tool_with_retry(
         error: last_error,
         message: Some("工具调用失败，已重试多次".to_string()),
         error_kind: None,
-                                display_error: None,
+        display_error: None,
+        meta: None,
     })
 }
 
@@ -70,4 +71,3 @@ fn is_retriable_error(error: &Option<String>) -> bool {
         false
     }
 }
-

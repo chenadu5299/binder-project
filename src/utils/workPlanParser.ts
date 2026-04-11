@@ -1,6 +1,10 @@
 /**
  * 工作计划解析工具（简化版）
  * 从 AI 回复中提取执行计划信息
+ *
+ * Phase 1 起仅作为历史兼容展示解析器存在：
+ * - 可驱动 WorkPlanCard 展示
+ * - 不作为 Agent 正式 plan / task 对象来源
  */
 
 export interface WorkPlan {
@@ -94,4 +98,3 @@ export function parseWorkPlan(content: string): WorkPlan | null {
 export function hasWorkPlan(content: string): boolean {
     return parseWorkPlan(content) !== null;
 }
-

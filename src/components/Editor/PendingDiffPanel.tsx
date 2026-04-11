@@ -8,6 +8,19 @@ import { useDiffStore } from '../../stores/diffStore';
 import { useFileStore } from '../../stores/fileStore';
 import { ChevronDownIcon, ChevronUpIcon, DocumentTextIcon } from '@heroicons/react/24/outline';
 import { toast } from '../Common/Toast';
+import { markAgentStageComplete, markAgentUserConfirmed } from '../../utils/agentShadowLifecycle';
+
+function completeAgentPairs(entries: Array<{ chatTabId?: string; agentTaskId?: string }>, reason: string) {
+  const seen = new Set<string>();
+  for (const entry of entries) {
+    if (!entry.chatTabId || !entry.agentTaskId) continue;
+    const key = `${entry.chatTabId}:${entry.agentTaskId}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    markAgentUserConfirmed(entry.chatTabId, entry.agentTaskId, 'pending_panel_accept_confirmed');
+    markAgentStageComplete(entry.chatTabId, entry.agentTaskId, reason);
+  }
+}
 
 export const PendingDiffPanel: React.FC = () => {
   const { currentWorkspace } = useFileStore();
@@ -29,7 +42,9 @@ export const PendingDiffPanel: React.FC = () => {
     let err = 0;
     for (const [filePath] of pendingFiles) {
       try {
+        const entries = byFilePath[filePath] ?? [];
         await acceptFileDiffs(filePath, currentWorkspace);
+        completeAgentPairs(entries, 'workspace_file_written');
         ok++;
       } catch (e) {
         err++;
@@ -101,7 +116,9 @@ export const PendingDiffPanel: React.FC = () => {
                   <button
                     onClick={async () => {
                       try {
+                        const entries = byFilePath[filePath] ?? [];
                         await acceptFileDiffs(filePath, currentWorkspace);
+                        completeAgentPairs(entries, 'workspace_file_written');
                         toast.success(`已应用 ${fileName} 的修改`);
                       } catch (e) {
                         toast.error(`接受失败: ${e instanceof Error ? e.message : String(e)}`);

@@ -1,4 +1,12 @@
 // 引用类型定义
+import type {
+    KnowledgeAssetKind,
+    KnowledgeCitation,
+    KnowledgeInjectionSlice,
+    KnowledgeSourceRole,
+    KnowledgeQueryMetadata,
+    KnowledgeQueryWarning,
+} from './knowledge';
 
 // 引用类型枚举
 export enum ReferenceType {
@@ -86,7 +94,7 @@ export interface ImageReference extends BaseReference {
 // 记忆库引用
 export interface MemoryReference extends BaseReference {
     type: ReferenceType.MEMORY;
-    memoryId: string;          // 记忆库 ID
+    memoryId: string;          // memory_items.id（后端真实主键，用于 S-01 去重）
     name: string;              // 记忆库名称
     itemCount?: number;        // 记忆项数量
     items?: any[];             // 记忆项列表（可选）
@@ -143,16 +151,30 @@ export interface KnowledgeBaseReference extends BaseReference {
     type: ReferenceType.KNOWLEDGE_BASE;
     kbId: string;              // 知识库 ID
     kbName: string;            // 知识库名称
+    entryId?: string;          // 知识条目 ID（P0）
+    documentId?: string;       // 知识文档 ID（P0）
+    entryTitle?: string;       // 条目标题（P0）
+    assetKind?: KnowledgeAssetKind;
+    sourceRole?: KnowledgeSourceRole;
     query?: string;            // 查询关键词（可选）
     itemCount?: number;        // 匹配项数量
+    preview?: string;          // 预览文本
+    citation?: KnowledgeCitation | null;
+    injectionSlices?: KnowledgeInjectionSlice[];
+    queryMetadata?: KnowledgeQueryMetadata;
+    warnings?: KnowledgeQueryWarning[];
 }
 
-// 模板库引用（Phase 3.2 占位）
+// 模板库引用（workflow-only）
 export interface TemplateReference extends BaseReference {
     type: ReferenceType.TEMPLATE;
     templateId: string;
     templateName: string;
-    templateType?: 'document' | 'workflow' | 'skill';
+    /**
+     * TMP-P0 冻结：模板库当前唯一有效对象类型是工作流模板。
+     * 不允许 document / skill / prompt template 借壳回流。
+     */
+    templateType?: 'workflow';
 }
 
 // 联合类型

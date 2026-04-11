@@ -1,6 +1,7 @@
 import { Extension } from '@tiptap/core';
 import { Plugin, PluginKey } from '@tiptap/pm/state';
 import { EditorView } from '@tiptap/pm/view';
+import { useEditorStore } from '../../../stores/editorStore';
 import { createAnchorFromSelection } from '../../../utils/anchorFromSelection';
 
 interface CopyReferenceExtensionOptions {
@@ -60,9 +61,7 @@ export const CopyReferenceExtension = Extension.create<CopyReferenceExtensionOpt
               // 方法 2：如果函数未提供，尝试从 store 获取（通过 tabId）
               if (!filePath && tabId) {
                 try {
-                  // 动态导入 store（使用 require 在运行时加载，避免循环依赖）
-                  const editorStoreModule = require('../../../stores/editorStore');
-                  const store = editorStoreModule.useEditorStore.getState();
+                  const store = useEditorStore.getState();
                   const tab = store.tabs.find((t: any) => t.id === tabId);
                   if (tab) {
                     filePath = tab.filePath || null;
@@ -120,12 +119,10 @@ export const CopyReferenceExtension = Extension.create<CopyReferenceExtensionOpt
                 },
                 ...(anchor && {
                   blockId: anchor.startBlockId,
+                  startBlockId: anchor.startBlockId,
+                  endBlockId: anchor.endBlockId,
                   startOffset: anchor.startOffset,
                   endOffset: anchor.endOffset,
-                  ...(anchor.startBlockId !== anchor.endBlockId && {
-                    startBlockId: anchor.startBlockId,
-                    endBlockId: anchor.endBlockId,
-                  }),
                 }),
               };
 
@@ -217,4 +214,3 @@ function fallbackCopy(event: ClipboardEvent, text: string, sourceJson: string) {
     }
   }
 }
-

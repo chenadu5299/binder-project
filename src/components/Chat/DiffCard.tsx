@@ -8,9 +8,11 @@ import React, { useState } from 'react';
 import { CheckIcon, XMarkIcon, ChevronDownIcon, ChevronUpIcon } from '@heroicons/react/24/outline';
 import type { DiffEntry } from '../../stores/diffStore';
 import { ExecutionPanel } from '../Debug/ExecutionPanel';
+import { AgentShadowStateSummary } from './AgentShadowStateSummary';
 
 interface DiffCardProps {
   diff: DiffEntry;
+  chatTabId?: string;
   /** 文件绝对路径 */
   filePath: string;
   /** 工作区路径，用于显示相对路径 */
@@ -76,6 +78,7 @@ function getRelativePathDisplay(filePath: string, workspacePath: string | null):
 
 export const DiffCard: React.FC<DiffCardProps> = ({
   diff,
+  chatTabId,
   filePath,
   workspacePath = null,
   lineStart,
@@ -119,6 +122,12 @@ export const DiffCard: React.FC<DiffCardProps> = ({
         全文重写
       </span>
     ) : null;
+
+  const shadowStateBar = chatTabId ? (
+    <div className="px-2 py-1 border-b border-gray-100 dark:border-gray-800">
+      <AgentShadowStateSummary chatTabId={chatTabId} compact />
+    </div>
+  ) : null;
 
   // block_level 副文案（单独一行）
   const blockLevelHint =
@@ -264,6 +273,7 @@ export const DiffCard: React.FC<DiffCardProps> = ({
       >
         {pathBar}
         {sourceHint}
+        {shadowStateBar}
         {titleBar}
         {blockLevelHint}
         {/* 已接受且未展开：不显示 diff 区和操作区 */}

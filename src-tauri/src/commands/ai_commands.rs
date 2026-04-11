@@ -1,29 +1,43 @@
 use crate::services::ai_service::AIService;
 use crate::services::ai_providers::{ChatMessage, ModelConfig, ChatChunk};
+use crate::services::memory_service::{MemoryService, SearchMemoriesParams, MemorySearchScope, format_memory_for_injection};
 use crate::services::document_analysis::{DocumentAnalysisService, AnalysisType};
+use crate::services::knowledge::{KnowledgeInjectionSlice, KnowledgeQueryRequest, KnowledgeService};
 use crate::services::tool_definitions::get_tool_definitions;
 use crate::services::tool_service::{ToolService, ToolCall};
 use crate::services::file_watcher::FileWatcherService;
 use crate::services::conversation_manager::ConversationManager;
 use crate::services::streaming_response_handler::StreamingResponseHandler;
 use crate::services::tool_call_handler::ToolCallHandler;
-use crate::services::context_manager::{ContextManager, ContextInfo, EditorState as ContextEditorState, ReferenceInfo, ReferenceType, TruncationStrategy};
+use crate::services::context_manager::{ContextManager, ContextInfo, EditorState as ContextEditorState, KnowledgeRetrievalContext, ReferenceInfo, ReferenceType, TruncationStrategy};
+use crate::services::template::TemplateService;
 use serde::Deserialize;
-use crate::services::exception_handler::{ExceptionHandler, ConversationError, ErrorContext};
 use crate::services::loop_detector::LoopDetector;
 use crate::services::reply_completeness_checker::ReplyCompletenessChecker;
-use crate::services::confirmation_manager::ConfirmationManager;
 use crate::services::task_progress_analyzer::TaskProgressAnalyzer;
+use crate::services::tool_policy::BuildModePolicy;
 use crate::services::stream_state::{
     begin_next_stream_round, finalize_stream, stream_state_label, StreamContext, StreamState,
 };
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Runtime, State};
 use tokio::sync::oneshot;
+use tokio::time::{timeout, Duration};
 use once_cell::sync::Lazy;
+
+// ============================================================================
+// AI 命令边界说明（Phase 1）
+// - L1：ai_autocomplete
+// - L2：ai_inline_assist
+// - L3：ai_chat_stream
+//
+// 当前阶段继续共用同一命令文件，避免大爆破式重写。
+// 但后续阶段只允许 L3 承接 Agent 主链状态 / verification / confirmation / artifact。
+// L1/L2 保持兼容链，不得反向污染 L3 主链对象。
+// ============================================================================
 
 // 全局取消通道存储：tab_id -> cancel_tx
 static CANCEL_CHANNELS: Lazy<Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>> = 
@@ -62,6 +76,140 @@ fn build_openai_tool_calls_json(specs: &[(String, String, String)]) -> Vec<serde
             })
         })
         .collect()
+}
+
+fn shadow_registry_task_id(tab_id: &str) -> String {
+    format!("shadow-tab:{}", tab_id)
+}
+
+fn persist_artifact_to_db(
+    workspace_path: &std::path::Path,
+    task_id: &str,
+    kind: &str,
+    status: &str,
+    summary: &str,
+) {
+    let artifact_id = format!("{}-{}-{}", kind, task_id, chrono::Utc::now().timestamp_millis());
+    let task_id_owned = task_id.to_string();
+    let ws = workspace_path.to_path_buf();
+    let kind = kind.to_string();
+    let status = status.to_string();
+    let summary = summary.to_string();
+    let artifact_id_clone = artifact_id.clone();
+    tokio::spawn(async move {
+        if let Ok(db) = crate::workspace::workspace_db::WorkspaceDb::new(&ws) {
+            let _ = db.upsert_agent_artifact(
+                &artifact_id_clone,
+                Some(&task_id_owned),
+                &kind,
+                &status,
+                Some(&summary),
+            );
+        }
+    });
+}
+
+fn seed_shadow_artifacts(tab_id: &str, workspace_path: &std::path::Path) {
+    let task_id = shadow_registry_task_id(tab_id);
+    persist_artifact_to_db(workspace_path, &task_id, "verification", "pending", "l3_stream_started");
+    persist_artifact_to_db(workspace_path, &task_id, "confirmation", "pending", "awaiting_candidate_or_review");
+}
+
+fn mark_shadow_candidate_artifacts(tab_id: &str, workspace_path: &std::path::Path) {
+    let task_id = shadow_registry_task_id(tab_id);
+    persist_artifact_to_db(workspace_path, &task_id, "verification", "passed", "candidate_emitted");
+    persist_artifact_to_db(workspace_path, &task_id, "confirmation", "pending", "awaiting_user_review");
+}
+
+/// Phase 6: 将 agent task 的 stage 写入 workspace.db 并向前端发送事件。
+/// 仅在有真实 task_id（非 shadow-tab:* 代理键）时写入 DB。
+fn write_task_stage<R: Runtime>(
+    app: &impl Emitter<R>,
+    task_id: &str,
+    tab_id: &str,
+    stage: &str,
+    stage_reason: &str,
+    workspace_path: &std::path::Path,
+) {
+    // 仅对真实 task_id 写 DB（过滤掉 shadow 代理键）
+    let is_real_task = !task_id.starts_with("shadow-tab:");
+    if is_real_task {
+        let ws = workspace_path.to_path_buf();
+        let tid = task_id.to_string();
+        let s = stage.to_string();
+        let r = stage_reason.to_string();
+        tokio::spawn(async move {
+            if let Ok(db) = crate::workspace::workspace_db::WorkspaceDb::new(&ws) {
+                let _ = db.update_agent_task_stage(&tid, &s, Some(&r));
+            }
+        });
+    }
+    // 发送事件（无论是否真实 task_id，前端都需要感知状态变化）
+    let _ = app.emit("ai-agent-stage-changed", serde_json::json!({
+        "tabId": tab_id,
+        "taskId": task_id,
+        "stage": stage,
+        "stageReason": stage_reason,
+    }));
+}
+
+fn emit_workflow_execution_runtime<R: Runtime>(
+    app: &impl Emitter<R>,
+    tab_id: &str,
+    task_id: &str,
+    runtime: &crate::services::template::WorkflowExecutionRuntime,
+) {
+    let _ = app.emit("ai-workflow-execution-updated", serde_json::json!({
+        "tabId": tab_id,
+        "taskId": task_id,
+        "runtime": runtime,
+    }));
+}
+
+/// Phase 6: 判断工具结果是否产生了候选（优先读 meta，fallback 到数据字段启发式）
+fn tool_results_emit_candidate(
+    tool_results: &[(String, String, crate::services::tool_service::ToolResult)],
+) -> bool {
+    tool_results.iter().any(|(_, name, result)| {
+        if !result.success {
+            return false;
+        }
+        // Phase 6: 优先通过 meta.gate.status 判断
+        if let Some(ref meta) = result.meta {
+            if let Some(ref gate) = meta.gate {
+                if gate.status.as_deref() == Some("candidate_ready") {
+                    return true;
+                }
+                if gate.status.as_deref() == Some("no_op") {
+                    return false;
+                }
+            }
+        }
+        // Fallback: 旧启发式（向后兼容）
+        let Some(data) = result.data.as_ref() else {
+            return false;
+        };
+        if name == "update_file" {
+            return data
+                .get("pending_diffs")
+                .and_then(|v| v.as_array())
+                .map(|arr| !arr.is_empty())
+                .unwrap_or(false);
+        }
+        if name == "edit_current_editor_document" {
+            let has_diff_area = data
+                .get("diff_area_id")
+                .map(|v| !v.is_null())
+                .unwrap_or(false);
+            let has_diffs = data
+                .get("diffs")
+                .and_then(|v| v.as_array())
+                .map(|arr| !arr.is_empty())
+                .unwrap_or(false);
+            return has_diff_area && has_diffs;
+        }
+        false
+    })
 }
 
 /// 单条 `role: "tool"` 消息的 `content`（与原先聚合块中单条工具的格式一致）。
@@ -103,6 +251,22 @@ fn push_chat_message_if_allowed(stream_ctx: &StreamContext, current_messages: &m
         return;
     }
     current_messages.push(msg);
+}
+
+fn is_internal_orchestration_user_message(message: &ChatMessage) -> bool {
+    if message.role != "user" {
+        return false;
+    }
+
+    let content = message.text().trim_start();
+    content.starts_with("[NEXT_ACTION]") || content.starts_with("[TOOL_RESULTS]")
+}
+
+fn find_last_real_user_message<'a>(messages: &'a [ChatMessage]) -> Option<&'a ChatMessage> {
+    messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user" && !is_internal_orchestration_user_message(m))
 }
 
 fn format_single_tool_result_content(
@@ -220,158 +384,6 @@ fn with_execution_observability(
 // 注意：analyze_task_progress 函数已废弃，统一使用 TaskProgressAnalyzer::analyze
 // 这样可以避免重复控制逻辑，确保新的优化能够全面生效
 
-/// 验证和规范化工具调用参数
-fn validate_and_normalize_arguments(tool_name: &str, args: &serde_json::Value) -> serde_json::Value {
-    let mut normalized = args.clone();
-    
-    // 根据工具类型验证必需参数
-    match tool_name {
-        "create_file" | "update_file" => {
-            // 确保 path 和 content 存在且为字符串
-            if let Some(path) = normalized.get("path") {
-                if !path.is_string() {
-                    if let Some(path_str) = path.as_str() {
-                        normalized["path"] = serde_json::json!(path_str);
-                    }
-                }
-            }
-            if let Some(content) = normalized.get("content") {
-                if !content.is_string() {
-                    if let Some(content_str) = content.as_str() {
-                        normalized["content"] = serde_json::json!(content_str);
-                    }
-                }
-            }
-        }
-        "read_file" | "delete_file" | "create_folder" => {
-            if let Some(path) = normalized.get("path") {
-                if !path.is_string() {
-                    if let Some(path_str) = path.as_str() {
-                        normalized["path"] = serde_json::json!(path_str);
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-    
-    normalized
-}
-
-/// 简单的 JSON 修复尝试（后端版本）
-fn repair_json_arguments(broken: &str) -> Result<serde_json::Value, ()> {
-    let mut repaired = broken.trim().to_string();
-    
-    // 确保以 { 开头
-    if !repaired.starts_with('{') {
-        repaired = format!("{{{repaired}");
-    }
-    
-    // 修复键名缺少引号（简单版本，不使用 regex）
-    // 查找 pattern: {key: 或 ,key:
-    let mut chars: Vec<char> = repaired.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        if (chars[i] == '{' || chars[i] == ',') && i + 1 < chars.len() {
-            // 跳过空格
-            let mut j = i + 1;
-            while j < chars.len() && chars[j].is_whitespace() {
-                j += 1;
-            }
-            // 检查是否是键名（字母或下划线开头）
-            if j < chars.len() && (chars[j].is_alphabetic() || chars[j] == '_') {
-                // 查找冒号
-                let mut k = j;
-                while k < chars.len() && chars[k] != ':' && !chars[k].is_whitespace() {
-                    k += 1;
-                }
-                // 如果键名没有引号，添加引号
-                if chars[j] != '"' && k < chars.len() && chars[k] == ':' {
-                    chars.insert(j, '"');
-                    chars.insert(k + 1, '"');
-                    i = k + 2;
-                    continue;
-                }
-            }
-        }
-        i += 1;
-    }
-    repaired = chars.into_iter().collect();
-    
-    // 修复缺失的结束括号
-    if repaired.starts_with('{') && !repaired.ends_with('}') {
-        let open = repaired.matches('{').count();
-        let close = repaired.matches('}').count();
-        let missing = open - close;
-        repaired = repaired.trim_end_matches(',').to_string();
-        for _ in 0..missing {
-            repaired.push('}');
-        }
-    }
-    
-    // ⚠️ 关键修复：处理字符串值中的未转义换行符
-    repaired = repair_json_string_escapes(&repaired);
-    
-    serde_json::from_str(&repaired).map_err(|_| ())
-}
-
-/// 修复 JSON 字符串中的转义问题（处理未转义的换行符等）
-fn repair_json_string_escapes(json: &str) -> String {
-    let mut result = String::new();
-    let mut in_string = false;
-    let mut escaped = false;
-    let mut chars = json.chars().peekable();
-    
-    while let Some(ch) = chars.next() {
-        if escaped {
-            result.push(ch);
-            escaped = false;
-            continue;
-        }
-        
-        if ch == '\\' {
-            result.push(ch);
-            escaped = true;
-            continue;
-        }
-        
-        if ch == '"' {
-            in_string = !in_string;
-            result.push(ch);
-            continue;
-        }
-        
-        if in_string {
-            match ch {
-                '\n' => {
-                    // 在字符串值内部，将未转义的换行符替换为 \n
-                    result.push_str("\\n");
-                }
-                '\r' => {
-                    // 处理 \r\n 或单独的 \r
-                    if chars.peek() == Some(&'\n') {
-                        chars.next(); // 跳过 \n
-                        result.push_str("\\n");
-                    } else {
-                        result.push_str("\\n");
-                    }
-                }
-                '\t' => {
-                    // 将制表符转义
-                    result.push_str("\\t");
-                }
-                _ => {
-                    result.push(ch);
-                }
-            }
-        } else {
-            result.push(ch);
-        }
-    }
-    
-    result
-}
-
 // AI 服务状态（全局单例）
 type AIServiceState = Arc<Mutex<AIService>>;
 
@@ -403,6 +415,9 @@ pub struct DocumentOverview {
     pub next_paragraph: String,
 }
 
+// ============================================================================
+// L1：辅助续写兼容入口
+// ============================================================================
 #[tauri::command]
 pub async fn ai_autocomplete(
     context_before: String,
@@ -493,6 +508,9 @@ pub struct InlineAssistMessage {
     text: String,
 }
 
+// ============================================================================
+// L2：局部修改兼容入口
+// ============================================================================
 #[tauri::command]
 pub async fn ai_inline_assist(
     instruction: String,
@@ -565,12 +583,30 @@ pub struct ReferenceFromFrontend {
     reference_type: String,
     source: String,
     content: String,
+    #[serde(rename = "knowledgeBaseId")]
+    knowledge_base_id: Option<String>,
+    #[serde(rename = "knowledgeEntryId")]
+    knowledge_entry_id: Option<String>,
+    #[serde(rename = "knowledgeDocumentId")]
+    knowledge_document_id: Option<String>,
+    #[serde(rename = "knowledgeCitationKey")]
+    knowledge_citation_key: Option<String>,
+    #[serde(rename = "knowledgeRetrievalMode")]
+    _knowledge_retrieval_mode: Option<String>,
     #[serde(rename = "textReference")]
     text_reference: Option<TextReferenceInfo>,
     #[serde(rename = "editTarget")]
     edit_target: Option<EditTargetInfo>,
     #[serde(rename = "templateType")]
-    _template_type: Option<String>,
+    _template_type: Option<WorkflowTemplateReferenceType>,
+}
+
+/// TMP-P0 冻结：前端模板引用协议只允许 workflow。
+/// 不允许 document / skill / prompt template 借壳回流到执行主链。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WorkflowTemplateReferenceType {
+    Workflow,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -602,6 +638,15 @@ struct ReferenceAnchorSelection {
     end_block_id: String,
     end_offset: usize,
     source: String,
+}
+
+#[derive(Debug, Default, Clone)]
+struct ExplicitKnowledgeSuppression {
+    has_explicit_reference: bool,
+    granular_reference_count: usize,
+    entry_ids: HashSet<String>,
+    document_ids: HashSet<String>,
+    citation_keys: HashSet<String>,
 }
 
 fn normalize_path_for_reference_compare(raw: &str, workspace: &std::path::Path) -> String {
@@ -663,6 +708,44 @@ fn extract_reference_anchor_for_zero_search(
         }
     }
     None
+}
+
+fn extract_explicit_knowledge_suppression(
+    refs: Option<&Vec<ReferenceFromFrontend>>,
+) -> ExplicitKnowledgeSuppression {
+    let Some(refs) = refs else {
+        return ExplicitKnowledgeSuppression::default();
+    };
+
+    let mut suppression = ExplicitKnowledgeSuppression::default();
+    for reference in refs {
+        if reference.reference_type != "kb" {
+            continue;
+        }
+        suppression.has_explicit_reference = true;
+        if let Some(entry_id) = reference.knowledge_entry_id.as_ref().filter(|value| !value.is_empty()) {
+            suppression.granular_reference_count += 1;
+            suppression.entry_ids.insert(entry_id.clone());
+        }
+        if let Some(document_id) = reference
+            .knowledge_document_id
+            .as_ref()
+            .filter(|value| !value.is_empty())
+        {
+            suppression.granular_reference_count += 1;
+            suppression.document_ids.insert(document_id.clone());
+        }
+        if let Some(citation_key) = reference
+            .knowledge_citation_key
+            .as_ref()
+            .filter(|value| !value.is_empty())
+        {
+            suppression.granular_reference_count += 1;
+            suppression.citation_keys.insert(citation_key.clone());
+        }
+    }
+
+    suppression
 }
 
 /// 当用户显式 primary_edit_target（工作区相对路径）与当前编辑器文件不一致时，禁止注入当前编辑器内容，避免改错文件。
@@ -761,7 +844,9 @@ fn frontend_ref_to_reference_info(r: &ReferenceFromFrontend) -> Option<Reference
         "link" => ReferenceType::Link,
         "chat" => ReferenceType::Chat,
         "kb" => ReferenceType::KnowledgeBase,
-        "template" => ReferenceType::Template,
+        // TMP-P3: template 引用不允许直接降级为普通 reference。
+        // 必须先走 RuntimeWorkflowPlan 门禁，再以编译后引用内容重新注入。
+        "template" => return None,
         _ => return None,
     };
     Some(ReferenceInfo {
@@ -771,12 +856,239 @@ fn frontend_ref_to_reference_info(r: &ReferenceFromFrontend) -> Option<Reference
     })
 }
 
+fn extract_template_reference_ids(
+    refs: Option<&Vec<ReferenceFromFrontend>>,
+) -> Vec<String> {
+    refs.map(|items| {
+        items
+            .iter()
+            .filter(|item| item.reference_type == "template")
+            .map(|item| item.source.clone())
+            .filter(|item| !item.trim().is_empty())
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn build_runtime_execution_reference_content(
+    template_id: &str,
+    runtime: &crate::services::template::WorkflowExecutionRuntime,
+) -> String {
+    let plan = &runtime.runtime_plan;
+    let mut lines = vec![
+        "[Compiled Workflow Execution Contract]".to_string(),
+        format!("template_id: {}", template_id),
+        format!("task_id: {}", plan.task_id),
+        format!("execution_stage: {:?}", runtime.execution_state.stage).to_lowercase(),
+        format!("waiting_for_user: {}", runtime.execution_state.waiting_for_user),
+        format!("total_steps: {}", plan.total_steps),
+        format!("current_step_index: {}", plan.current_step_index),
+    ];
+
+    if let Some(current_step) = plan.steps.get(plan.current_step_index) {
+        lines.push(format!("current_phase: {}", current_step.phase_name));
+        lines.push(format!("current_step: {}", current_step.name));
+        lines.push(format!(
+            "current_step_input: {}",
+            if current_step.input.is_empty() {
+                "-".to_string()
+            } else {
+                current_step.input.join(", ")
+            }
+        ));
+        lines.push(format!(
+            "current_step_output: {}",
+            if current_step.output.is_empty() {
+                "-".to_string()
+            } else {
+                current_step.output.join(", ")
+            }
+        ));
+        lines.push(format!(
+            "current_step_constraint: {}",
+            if current_step.constraint.is_empty() {
+                "-".to_string()
+            } else {
+                current_step.constraint.join(", ")
+            }
+        ));
+    }
+
+    if let Some(next_step) = plan.steps.get(plan.current_step_index + 1) {
+        lines.push(format!("next_step: {}", next_step.name));
+        lines.push(format!("next_phase: {}", next_step.phase_name));
+    } else {
+        lines.push("next_step: workflow_complete_after_current_step".to_string());
+    }
+
+    let completed = runtime
+        .step_states
+        .iter()
+        .filter(|item| matches!(item.status, crate::services::template::types::StepExecutionStatus::Completed))
+        .count();
+    lines.push(format!("completed_steps: {}", completed));
+
+    if !runtime.runtime_diagnostics.is_empty() {
+        lines.push("runtime_diagnostics:".to_string());
+        for diagnostic in &runtime.runtime_diagnostics {
+            lines.push(format!(
+                "- [{}] {} | phase={} | step={} | message={}",
+                match diagnostic.kind {
+                    crate::services::template::types::WorkflowDiagnosticKind::Fatal => "fatal",
+                    crate::services::template::types::WorkflowDiagnosticKind::Recoverable => "recoverable",
+                    crate::services::template::types::WorkflowDiagnosticKind::Runtime => "runtime",
+                },
+                diagnostic.code,
+                diagnostic.phase_name.as_deref().unwrap_or("-"),
+                diagnostic.step_name.as_deref().unwrap_or("-"),
+                diagnostic.message
+            ));
+        }
+    }
+
+    lines.push("steps:".to_string());
+    for step in &plan.steps {
+        lines.push(format!(
+            "{}. [{}] {} | input: {} | output: {} | constraint: {}",
+            step.step_index + 1,
+            step.phase_name,
+            step.name,
+            if step.input.is_empty() { "-".to_string() } else { step.input.join(", ") },
+            if step.output.is_empty() { "-".to_string() } else { step.output.join(", ") },
+            if step.constraint.is_empty() { "-".to_string() } else { step.constraint.join(", ") },
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn build_build_mode_workflow_constraint_content(
+    template_id: &str,
+    runtime: &crate::services::template::WorkflowExecutionRuntime,
+) -> String {
+    let current_step = runtime
+        .runtime_plan
+        .steps
+        .get(runtime.execution_state.current_step_index);
+    let mut lines = vec![
+        "[Build Mode Workflow Constraint]".to_string(),
+        format!("template_id: {}", template_id),
+        format!("task_id: {}", runtime.context.task_id),
+    ];
+    if let Some(step) = current_step {
+        lines.push(format!("build_mode_current_phase: {}", step.phase_name));
+        lines.push(format!("build_mode_current_step: {}", step.name));
+        lines.push(format!(
+            "build_mode_current_constraint: {}",
+            if step.constraint.is_empty() {
+                "-".to_string()
+            } else {
+                step.constraint.join(", ")
+            }
+        ));
+    }
+    lines.push(
+        "build_mode_rule: consume this workflow payload only as process constraint input; do not treat it as an executable script."
+            .to_string(),
+    );
+    lines.join("\n")
+}
+
+fn maybe_sync_workflow_execution_from_tool_result<R: Runtime>(
+    app: &impl Emitter<R>,
+    tab_id: &str,
+    task_id: &str,
+    workspace_path: &std::path::Path,
+    tool_name: &str,
+    tool_result: &crate::services::tool_service::ToolResult,
+) {
+    if task_id.starts_with("shadow-tab:") {
+        return;
+    }
+
+    let service = TemplateService::new();
+    if service
+        .get_workflow_execution_runtime(workspace_path, task_id)
+        .is_err()
+    {
+        return;
+    }
+
+    let detail = if tool_result.success {
+        tool_result
+            .message
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+    } else {
+        tool_result
+            .display_error
+            .as_deref()
+            .or(tool_result.error.as_deref())
+            .filter(|value| !value.trim().is_empty())
+    };
+
+    match service.apply_tool_execution_feedback(
+        workspace_path,
+        task_id,
+        tool_name,
+        tool_result.success,
+        detail,
+    ) {
+        Ok(runtime) => emit_workflow_execution_runtime(app, tab_id, task_id, &runtime),
+        Err(error) => {
+            eprintln!(
+                "⚠️ workflow execution feedback sync failed: task_id={} tool={} error={}",
+                task_id, tool_name, error
+            );
+        }
+    }
+}
+
+fn maybe_build_build_mode_workflow_constraint(
+    workspace_path: &std::path::Path,
+    task_id: &str,
+) -> Option<String> {
+    if task_id.starts_with("shadow-tab:") {
+        return None;
+    }
+    let service = TemplateService::new();
+    let runtime = service
+        .get_workflow_execution_runtime(workspace_path, task_id)
+        .ok()?;
+    Some(build_build_mode_workflow_constraint_content(
+        &runtime.context.template_id,
+        &runtime,
+    ))
+}
+
+fn maybe_build_runtime_execution_directive(
+    workspace_path: &std::path::Path,
+    task_id: &str,
+) -> Option<String> {
+    if task_id.starts_with("shadow-tab:") {
+        return None;
+    }
+    let service = TemplateService::new();
+    let runtime = service
+        .get_workflow_execution_runtime(workspace_path, task_id)
+        .ok()?;
+    Some(build_runtime_execution_reference_content(
+        &runtime.context.template_id,
+        &runtime,
+    ))
+}
+
+// ============================================================================
+// L3：Binder Agent 主链入口
+// Phase 1 起，后续状态 / verification / confirmation / artifact 只允许从这里进入主链。
+// ============================================================================
 #[tauri::command]
 pub async fn ai_chat_stream(
     tab_id: String, // 注意：前端发送的是 tabId (camelCase)，Tauri 会自动转换为 tab_id (snake_case)
     messages: Vec<ChatMessage>,
     model_config: ModelConfig,
     enable_tools: Option<bool>, // 是否启用工具调用（Agent 模式为 true，Chat 模式为 false）
+    workspace_path: Option<String>, // 绑定工作区路径（优先于 watcher 全局路径）
     current_file: Option<String>, // 当前打开的文档路径（第二层上下文）
     selected_text: Option<String>, // 当前选中的文本（第二层上下文）
     current_editor_content: Option<String>, // 当前编辑器内容（用于文档编辑功能）
@@ -794,6 +1106,8 @@ pub async fn ai_chat_stream(
     // §7.1：光标所在块（无选区场景）
     cursor_block_id: Option<String>,
     cursor_offset: Option<usize>,
+    // Phase 6: 前端 shadow task ID，用于 stage 写入与事件推送
+    agent_task_id: Option<String>,
     app: tauri::AppHandle,
     service: State<'_, AIServiceState>,
     watcher: State<'_, Mutex<FileWatcherService>>,
@@ -862,8 +1176,10 @@ pub async fn ai_chat_stream(
         None
     };
     
-    // 获取工作区路径（优先从文件监听器获取，否则使用当前目录）
-    let workspace_path: PathBuf = {
+    // 获取工作区路径（优先使用前端 tab 绑定路径，避免跨工作区污染）
+    let workspace_path: PathBuf = if let Some(ws) = workspace_path.filter(|w| !w.trim().is_empty()) {
+        PathBuf::from(ws)
+    } else {
         let watcher_guard = watcher.lock().unwrap();
         watcher_guard.get_workspace_path()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
@@ -880,6 +1196,46 @@ pub async fn ai_chat_stream(
     } else {
         Vec::new()
     };
+    let mut active_workflow_template_task: Option<(String, String)> = None;
+
+    let template_reference_ids = extract_template_reference_ids(references.as_ref());
+    if !template_reference_ids.is_empty() {
+        if template_reference_ids.len() > 1 {
+            return Err("当前阶段仅支持单个工作流模板引用进入执行链".to_string());
+        }
+
+        let task_id = agent_task_id
+            .clone()
+            .ok_or_else(|| "模板任务缺少 agent_task_id，不能绕过 RuntimeWorkflowPlan 直接执行".to_string())?;
+        let template_id = template_reference_ids[0].clone();
+        let template_service = TemplateService::new();
+        let _runtime_plan = template_service
+            .create_runtime_workflow_plan(&workspace_path, &template_id, &task_id)?;
+        let workflow_runtime = template_service
+            .get_workflow_execution_runtime(&workspace_path, &task_id)?;
+        write_task_stage(
+            &app,
+            &task_id,
+            &tab_id,
+            "structured",
+            "runtime_workflow_plan_bound",
+            &workspace_path,
+        );
+        persist_artifact_to_db(
+            &workspace_path,
+            &task_id,
+            "plan",
+            "active",
+            &format!("workflow_template_bound:{}:step_1_ready", template_id),
+        );
+        emit_workflow_execution_runtime(
+            &app,
+            &tab_id,
+            &task_id,
+            &workflow_runtime,
+        );
+        active_workflow_template_task = Some((template_id.clone(), task_id.clone()));
+    }
     
     // 若前端 references 为空，仅将 current_file 作为引用；若非空，补充 current_file（不重复）
     if let Some(current_file_path) = &current_file {
@@ -973,6 +1329,368 @@ pub async fn ai_chat_stream(
     let cursor_block_id_for_spawn = cursor_block_id.clone();
     let cursor_offset_for_spawn = cursor_offset;
 
+    // 读取当前 chat tab 的 agent task 状态摘要
+    let (agent_task_summary, agent_artifacts_summary): (Option<String>, Option<String>) = {
+        let db_opt = crate::workspace::workspace_db::WorkspaceDb::new(&workspace_path).ok();
+        let tasks = db_opt.as_ref()
+            .and_then(|db| db.get_agent_tasks_by_chat_tab(&tab_id).ok())
+            .unwrap_or_default();
+
+        let task_summary = if tasks.is_empty() {
+            None
+        } else {
+            let lines: Vec<String> = tasks.iter().take(3).map(|t| {
+                format!(
+                    "- Task [{}]: goal=\"{}\", lifecycle={}, stage={}, reason={}",
+                    &t.id[..8.min(t.id.len())],
+                    t.goal.chars().take(80).collect::<String>(),
+                    t.lifecycle,
+                    t.stage,
+                    t.stage_reason.as_deref().unwrap_or("none"),
+                )
+            }).collect();
+            Some(lines.join("\n"))
+        };
+
+        // Phase 7: 读取最近活跃任务的 artifacts 摘要
+        let artifacts_summary = tasks.first()
+            .and_then(|active_task| {
+                db_opt.as_ref()?.get_agent_artifacts_by_task(&active_task.id).ok()
+            })
+            .and_then(|artifacts| {
+                if artifacts.is_empty() {
+                    return None;
+                }
+                let lines: Vec<String> = artifacts.iter().take(5).map(|a| {
+                    format!(
+                        "- [{}] kind={} status={} summary={}",
+                        &a.id[..8.min(a.id.len())],
+                        a.kind,
+                        a.status,
+                        a.summary.as_deref().unwrap_or("—"),
+                    )
+                }).collect();
+                Some(lines.join("\n"))
+            });
+
+        (task_summary, artifacts_summary)
+    };
+
+    // ── L6 augmentation：记忆库检索（gating + search + format）──────────────
+    let last_user_message = messages.iter().rev()
+        .find(|m| m.role == "user")
+        .and_then(|m| m.content.clone())
+        .unwrap_or_default();
+
+    // ExtractionConfig: load once for this request (reads env vars)
+    let extraction_cfg = crate::services::memory_service::ExtractionConfig::load();
+
+    // S-01: collect memory IDs already explicitly @-referenced by user (to deduplicate auto-injection)
+    let explicitly_referenced_memory_ids: std::collections::HashSet<String> = final_references
+        .iter()
+        .filter(|r| matches!(r.ref_type, ReferenceType::Memory))
+        .map(|r| r.source.clone())
+        .collect();
+
+    let memory_context: Option<String> = if extraction_cfg.enabled && extraction_cfg.inject_enabled && last_user_message.chars().count() >= 5 {
+        let ws_str = workspace_path.to_string_lossy().to_string();
+        match MemoryService::new(&workspace_path) {
+            Ok(svc) => {
+                let params = SearchMemoriesParams {
+                    query: build_memory_query(&last_user_message, current_file.as_deref(), selected_text.as_deref()),
+                    tab_id: Some(tab_id.clone()),
+                    workspace_path: Some(ws_str),
+                    scope: MemorySearchScope::All,
+                    limit: Some(10),
+                    entity_types: None,
+                };
+                match svc.search_memories(params).await {
+                    Ok(resp) if !resp.items.is_empty() => {
+                        // S-01: exclude items already in user's explicit @-references
+                        let items_to_inject: Vec<_> = resp.items.iter()
+                            .filter(|r| !explicitly_referenced_memory_ids.contains(&r.item.id))
+                            .cloned()
+                            .collect();
+                        if items_to_inject.is_empty() {
+                            eprintln!("[memory] S-01: all items already explicitly referenced, skipping injection");
+                            // still log usage for all retrieved items
+                            let ids: Vec<String> = resp.items.iter().map(|r| r.item.id.clone()).collect();
+                            let tab_id_log = tab_id.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = svc.record_memory_usage(&ids, &tab_id_log).await {
+                                    eprintln!("[memory] usage log failed: {:?}", e);
+                                }
+                            });
+                            None
+                        } else {
+                        let formatted = format_memory_for_injection(&items_to_inject);
+                        eprintln!("[memory] MEMORY_INJECT_SUCCESS: injecting {} items (of {} retrieved)", items_to_inject.len(), resp.items.len());
+                        // fire-and-forget usage log for all retrieved items
+                        let ids: Vec<String> = resp.items.iter().map(|r| r.item.id.clone()).collect();
+                        let tab_id_log = tab_id.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = svc.record_memory_usage(&ids, &tab_id_log).await {
+                                eprintln!("[memory] usage log failed: {:?}", e);
+                            }
+                        });
+                        Some(formatted)
+                        } // end S-01 else
+                    }
+                    Ok(_) => None,
+                    Err(e) => {
+                        eprintln!("[memory] inject fallback: {:?}", e);
+                        None
+                    }
+                }
+            }
+            Err(_) => None, // workspace.db 不存在时静默降级
+        }
+    } else {
+        // memory search skipped: msg too short
+        None
+    };
+
+    let explicit_knowledge_suppression = extract_explicit_knowledge_suppression(references.as_ref());
+
+    let knowledge_probe_context = ContextInfo {
+        current_file: current_file.clone(),
+        selected_text: selected_text.clone(),
+        workspace_path: workspace_path.clone(),
+        editor_state: ContextEditorState {
+            is_editable: true,
+            file_type: current_file.as_ref().and_then(|f| {
+                std::path::Path::new(f).extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|s| s.to_string())
+            }),
+            file_size: None,
+            is_saved: true,
+        },
+        references: final_references.clone(),
+        current_content: current_editor_content.clone(),
+        edit_target_present: selection_start_block_id_for_spawn.is_some(),
+        selection_start_block_id: selection_start_block_id.clone(),
+        selection_start_offset,
+        selection_end_block_id: selection_end_block_id.clone(),
+        selection_end_offset,
+        cursor_block_id: cursor_block_id.clone(),
+        cursor_offset,
+        baseline_id: baseline_id.clone(),
+        document_revision,
+        user_message: last_user_message.clone(),
+        agent_task_summary: agent_task_summary.clone(),
+        agent_artifacts_summary: agent_artifacts_summary.clone(),
+        memory_context: memory_context.clone(),
+        knowledge_injection_slices: Vec::new(),
+    };
+
+    let knowledge_policy_summary = match tokio::task::spawn_blocking({
+        let workspace_for_policy = workspace_path.clone();
+        move || -> Result<crate::services::knowledge::repository::AutomaticRetrievalPolicySummary, String> {
+            let service = KnowledgeService::new(&workspace_for_policy)?;
+            service
+                .automatic_retrieval_policy_summary()
+                .map_err(|error| error.to_string())
+        }
+    })
+    .await
+    {
+        Ok(Ok(summary)) => summary,
+        Ok(Err(error)) => {
+            eprintln!("[knowledge] retrieval policy summary failed: {}", error);
+            crate::services::knowledge::repository::AutomaticRetrievalPolicySummary {
+                active_entry_count: 0,
+                policy_allowed_entry_count: 1,
+                automatic_entry_count: 1,
+            }
+        }
+        Err(join_error) => {
+            eprintln!("[knowledge] retrieval policy summary join failed: {}", join_error);
+            crate::services::knowledge::repository::AutomaticRetrievalPolicySummary {
+                active_entry_count: 0,
+                policy_allowed_entry_count: 1,
+                automatic_entry_count: 1,
+            }
+        }
+    };
+
+    let knowledge_retrieval_context = KnowledgeRetrievalContext {
+        explicit_reference_count: usize::from(explicit_knowledge_suppression.has_explicit_reference),
+        granular_explicit_reference_count: explicit_knowledge_suppression.granular_reference_count,
+        automatic_candidate_count: knowledge_policy_summary.automatic_entry_count,
+        automatic_policy_blocked: knowledge_policy_summary.active_entry_count > 0
+            && knowledge_policy_summary.policy_allowed_entry_count == 0,
+    };
+
+    let knowledge_decision = context_manager.should_trigger_knowledge_retrieval(
+        &knowledge_probe_context,
+        &knowledge_retrieval_context,
+    );
+    eprintln!(
+        "[knowledge] retrieval decision: should_trigger={} reason={:?} explicit_refs={} granular_refs={} auto_candidates={} policy_blocked={}",
+        knowledge_decision.should_trigger,
+        knowledge_decision.reason,
+        knowledge_retrieval_context.explicit_reference_count,
+        knowledge_retrieval_context.granular_explicit_reference_count,
+        knowledge_retrieval_context.automatic_candidate_count,
+        knowledge_retrieval_context.automatic_policy_blocked
+    );
+
+    let mut knowledge_slices_for_event: Vec<KnowledgeInjectionSlice> = Vec::new();
+    let mut knowledge_warnings_for_event: Vec<crate::services::knowledge::KnowledgeQueryWarning> =
+        Vec::new();
+    let mut knowledge_metadata_for_event: Option<
+        crate::services::knowledge::KnowledgeQueryMetadata,
+    > = None;
+
+    let knowledge_injection_slices: Vec<KnowledgeInjectionSlice> = if knowledge_decision.should_trigger {
+        let workspace_for_query = workspace_path.clone();
+        let current_file_for_query = current_file.clone();
+        let selected_text_for_query = selected_text.clone();
+        let explicit_suppression = explicit_knowledge_suppression.clone();
+        let knowledge_query = build_knowledge_query(
+            &last_user_message,
+            current_file_for_query.as_deref(),
+            selected_text_for_query.as_deref(),
+        );
+
+        match timeout(
+            Duration::from_millis(1500),
+            tokio::task::spawn_blocking(move || -> Result<crate::services::knowledge::KnowledgeQueryResponse, String> {
+                let service = KnowledgeService::new(&workspace_for_query)?;
+                service
+                    .query_knowledge_base(KnowledgeQueryRequest {
+                        query: Some(knowledge_query),
+                        limit: Some(8),
+                        intent: Some(crate::services::knowledge::KnowledgeQueryIntent::Augmentation),
+                        query_mode: Some(crate::services::knowledge::KnowledgeQueryMode::Content),
+                        asset_kind_filter: Some(
+                            crate::services::knowledge::KnowledgeAssetKindFilter::Standard,
+                        ),
+                        retrieval_strategy: Some(
+                            crate::services::knowledge::KnowledgeRetrievalStrategy::HybridWithRerank,
+                        ),
+                        ..Default::default()
+                    })
+                    .map_err(|e| e.to_string())
+            }),
+        )
+        .await
+        {
+            Ok(Ok(Ok(mut response))) => {
+                for slice in &mut response.injection_slices {
+                    slice.retrieval_mode = "automatic".to_string();
+                    if !slice.risk_flags.iter().any(|flag| flag == "automatic_retrieval") {
+                        slice.risk_flags.push("automatic_retrieval".to_string());
+                    }
+                }
+
+                let mut deduped = KnowledgeService::dedupe_automatic_slices(
+                    response.injection_slices.clone(),
+                    &explicit_suppression.entry_ids,
+                    &explicit_suppression.document_ids,
+                    &explicit_suppression.citation_keys,
+                );
+                deduped.truncate(3);
+                knowledge_warnings_for_event = response.warnings.clone();
+                knowledge_metadata_for_event = Some(response.metadata.clone());
+                knowledge_slices_for_event = deduped.clone();
+
+                if !deduped.is_empty() {
+                    eprintln!("[knowledge] auto retrieval injected {} slices", deduped.len());
+                    deduped
+                } else {
+                    if knowledge_warnings_for_event.is_empty() {
+                        knowledge_warnings_for_event.push(crate::services::knowledge::KnowledgeQueryWarning {
+                            code: "automatic_empty".to_string(),
+                            message: "自动检索未返回可注入的知识片段".to_string(),
+                        });
+                    }
+                    eprintln!("[knowledge] auto retrieval returned no usable slices");
+                    Vec::new()
+                }
+            }
+            Ok(Ok(Err(error))) => {
+                knowledge_warnings_for_event.push(crate::services::knowledge::KnowledgeQueryWarning {
+                    code: "automatic_failed".to_string(),
+                    message: error.clone(),
+                });
+                eprintln!("[knowledge] auto retrieval failed: {}", error);
+                Vec::new()
+            }
+            Ok(Err(join_error)) => {
+                knowledge_warnings_for_event.push(crate::services::knowledge::KnowledgeQueryWarning {
+                    code: "automatic_join_failed".to_string(),
+                    message: join_error.to_string(),
+                });
+                eprintln!("[knowledge] auto retrieval join failed: {}", join_error);
+                Vec::new()
+            }
+            Err(_) => {
+                knowledge_warnings_for_event.push(crate::services::knowledge::KnowledgeQueryWarning {
+                    code: "automatic_timeout".to_string(),
+                    message: "自动检索超时，已降级为无 augmentation".to_string(),
+                });
+                eprintln!("[knowledge] auto retrieval timeout -> degrade to no augmentation");
+                Vec::new()
+            }
+        }
+    } else {
+        knowledge_warnings_for_event.push(crate::services::knowledge::KnowledgeQueryWarning {
+            code: "automatic_skipped".to_string(),
+            message: format!(
+                "自动检索未触发: {:?}",
+                knowledge_decision.reason
+            ),
+        });
+        Vec::new()
+    };
+
+    if let Some((template_id, task_id)) = active_workflow_template_task.as_ref() {
+        let template_service = TemplateService::new();
+        let runtime = template_service.evaluate_runtime_step_readiness(
+            &workspace_path,
+            task_id,
+            &last_user_message,
+            current_file.as_deref(),
+            selected_text.as_deref(),
+            current_editor_content
+                .as_ref()
+                .map(|content| !content.trim().is_empty())
+                .unwrap_or(false),
+            final_references.len(),
+            knowledge_injection_slices.len(),
+        )?;
+        let persisted_runtime_plan =
+            template_service.get_runtime_workflow_plan(&workspace_path, task_id)?;
+        emit_workflow_execution_runtime(&app, &tab_id, task_id, &runtime);
+        final_references.push(ReferenceInfo {
+            ref_type: ReferenceType::Template,
+            source: format!("workflow_template:{}#runtime_plan", template_id),
+            content: build_runtime_execution_reference_content(
+                template_id,
+                &crate::services::template::WorkflowExecutionRuntime {
+                    runtime_plan: persisted_runtime_plan,
+                    ..runtime.clone()
+                },
+            ),
+        });
+    }
+
+    let knowledge_event_payload = serde_json::json!({
+        "tab_id": tab_id.clone(),
+        "chunk": "",
+        "done": false,
+        "knowledge_retrieval": {
+            "triggered": knowledge_decision.should_trigger,
+            "decision_reason": format!("{:?}", knowledge_decision.reason),
+            "injection_slices": knowledge_slices_for_event,
+            "warnings": knowledge_warnings_for_event,
+            "metadata": knowledge_metadata_for_event,
+        }
+    });
+    let _ = app.emit("ai-chat-stream", knowledge_event_payload);
+
     // 构建上下文信息
     let context_info = ContextInfo {
         current_file: current_file.clone(),
@@ -1003,10 +1721,15 @@ pub async fn ai_chat_stream(
             .find(|m| m.role == "user")
             .map(|m| m.content.clone().unwrap_or_default())
             .unwrap_or_default(),
+        agent_task_summary,
+        agent_artifacts_summary,
+        memory_context,
+        knowledge_injection_slices,
     };
-    
-    // 使用 build_multi_layer_prompt() 统一构建所有层（第一、二、三层）
-    let system_prompt = context_manager.build_multi_layer_prompt(&context_info, enable_tools);
+
+    // Phase 3: 通过 build_prompt_package 七层结构装配 prompt
+    let prompt_package = context_manager.build_prompt_package(&context_info, enable_tools);
+    let system_prompt = prompt_package.rendered_prompt.unwrap_or_default();
     
     // 构建增强的消息列表
     let mut enhanced_messages = messages.clone();
@@ -1061,6 +1784,11 @@ pub async fn ai_chat_stream(
             // cancel_flag 已经在上面注册到 CANCEL_FLAGS 中，这里直接使用
             let cancel_flag_clone = cancel_flag.clone();
             let cancel_flag_for_stream = cancel_flag.clone();
+            // Phase 6: 捕获真实 task ID（优先使用前端传入的，fallback 到 shadow 代理键）
+            let effective_task_id = agent_task_id
+                .clone()
+                .unwrap_or_else(|| shadow_registry_task_id(&tab_id));
+            let effective_task_id_clone = effective_task_id.clone();
             
             // 创建一个任务来监听取消信号
             let tab_id_for_cancel = tab_id.clone();
@@ -1086,15 +1814,17 @@ pub async fn ai_chat_stream(
                 let mut conversation_manager = ConversationManager::new();
                 let mut streaming_handler = StreamingResponseHandler::new();
                 let tool_call_handler = ToolCallHandler::new();
-                let exception_handler = ExceptionHandler::new();
                 let mut loop_detector = LoopDetector::new();
                 let reply_checker = ReplyCompletenessChecker::new();
-                let confirmation_manager = ConfirmationManager::new();
-                let task_analyzer = TaskProgressAnalyzer;
                 
+                // Phase 6: 在 spawn 内接收 effective_task_id
+                let effective_task_id = effective_task_id_clone;
                 // 初始化对话状态
                 let message_id = format!("msg_{}", chrono::Utc::now().timestamp_millis());
                 conversation_manager.start_conversation(&tab_id, message_id.clone());
+                seed_shadow_artifacts(&tab_id, &workspace_path);
+                // Phase 6: 跟踪本轮是否已产生候选，用于 review_ready 判断
+                let mut candidate_emitted_this_session = false;
                 
                 // ⚠️ 关键修复：清空流式响应处理器的累积文本，避免新对话时使用旧的累积文本
                 streaming_handler.clear_accumulated(&tab_id);
@@ -1350,6 +2080,14 @@ pub async fn ai_chat_stream(
                                         &name,
                                         Some(&parsed_args_for_result),
                                         skip_continue,
+                                    );
+                                    maybe_sync_workflow_execution_from_tool_result(
+                                        &app_handle,
+                                        &tab_id,
+                                        &effective_task_id,
+                                        &workspace_path,
+                                        &name,
+                                        &tool_result,
                                     );
                                     
                                     // ⚠️ 关键修复：在工具调用执行后检查取消标志
@@ -1714,7 +2452,8 @@ pub async fn ai_chat_stream(
                                             error: Some(format!("执行失败（已重试 {} 次）: {}", max_retries, error_msg)),
                                             message: None,
                                             error_kind: None,
-                                display_error: None,
+                                            display_error: None,
+                                            meta: None,
                                         }
                                     }
                                 };
@@ -1724,6 +2463,14 @@ pub async fn ai_chat_stream(
                                     &name,
                                     Some(&parsed_args_for_result),
                                     skip_continue,
+                                );
+                                maybe_sync_workflow_execution_from_tool_result(
+                                    &app_handle,
+                                    &tab_id,
+                                    &effective_task_id,
+                                    &workspace_path,
+                                    &name,
+                                    &tool_result,
                                 );
                                 
                                 if tool_result.success {
@@ -1810,6 +2557,12 @@ pub async fn ai_chat_stream(
                 // 如果有工具调用，需要继续对话
                 if has_tool_calls && !tool_results.is_empty() {
                     eprintln!("🔄 检测到工具调用，准备继续对话: 工具调用数量={}", tool_results.len());
+                    if tool_results_emit_candidate(&tool_results) {
+                        mark_shadow_candidate_artifacts(&tab_id, &workspace_path);
+                        // Phase 6: 写 candidate_ready 阶段
+                        write_task_stage(&app_handle, &effective_task_id, &tab_id, "candidate_ready", "tool_candidate_emitted", &workspace_path);
+                        candidate_emitted_this_session = true;
+                    }
                     
                     // 将 assistant 的回复（含 tool_calls）写入历史；工具执行结果见后续 role=tool 消息（OpenAI 兼容）
                     let accumulated_text = streaming_handler.get_accumulated(&tab_id);
@@ -1838,17 +2591,25 @@ pub async fn ai_chat_stream(
                     let task_progress_info = TaskProgressAnalyzer::analyze(&tool_results);
                     let task_progress = task_progress_info.progress_hint.clone();
                     
-                    // 检查任务是否完成（使用结构化的字段）
-                    let task_incomplete = task_progress_info.is_incomplete;
-                    let task_completed = task_progress_info.is_completed;
+                    // Phase 8: 用 BuildModePolicy 统一控制 TPA force-continue
+                    let is_doc_edit_task = task_progress_info.task_type == crate::services::task_progress_analyzer::TaskType::DocumentEdit
+                        || task_progress_info.task_type == crate::services::task_progress_analyzer::TaskType::MultiDocumentEdit;
+                    let build_mode_policy = if is_doc_edit_task {
+                        BuildModePolicy::default_writing()
+                    } else if task_progress_info.task_type == crate::services::task_progress_analyzer::TaskType::RecursiveCheck
+                        || task_progress_info.task_type == crate::services::task_progress_analyzer::TaskType::FileMove
+                    {
+                        BuildModePolicy::build_mode()
+                    } else {
+                        BuildModePolicy::default_writing()
+                    };
+
+                    let task_incomplete = if build_mode_policy.allows_tpa_force_continue() { task_progress_info.is_incomplete } else { false };
+                    let task_completed = if build_mode_policy.allows_tpa_force_continue() { task_progress_info.is_completed } else { false };
                     
                     // 检查是否是"检查所有文件夹"任务未完成
                     let check_folders_incomplete = task_progress_info.task_type == crate::services::task_progress_analyzer::TaskType::RecursiveCheck && task_progress_info.is_incomplete;
                     
-                    // 添加工具调用结果到消息历史
-                    // 格式：清晰简洁，直接提供结果数据，明确指导 AI 继续执行
-                    let is_doc_edit_task = task_progress_info.task_type == crate::services::task_progress_analyzer::TaskType::DocumentEdit
-                        || task_progress_info.task_type == crate::services::task_progress_analyzer::TaskType::MultiDocumentEdit;
                     let continue_instruction = if is_doc_edit_task {
                         "The edit has been applied to the document. Review the result and determine if the task is complete. If further edits are needed, call edit_current_editor_document again. Otherwise, provide a concise summary of what was changed.".to_string()
                     } else if check_folders_incomplete {
@@ -1871,7 +2632,7 @@ pub async fn ai_chat_stream(
                         "任务已完成，请进行工作总结：\n\n请检查你的工作，然后提供一份简洁的总结，包括：\n1. 完成的工作：简要说明你完成了哪些操作（如移动了多少文件、创建了哪些文件夹等）\n2. 执行逻辑：简要说明你是如何组织和执行这些操作的\n3. 执行效果：说明任务完成后的结果和状态\n4. 下一步建议：如果有需要用户注意的事项或后续建议，请说明\n\n请用自然语言回复，不要调用工具。".to_string()
                     } else if tool_results.iter().any(|(_, name, _)| name == "read_file") {
                         // 如果调用了 read_file，检查用户是否要求总结/概述内容
-                        let last_user_message = messages.iter().rev().find(|m| m.role == "user");
+                        let last_user_message = find_last_real_user_message(&messages);
                         let user_asks_for_summary = last_user_message
                             .map(|m| {
                                 let content_lower = m.text().to_lowercase();
@@ -1891,7 +2652,7 @@ pub async fn ai_chat_stream(
                         }
                     } else if tool_results.iter().any(|(_, name, _)| name == "list_files") {
                         // 检查用户是否要求检查/列出文件
-                        let last_user_message = messages.iter().rev().find(|m| m.role == "user");
+                        let last_user_message = find_last_real_user_message(&messages);
                         let user_asks_to_check_or_list_files = last_user_message
                             .map(|m| {
                                 let content_lower = m.text().to_lowercase();
@@ -1932,6 +2693,18 @@ pub async fn ai_chat_stream(
                     } else {
                         "请基于以上结果继续执行用户的任务。如果任务还未完成，请继续调用相应的工具完成剩余步骤。".to_string()
                     };
+                    let continue_instruction = if build_mode_policy.allows_tpa_force_continue() {
+                        if let Some(build_mode_constraint) = maybe_build_build_mode_workflow_constraint(
+                            &workspace_path,
+                            &effective_task_id,
+                        ) {
+                            format!("{}\n\n{}", continue_instruction, build_mode_constraint)
+                        } else {
+                            continue_instruction
+                        }
+                    } else {
+                        continue_instruction
+                    };
                     
                     // 如果任务未完成，添加调试日志
                     if task_incomplete {
@@ -1947,6 +2720,15 @@ pub async fn ai_chat_stream(
                     } else {
                         format!("[NEXT_ACTION]\n{}", continue_instruction)
                     };
+                    let followup_user_content =
+                        if let Some(runtime_directive) = maybe_build_runtime_execution_directive(
+                            &workspace_path,
+                            &effective_task_id,
+                        ) {
+                            format!("{}\n\n[WORKFLOW_EXECUTION]\n{}", followup_user_content, runtime_directive)
+                        } else {
+                            followup_user_content
+                        };
                     for (tool_id, tool_name, tool_result) in &tool_results {
                         let mut tool_content = format_single_tool_result_content(tool_name, tool_result);
                         if tool_name == "create_folder" && tool_result.success {
@@ -2117,14 +2899,18 @@ pub async fn ai_chat_stream(
                             // 累积所有工具调用结果（包括第一次的和后续的），用于任务完成度分析
                             let mut all_tool_results = tool_results.clone();
                             
-                            // 添加循环检测和重试限制
-                            let mut force_continue_count = 0; // 强制继续的次数
-                            const MAX_FORCE_CONTINUE_RETRIES: usize = 5; // 最大强制继续重试次数
-                            let mut last_force_continue_content: Option<String> = None; // 上次强制继续时的回复内容
+                            // Phase 8: 循环级 build mode 策略（由外层首轮 TPA 分析确定）
+                            let loop_build_policy = build_mode_policy.clone();
+                            let budget = &loop_build_policy.budget;
 
-                            // 工具调用轮次限制（防止无限工具链）
+                            // 添加循环检测和重试限制（从 ToolCallBudget 获取）
+                            let mut force_continue_count = 0usize;
+                            let max_force_continue_retries = budget.max_force_continues;
+                            let mut last_force_continue_content: Option<String> = None;
+
+                            // 工具调用轮次限制（从 ToolCallBudget 获取）
                             let mut tool_round_count = 0usize;
-                            const MAX_TOOL_ROUNDS: usize = 10;
+                            let max_tool_rounds = budget.max_tool_rounds;
 
                             while continue_loop {
                                 continue_loop = false; // 默认不继续循环，除非有工具调用
@@ -2406,7 +3192,8 @@ pub async fn ai_chat_stream(
                                                                 error: Some(format!("执行失败（已重试 {} 次）: {}", max_retries, error_msg)),
                                                                 message: None,
                                                                 error_kind: None,
-                                display_error: None,
+                                                                display_error: None,
+                                                                meta: None,
                                                             }
                                                         }
                                                     };
@@ -2416,6 +3203,14 @@ pub async fn ai_chat_stream(
                                                         &name,
                                                         Some(&parsed_args_for_result_continue),
                                                         skip_continue,
+                                                    );
+                                                    maybe_sync_workflow_execution_from_tool_result(
+                                                        &app_handle,
+                                                        &tab_id,
+                                                        &effective_task_id,
+                                                        &workspace_path,
+                                                        &name,
+                                                        &tool_result,
                                                     );
                                                     
                                                     // ⚠️ 关键修复：在继续对话的工具调用执行后检查取消标志
@@ -2519,12 +3314,14 @@ pub async fn ai_chat_stream(
                                         }
                                         Err(e) => {
                                             eprintln!("❌ 继续对话时发生错误: {}", e);
-                                            // 检查任务完成度，如果未完成，尝试继续
-                                            let task_progress_info = TaskProgressAnalyzer::analyze(&all_tool_results);
-                                            let task_incomplete = task_progress_info.is_incomplete;
-                                            if task_incomplete {
-                                                eprintln!("⚠️ 流错误但任务未完成，尝试继续");
-                                                // 不设置 continue_loop = false，让外层逻辑处理
+                                            // Phase 8: 流错误后只在 build mode 下尝试继续
+                                            if loop_build_policy.allows_tpa_force_continue() {
+                                                let err_progress = TaskProgressAnalyzer::analyze(&all_tool_results);
+                                                if err_progress.is_incomplete {
+                                                    eprintln!("⚠️ 流错误但任务未完成（build mode），尝试继续");
+                                                } else {
+                                                    continue_loop = false;
+                                                }
                                             } else {
                                                 continue_loop = false;
                                             }
@@ -2546,15 +3343,25 @@ pub async fn ai_chat_stream(
                                 let new_accumulated_text = new_streaming_handler.get_accumulated(&tab_id);
                                 let new_accumulated_text_clone = new_accumulated_text.clone();
                                 if !continue_loop && !new_accumulated_text_clone.is_empty() && new_tool_results.is_empty() {
-                                    // 使用 TaskProgressAnalyzer 分析任务完成度
+                                    // Phase 8: 用 BuildModePolicy 统一控制 TPA force-continue
                                     let task_progress_info = TaskProgressAnalyzer::analyze(&all_tool_results);
                                     let task_progress = task_progress_info.progress_hint.clone();
-                                    
-                                    // 使用结构化的字段判断任务是否未完成
-                                    let task_incomplete = task_progress_info.is_incomplete;
-                                    
+
+                                    let inner_is_doc_edit = task_progress_info.task_type == crate::services::task_progress_analyzer::TaskType::DocumentEdit
+                                        || task_progress_info.task_type == crate::services::task_progress_analyzer::TaskType::MultiDocumentEdit;
+                                    let inner_build_policy = if inner_is_doc_edit {
+                                        BuildModePolicy::default_writing()
+                                    } else if task_progress_info.task_type == crate::services::task_progress_analyzer::TaskType::RecursiveCheck
+                                        || task_progress_info.task_type == crate::services::task_progress_analyzer::TaskType::FileMove
+                                    {
+                                        BuildModePolicy::build_mode()
+                                    } else {
+                                        BuildModePolicy::default_writing()
+                                    };
+                                    let task_incomplete = if inner_build_policy.allows_tpa_force_continue() { task_progress_info.is_incomplete } else { false };
+
                                     // 检查用户是否要求递归检查所有文件（使用 TaskProgressAnalyzer 的辅助方法）
-                                    let last_user_message = current_messages.iter().rev().find(|m| m.role == "user");
+                                    let last_user_message = find_last_real_user_message(&current_messages);
                                     let user_asks_for_all_files_recursive = last_user_message
                                         .map(|m| TaskProgressAnalyzer::user_asks_for_recursive_check(m.text()))
                                         .unwrap_or(false);
@@ -2587,8 +3394,8 @@ pub async fn ai_chat_stream(
                                     
                                     if task_incomplete {
                                         // 使用 LoopDetector 检查是否超过最大重试次数
-                                        if loop_detector.check_max_force_continue_retries(force_continue_count) {
-                                            eprintln!("⚠️ 已达到最大强制继续重试次数（{}），停止继续请求", loop_detector.max_force_continue_retries);
+                                        if force_continue_count >= max_force_continue_retries {
+                                            eprintln!("⚠️ 已达到最大强制继续重试次数（{}），停止继续请求", max_force_continue_retries);
                                             eprintln!("📝 保存当前回复（长度={}）", new_accumulated_text_clone.len());
                                             // 不再继续，保存当前回复
                                             continue_loop = false;
@@ -2678,12 +3485,8 @@ pub async fn ai_chat_stream(
                                     
                                     if task_incomplete && continue_loop {
                                         
-                                        // 根据任务类型生成不同的强制继续提示
-                                        let is_doc_edit_force = task_progress_info.task_type == crate::services::task_progress_analyzer::TaskType::DocumentEdit
-                                            || task_progress_info.task_type == crate::services::task_progress_analyzer::TaskType::MultiDocumentEdit;
-                                        let force_continue_message = if is_doc_edit_force {
-                                            "The document edit is in progress. If more changes are needed, call edit_current_editor_document again. Otherwise, reply with a summary of what was changed.".to_string()
-                                        } else if recursive_check_incomplete {
+                                        // Phase 8: force-continue 只在 build mode 下才可能到达此处
+                                        let force_continue_message = if recursive_check_incomplete {
                                             // 递归检查任务未完成
                                             format!(
                                                 "{}\n\n任务未完成警告：你还没有完成对所有文件夹的检查。\n\n重要指令：\n1. 必须使用 list_files 工具检查所有子文件夹\n2. 不要停止，不要结束回复\n3. 必须检查完所有文件夹才能结束\n4. 立即调用 list_files 工具检查剩余的文件夹\n\n执行要求：必须调用工具继续检查，不要只回复文本。",
@@ -2772,12 +3575,16 @@ pub async fn ai_chat_stream(
                                             }
                                         }
                                     } else {
-                                        // 任务已完成，检查是否需要总结
-                                        let task_completed = !task_progress.is_empty() && task_progress.contains("任务完成确认");
+                                        // Phase 8: 总结注入仅在 build mode 下触发
+                                        let task_completed = if inner_build_policy.allows_tpa_force_continue() {
+                                            !task_progress.is_empty() && task_progress.contains("任务完成确认")
+                                        } else {
+                                            false
+                                        };
                                         
                                         // 检查是否调用了 read_file 且用户要求总结内容
                                         let has_read_file = all_tool_results.iter().any(|(_, name, _)| name == "read_file");
-                                        let last_user_message = current_messages.iter().rev().find(|m| m.role == "user");
+                                        let last_user_message = find_last_real_user_message(&current_messages);
                                         let user_asks_for_summary = last_user_message
                                             .map(|m| {
                                                 let content_lower = m.text().to_lowercase();
@@ -3035,7 +3842,7 @@ pub async fn ai_chat_stream(
                                                     let has_tool_results = !all_tool_results.is_empty();
                                                     
                                                     // 检查用户是否要求检查/列出文件
-                                                    let last_user_message = current_messages.iter().rev().find(|m| m.role == "user");
+                                                    let last_user_message = find_last_real_user_message(&current_messages);
                                                     let user_asks_to_check_or_list_files = last_user_message
                                                         .map(|m| {
                                                             let content_lower = m.text().to_lowercase();
@@ -3056,9 +3863,9 @@ pub async fn ai_chat_stream(
                                                             "重要：你的回复不完整。你已经调用了 list_files 工具检查了所有文件夹，现在必须基于工具调用结果给出完整、详细的文件列表总结。\n\n必须包含的内容：\n1. 完整列出所有检查到的文件：详细列出每个文件夹中的所有文件（包括文件名、路径等）\n2. 按文件夹分类组织：清晰地按文件夹分组展示文件列表\n3. 提供统计信息：总文件数、文件夹数、每个文件夹的文件数等\n4. 使用清晰的格式：使用列表、分类等方式，确保用户能够清楚了解所有文件的情况\n\n重要：不要只给出简短回复，必须完整呈现所有文件信息。基于你调用的 list_files 工具结果，提供一份详细、完整的文件列表总结。"
                                                         )
                                                     } else if has_tool_results {
-                                                        // 有其他工具调用结果，要求AI总结
+                                                        // 有工具调用结果，但并非文件清单任务：仅围绕原始任务继续
                                                         format!(
-                                                            "你的回复不完整。你已经调用了工具并获取了结果，现在需要：\n\n1. 完整总结所有工具调用的结果：详细列出你检查到的所有文件和文件夹\n2. 给出清晰的分类：按文件夹组织文件列表\n3. 提供完整的统计信息：总文件数、文件夹数等\n4. 以清晰、易读的格式呈现：使用列表、分类等方式\n\n请基于你的工具调用结果，提供一份完整、详细的文件列表总结。不要只给出简短回复，要完整呈现所有信息。"
+                                                            "你的回复不完整。你已经调用了工具并获取了结果，请基于这些结果继续完成原始任务：\n\n1. 简洁说明已执行的关键操作及结果\n2. 明确当前任务是否已完成；若未完成，继续调用必要工具\n3. 仅围绕用户原始指令输出，不要引入额外的文件巡检或目录总结\n\n请继续完成任务。"
                                                         )
                                                     } else {
                                                         // 如果没有工具调用，只是要求继续完成文本回复
@@ -3107,7 +3914,7 @@ pub async fn ai_chat_stream(
                                                 continue_reply_retry_count = 0;
                                                 // 基于第一性原理：分析AI的实际行为，判断任务是否真正完成
                                                 // 1. 分析用户意图：是否明确要求递归检查所有文件或检查每一个文件夹
-                                                let last_user_message = current_messages.iter().rev().find(|m| m.role == "user");
+                                                let last_user_message = find_last_real_user_message(&current_messages);
                                                 let user_asks_for_all_files_recursive = last_user_message
                                                     .map(|m| {
                                                         let content_lower = m.text().to_lowercase();
@@ -3277,7 +4084,7 @@ pub async fn ai_chat_stream(
                                                     }
                                                 } else {
                                                     // 检查用户是否要求检查/列出文件，且AI是否给出了完整的文件列表
-                                                    let last_user_message = current_messages.iter().rev().find(|m| m.role == "user");
+                                                    let last_user_message = find_last_real_user_message(&current_messages);
                                                     let user_asks_to_check_or_list_files = last_user_message
                                                         .map(|m| {
                                                             let content_lower = m.text().to_lowercase();
@@ -3384,11 +4191,11 @@ pub async fn ai_chat_stream(
                                 // 如果有新的工具调用，需要继续对话
                                 if continue_loop && !new_tool_results.is_empty() {
                                     tool_round_count += 1;
-                                    if tool_round_count > MAX_TOOL_ROUNDS {
-                                        eprintln!("🚫 工具调用轮次超过上限 ({})，终止循环", MAX_TOOL_ROUNDS);
+                                    if tool_round_count > max_tool_rounds {
+                                        eprintln!("🚫 工具调用轮次超过上限 ({})，终止循环", max_tool_rounds);
                                         let _ = app_handle.emit("ai-stream-error", serde_json::json!({
                                             "tab_id": tab_id,
-                                            "error": format!("工具调用轮次超过上限（{}轮），已自动终止。", MAX_TOOL_ROUNDS)
+                                            "error": format!("工具调用轮次超过上限（{}轮），已自动终止。", max_tool_rounds)
                                         }));
                                         continue_loop = false;
                                     } else {
@@ -3416,20 +4223,27 @@ pub async fn ai_chat_stream(
                                         });
                                     }
 
-                                    // 分析任务完成度，生成任务进度提示（使用所有累积的工具调用结果）
+                                    // Phase 8: 用 BuildModePolicy 统一控制 TPA（工具调用续轮路径）
                                     let task_progress_info = TaskProgressAnalyzer::analyze(&all_tool_results);
                                     let task_progress = task_progress_info.progress_hint.clone();
                                     
                                     eprintln!("📊 任务进度分析结果：{}", if task_progress.is_empty() { "任务已完成或无需进度检查" } else { &task_progress });
                                     
-                                    // 检查任务是否完成（使用结构化的字段）
-                                    let task_incomplete = task_progress_info.is_incomplete;
-                                    let task_completed = task_progress_info.is_completed;
-                                    
-                                    // 添加工具调用结果到消息历史
-                                    let is_doc_edit_task = task_progress_info.task_type == crate::services::task_progress_analyzer::TaskType::DocumentEdit
+                                    let tool_round_is_doc_edit = task_progress_info.task_type == crate::services::task_progress_analyzer::TaskType::DocumentEdit
                                         || task_progress_info.task_type == crate::services::task_progress_analyzer::TaskType::MultiDocumentEdit;
-                                    let continue_instruction = if is_doc_edit_task {
+                                    let tool_round_policy = if tool_round_is_doc_edit {
+                                        BuildModePolicy::default_writing()
+                                    } else if task_progress_info.task_type == crate::services::task_progress_analyzer::TaskType::RecursiveCheck
+                                        || task_progress_info.task_type == crate::services::task_progress_analyzer::TaskType::FileMove
+                                    {
+                                        BuildModePolicy::build_mode()
+                                    } else {
+                                        BuildModePolicy::default_writing()
+                                    };
+                                    let task_incomplete = if tool_round_policy.allows_tpa_force_continue() { task_progress_info.is_incomplete } else { false };
+                                    let task_completed = if tool_round_policy.allows_tpa_force_continue() { task_progress_info.is_completed } else { false };
+                                    
+                                    let continue_instruction = if tool_round_is_doc_edit {
                                         "The edit has been applied to the document. Review the result and determine if the task is complete. If further edits are needed, call edit_current_editor_document again. Otherwise, provide a concise summary of what was changed.".to_string()
                                     } else if task_incomplete {
                                         // 任务未完成，强制要求继续
@@ -3439,7 +4253,7 @@ pub async fn ai_chat_stream(
                                                 "重要：文件夹已创建完成，现在必须立即调用 move_file 工具移动文件到相应的文件夹。不要停止，不要创建更多文件夹，必须开始移动文件。".to_string()
                                             } else if new_tool_results.iter().any(|(_, name, _)| name == "list_files" || name == "read_file") {
                                                 // 检查用户是否要求检查/列出文件
-                                                let last_user_message = current_messages.iter().rev().find(|m| m.role == "user");
+                                                let last_user_message = find_last_real_user_message(&current_messages);
                                                 let user_asks_to_check_or_list_files = last_user_message
                                                     .map(|m| {
                                                         let content_lower = m.text().to_lowercase();
@@ -3473,7 +4287,7 @@ pub async fn ai_chat_stream(
                                         "重要：文件夹已创建完成，现在必须立即调用 move_file 工具移动文件到相应的文件夹。不要停止，不要创建更多文件夹，必须开始移动文件。".to_string()
                                     } else if new_tool_results.iter().any(|(_, name, _)| name == "list_files" || name == "read_file") {
                                         // 检查用户是否要求检查/列出文件
-                                        let last_user_message = current_messages.iter().rev().find(|m| m.role == "user");
+                                        let last_user_message = find_last_real_user_message(&current_messages);
                                         let user_asks_to_check_or_list_files = last_user_message
                                             .map(|m| {
                                                 let content_lower = m.text().to_lowercase();
@@ -3498,6 +4312,18 @@ pub async fn ai_chat_stream(
                                     } else {
                                         "请基于以上结果继续执行用户的任务。如果任务还未完成，请继续调用相应的工具完成剩余步骤。".to_string()
                                     };
+                                    let continue_instruction = if tool_round_policy.allows_tpa_force_continue() {
+                                        if let Some(build_mode_constraint) = maybe_build_build_mode_workflow_constraint(
+                                            &workspace_path,
+                                            &effective_task_id,
+                                        ) {
+                                            format!("{}\n\n{}", continue_instruction, build_mode_constraint)
+                                        } else {
+                                            continue_instruction
+                                        }
+                                    } else {
+                                        continue_instruction
+                                    };
                                     
                                     // 每条工具结果一条 role=tool；随后单独 user 承载 [NEXT_ACTION]
                                     let followup_user_content = if !task_progress.is_empty() {
@@ -3508,6 +4334,15 @@ pub async fn ai_chat_stream(
                                     } else {
                                         format!("[NEXT_ACTION]\n{}", continue_instruction)
                                     };
+                                    let followup_user_content =
+                                        if let Some(runtime_directive) = maybe_build_runtime_execution_directive(
+                                            &workspace_path,
+                                            &effective_task_id,
+                                        ) {
+                                            format!("{}\n\n[WORKFLOW_EXECUTION]\n{}", followup_user_content, runtime_directive)
+                                        } else {
+                                            followup_user_content
+                                        };
                                     for (tool_id, tool_name, tool_result) in &new_tool_results {
                                         let mut tool_content = format_single_tool_result_content(tool_name, tool_result);
                                         if tool_name == "create_folder" && tool_result.success {
@@ -3528,9 +4363,10 @@ pub async fn ai_chat_stream(
                                         name: None,
                                         tool_calls: None,
                                     });
+                                    if tool_results_emit_candidate(&new_tool_results) {
+                                        mark_shadow_candidate_artifacts(&tab_id, &workspace_path);
+                                    }
 
-                                    // 清空新的工具结果和文本，准备下一轮（但保留累积结果用于任务分析）
-                                    let previous_tool_results = new_tool_results.clone();
                                     new_tool_results.clear();
                                     new_tool_call_specs.clear();
                                     new_streaming_handler.clear_accumulated(&tab_id);
@@ -3609,7 +4445,7 @@ pub async fn ai_chat_stream(
                                             continue_loop = false;
                                         }
                                     }
-                                    } // else (tool_round_count <= MAX_TOOL_ROUNDS)
+                                    } // else (tool_round_count <= max_tool_rounds)
                                 }
 
                                 // ⚠️ 关键修复：在继续对话循环结束前检查取消标志
@@ -3638,9 +4474,12 @@ pub async fn ai_chat_stream(
                                 }
                                 
                                 // 检查循环结束后的状态：如果任务完成但没有总结，要求总结
+                                // LEG-004 降级：doc edit 任务不走 TPA 完成裁定，跳过此总结注入
                                 if !continue_loop {
                                     let final_task_progress_info = TaskProgressAnalyzer::analyze(&all_tool_results);
-                                    let final_task_completed = final_task_progress_info.is_completed;
+                                    let is_final_doc_edit = final_task_progress_info.task_type == crate::services::task_progress_analyzer::TaskType::DocumentEdit
+                                        || final_task_progress_info.task_type == crate::services::task_progress_analyzer::TaskType::MultiDocumentEdit;
+                                    let final_task_completed = if is_final_doc_edit { false } else { final_task_progress_info.is_completed };
                                     
                                     // 检查最后一条assistant消息是否包含总结
                                     let final_has_summary = current_messages.iter()
@@ -3809,6 +4648,29 @@ pub async fn ai_chat_stream(
                     if stream_ctx.state == StreamState::Streaming {
                         finalize_stream(&mut stream_ctx, StreamState::Completed);
                     }
+                    // Phase 6: 如果本轮产生过候选且模型已停止调用工具，进入 review_ready
+                    if candidate_emitted_this_session {
+                        write_task_stage(
+                            &app_handle, &effective_task_id, &tab_id,
+                            "review_ready", "model_stopped_candidate_pending",
+                            &workspace_path,
+                        );
+                    }
+
+                    // 记忆提炼：每5轮 user 消息触发一次后台提炼（fire-and-forget）
+                    if should_trigger_tab_memory_extraction(&current_messages) {
+                        let provider_mem = provider_clone.clone();
+                        let ws_mem = workspace_path.clone();
+                        let tab_mem = tab_id.clone();
+                        let msgs_mem = current_messages.clone();
+                        tokio::spawn(async move {
+                            crate::services::memory_service::memory_generation_task_tab(
+                                provider_mem, ws_mem, tab_mem, msgs_mem,
+                            ).await;
+                        });
+                        eprintln!("[memory] MEMORY_WRITE_QUEUED: tab memory extraction triggered for tab={}", tab_id);
+                    }
+
                     emit_ai_chat_stream_done(&app_handle, &tab_id, &stream_ctx, None);
                 }
             });
@@ -4007,4 +4869,77 @@ pub async fn ai_cancel_chat_stream(tab_id: String) -> Result<(), String> {
             Err(format!("未找到对应的任务: {}", tab_id))
         }
     }
+}
+
+// ── 记忆辅助函数 ──────────────────────────────────────────────────────────────
+
+/// 构造记忆检索 query：用户消息前200字符 + 当前文件名 + 选区前100字符
+fn build_memory_query(user_msg: &str, current_file: Option<&str>, selected_text: Option<&str>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    let msg_excerpt: String = user_msg.chars().take(200).collect();
+    if !msg_excerpt.is_empty() {
+        parts.push(msg_excerpt);
+    }
+
+    if let Some(f) = current_file {
+        if let Some(name) = std::path::Path::new(f).file_name().and_then(|n| n.to_str()) {
+            // strip extension for cleaner token match
+            let stem = std::path::Path::new(name)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(name);
+            parts.push(stem.to_string());
+        }
+    }
+
+    if let Some(sel) = selected_text {
+        let sel_excerpt: String = sel.chars().take(100).collect();
+        if !sel_excerpt.is_empty() {
+            parts.push(sel_excerpt);
+        }
+    }
+
+    parts.join(" ")
+}
+
+fn build_knowledge_query(user_msg: &str, current_file: Option<&str>, selected_text: Option<&str>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    let msg_excerpt: String = user_msg.chars().take(240).collect();
+    if !msg_excerpt.is_empty() {
+        parts.push(msg_excerpt);
+    }
+
+    if let Some(file) = current_file {
+        if let Some(stem) = std::path::Path::new(file)
+            .file_stem()
+            .and_then(|value| value.to_str())
+        {
+            parts.push(stem.to_string());
+        }
+    }
+
+    if let Some(selected) = selected_text {
+        let selected_excerpt: String = selected.chars().take(120).collect();
+        if !selected_excerpt.is_empty() {
+            parts.push(selected_excerpt);
+        }
+    }
+
+    parts.join(" ")
+}
+
+/// 检查是否应触发标签级记忆提炼（每 extraction_interval 轮 user 消息触发一次）
+fn should_trigger_tab_memory_extraction(messages: &[ChatMessage]) -> bool {
+    let cfg = crate::services::memory_service::ExtractionConfig::load();
+    if !cfg.enabled || !cfg.write_enabled {
+        return false;
+    }
+    let interval = cfg.extraction_interval.max(1);
+    let user_count = messages
+        .iter()
+        .filter(|m| m.role == "user" && !is_internal_orchestration_user_message(m))
+        .count();
+    user_count > 0 && user_count % interval == 0
 }

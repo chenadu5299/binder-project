@@ -4,6 +4,8 @@ use crate::services::file_watcher::FileWatcherService;
 use crate::services::file_system::FileSystemService;
 use crate::services::pandoc_service::PandocService;
 use crate::services::libreoffice_service::LibreOfficeService;
+use crate::workspace::timeline_support::record_resource_structure_timeline_node;
+use crate::workspace::workspace_db::WorkspaceDb;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -123,6 +125,17 @@ pub async fn create_file(path: String, file_type: String) -> Result<(), String> 
         match pandoc_service.convert_html_to_docx(empty_html, &path_buf) {
             Ok(_) => {
                 eprintln!("[create_file] DOCX 文件创建成功: {}", path);
+                if let Some(ws) = infer_workspace_root_from_path(&path_buf) {
+                    let db = WorkspaceDb::new(&ws)?;
+                    let _ = record_resource_structure_timeline_node(
+                        &db,
+                        &ws,
+                        "create_file",
+                        &format!("创建文件：{}", path_buf.file_name().and_then(|s| s.to_str()).unwrap_or(&path)),
+                        "user",
+                        &[path_buf.clone()],
+                    )?;
+                }
                 Ok(())
             }
             Err(e) => {
@@ -147,6 +160,17 @@ pub async fn create_file(path: String, file_type: String) -> Result<(), String> 
             })?;
         
         eprintln!("[create_file] 文件创建成功: {}", path);
+        if let Some(ws) = infer_workspace_root_from_path(&path_buf) {
+            let db = WorkspaceDb::new(&ws)?;
+            let _ = record_resource_structure_timeline_node(
+                &db,
+                &ws,
+                "create_file",
+                &format!("创建文件：{}", path_buf.file_name().and_then(|s| s.to_str()).unwrap_or(&path)),
+                "user",
+                &[path_buf.clone()],
+            )?;
+        }
         Ok(())
     }
 }
@@ -181,6 +205,17 @@ pub async fn create_folder(path: String) -> Result<(), String> {
         })?;
     
     eprintln!("[create_folder] 文件夹创建成功: {}", path);
+    if let Some(ws) = infer_workspace_root_from_path(&path_buf) {
+        let db = WorkspaceDb::new(&ws)?;
+        let _ = record_resource_structure_timeline_node(
+            &db,
+            &ws,
+            "create_folder",
+            &format!("创建文件夹：{}", path_buf.file_name().and_then(|s| s.to_str()).unwrap_or(&path)),
+            "user",
+            &[path_buf.clone()],
+        )?;
+    }
     Ok(())
 }
 
@@ -426,6 +461,8 @@ pub async fn move_file_to_workspace(
 #[tauri::command]
 pub async fn rename_file(path: String, new_name: String) -> Result<(), String> {
     let source = PathBuf::from(&path);
+    let workspace_root = infer_workspace_root_from_path(&source);
+    let is_dir_rename = source.is_dir();
     let parent = source.parent()
         .ok_or_else(|| format!("无法获取父目录: {}", path))?;
     let dest = parent.join(&new_name);
@@ -436,6 +473,37 @@ pub async fn rename_file(path: String, new_name: String) -> Result<(), String> {
     
     std::fs::rename(&source, &dest)
         .map_err(|e| format!("重命名失败: {}", e))?;
+
+    if let Some(ws) = &workspace_root {
+        let db = WorkspaceDb::new(ws)?;
+        let _ = record_resource_structure_timeline_node(
+            &db,
+            ws,
+            "rename_file",
+            &format!(
+                "重命名资源：{} -> {}",
+                source.file_name().and_then(|s| s.to_str()).unwrap_or(&path),
+                new_name
+            ),
+            "user",
+            &[source.clone(), dest.clone()],
+        )?;
+    }
+
+    if let Some(ws) = workspace_root {
+        match crate::services::memory_service::MemoryService::new(&ws) {
+            Ok(svc) => {
+                if let Err(e) = svc.rebind_content_memories_for_path(
+                    &source.to_string_lossy(),
+                    &dest.to_string_lossy(),
+                    is_dir_rename,
+                ).await {
+                    eprintln!("[memory] rename_file: rebind content memories failed: {:?}", e);
+                }
+            }
+            Err(e) => eprintln!("[memory] rename_file: MemoryService init failed: {}", e),
+        }
+    }
     
     Ok(())
 }
@@ -444,6 +512,8 @@ pub async fn rename_file(path: String, new_name: String) -> Result<(), String> {
 #[tauri::command]
 pub async fn delete_file(path: String) -> Result<(), String> {
     let path_buf = PathBuf::from(&path);
+    let workspace_root = infer_workspace_root_from_path(&path_buf);
+    let is_dir_delete = path_buf.is_dir();
     
     if !path_buf.exists() {
         return Err(format!("文件不存在: {}", path));
@@ -456,8 +526,52 @@ pub async fn delete_file(path: String) -> Result<(), String> {
         std::fs::remove_file(&path_buf)
             .map_err(|e| format!("删除文件失败: {}", e))?;
     }
+
+    if let Some(ws) = &workspace_root {
+        let db = WorkspaceDb::new(ws)?;
+        let _ = record_resource_structure_timeline_node(
+            &db,
+            ws,
+            "delete_file",
+            &format!("删除资源：{}", path_buf.file_name().and_then(|s| s.to_str()).unwrap_or(&path)),
+            "user",
+            &[path_buf.clone()],
+        )?;
+    }
+
+    if let Some(ws) = workspace_root {
+        match crate::services::memory_service::MemoryService::new(&ws) {
+            Ok(svc) => {
+                if let Err(e) = svc.expire_content_memories_for_path(
+                    &path_buf.to_string_lossy(),
+                    is_dir_delete,
+                ).await {
+                    eprintln!("[memory] delete_file: expire content memories failed: {:?}", e);
+                }
+            }
+            Err(e) => eprintln!("[memory] delete_file: MemoryService init failed: {}", e),
+        }
+    }
     
     Ok(())
+}
+
+fn infer_workspace_root_from_path(path: &Path) -> Option<PathBuf> {
+    let mut current = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()?.to_path_buf()
+    };
+    loop {
+        let binder = current.join(".binder");
+        if binder.join("workspace.db").exists() {
+            return Some(current);
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+    None
 }
 
 // ⚠️ Week 18.2：复制文件
@@ -498,6 +612,22 @@ pub async fn duplicate_file(path: String) -> Result<String, String> {
     
     std::fs::copy(&source, &dest)
         .map_err(|e| format!("复制文件失败: {}", e))?;
+
+    if let Some(ws) = infer_workspace_root_from_path(&source) {
+        let db = WorkspaceDb::new(&ws)?;
+        let _ = record_resource_structure_timeline_node(
+            &db,
+            &ws,
+            "duplicate_file",
+            &format!(
+                "复制文件：{} -> {}",
+                source.file_name().and_then(|s| s.to_str()).unwrap_or(&path),
+                dest.file_name().and_then(|s| s.to_str()).unwrap_or("")
+            ),
+            "user",
+            &[source.clone(), dest.clone()],
+        )?;
+    }
     
     Ok(dest.to_string_lossy().to_string())
 }
@@ -512,6 +642,11 @@ pub async fn move_file(
 ) -> Result<(), String> {
     let source = PathBuf::from(&source_path);
     let dest = PathBuf::from(&destination_path);
+    let is_dir_move = source.is_dir();
+    let memory_workspace_root = workspace_path
+        .as_ref()
+        .and_then(|ws| if ws.trim().is_empty() { None } else { Some(PathBuf::from(ws)) })
+        .or_else(|| infer_workspace_root_from_path(&source));
     
     // 检查源文件是否存在
     if !source.exists() {
@@ -560,6 +695,21 @@ pub async fn move_file(
             }
         }
     }
+
+    if let Some(ws) = &memory_workspace_root {
+        match crate::services::memory_service::MemoryService::new(ws) {
+            Ok(svc) => {
+                if let Err(e) = svc.rebind_content_memories_for_path(
+                    &source.to_string_lossy(),
+                    &dest.to_string_lossy(),
+                    is_dir_move,
+                ).await {
+                    eprintln!("[memory] move_file: rebind content memories failed: {:?}", e);
+                }
+            }
+            Err(e) => eprintln!("[memory] move_file: MemoryService init failed: {}", e),
+        }
+    }
     
     // 触发文件树变化事件
     if let Some(ws_path) = workspace_path {
@@ -568,6 +718,22 @@ pub async fn move_file(
         // 如果没有提供工作区路径，尝试从源路径推断（使用父目录作为工作区）
         let workspace_str = parent.to_string_lossy().to_string();
         let _ = app.emit("file-tree-changed", workspace_str);
+    }
+
+    if let Some(ws) = memory_workspace_root {
+        let db = WorkspaceDb::new(&ws)?;
+        let _ = record_resource_structure_timeline_node(
+            &db,
+            &ws,
+            "move_file",
+            &format!(
+                "移动资源：{} -> {}",
+                source.file_name().and_then(|s| s.to_str()).unwrap_or(&source_path),
+                dest.to_string_lossy()
+            ),
+            "user",
+            &[source.clone(), dest.clone()],
+        )?;
     }
     
     Ok(())
@@ -1938,3 +2104,188 @@ pub async fn remove_binder_file_record(
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{delete_file, rename_file};
+    use crate::services::memory_service::{
+        MemoryItemInput, MemoryLayer, MemoryScopeType, MemorySearchScope, MemoryService,
+        MemorySourceKind, SearchMemoriesParams,
+    };
+    use crate::workspace::workspace_db::WorkspaceDb;
+    use rusqlite::{params, Connection};
+    use std::path::{Path, PathBuf};
+
+    struct TestWorkspace {
+        path: PathBuf,
+    }
+
+    impl TestWorkspace {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "binder-file-memory-{}-{}",
+                label,
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&path).expect("create temp workspace");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn db_path(&self) -> PathBuf {
+            self.path.join(".binder").join("workspace.db")
+        }
+    }
+
+    impl Drop for TestWorkspace {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn sample_content_memory(file_path: &Path) -> MemoryItemInput {
+        MemoryItemInput {
+            layer: MemoryLayer::Content,
+            scope_type: MemoryScopeType::Workspace,
+            scope_id: String::new(),
+            entity_type: "note".to_string(),
+            entity_name: "content-lifecycle".to_string(),
+            content: format!(
+                "Content memory tracked for {}",
+                file_path.file_name().and_then(|name| name.to_str()).unwrap_or("file")
+            ),
+            summary: "content memory lifecycle".to_string(),
+            tags: vec!["content".to_string(), "lifecycle".to_string()],
+            source_kind: MemorySourceKind::DocumentExtract,
+            source_ref: file_path.to_string_lossy().to_string(),
+            confidence: 0.93,
+        }
+    }
+
+    async fn insert_content_memory(workspace: &TestWorkspace, file_path: &Path) {
+        let service = MemoryService::new(workspace.path()).expect("memory service init");
+        service
+            .upsert_project_content_memories(
+                &file_path.to_string_lossy(),
+                vec![sample_content_memory(file_path)],
+            )
+            .await
+            .expect("insert content memory");
+    }
+
+    fn query_memory_source_refs(conn: &Connection) -> Vec<(String, String)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT source_ref, freshness_status
+                 FROM memory_items
+                 WHERE layer = 'content'
+                 ORDER BY created_at ASC",
+            )
+            .expect("prepare source ref query");
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("execute source ref query")
+            .map(|row| row.expect("row"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn rename_file_rebinds_content_memory_source_ref() {
+        let workspace = TestWorkspace::new("rename");
+        let _db = WorkspaceDb::new(workspace.path()).expect("workspace db init");
+        let source = workspace.path().join("draft.md");
+        std::fs::write(&source, "# draft\n").expect("write source file");
+        insert_content_memory(&workspace, &source).await;
+
+        rename_file(source.to_string_lossy().to_string(), "renamed.md".to_string())
+            .await
+            .expect("rename file");
+
+        let conn = Connection::open(workspace.db_path()).expect("open workspace db");
+        let rows = query_memory_source_refs(&conn);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].0,
+            workspace.path().join("renamed.md").to_string_lossy()
+        );
+        assert_eq!(rows[0].1, "fresh");
+    }
+
+    #[tokio::test]
+    async fn delete_file_expires_content_memory_source_ref() {
+        let workspace = TestWorkspace::new("delete");
+        let _db = WorkspaceDb::new(workspace.path()).expect("workspace db init");
+        let source = workspace.path().join("obsolete.md");
+        std::fs::write(&source, "# obsolete\n").expect("write source file");
+        insert_content_memory(&workspace, &source).await;
+
+        delete_file(source.to_string_lossy().to_string())
+            .await
+            .expect("delete file");
+
+        let conn = Connection::open(workspace.db_path()).expect("open workspace db");
+        let rows = query_memory_source_refs(&conn);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, source.to_string_lossy());
+        assert_eq!(rows[0].1, "expired");
+    }
+
+    #[tokio::test]
+    async fn move_style_rebind_prevents_old_source_ref_from_polluting_search() {
+        let workspace = TestWorkspace::new("move");
+        let _db = WorkspaceDb::new(workspace.path()).expect("workspace db init");
+        let source_dir = workspace.path().join("notes");
+        let dest_dir = workspace.path().join("archive");
+        std::fs::create_dir_all(&source_dir).expect("create source dir");
+        std::fs::create_dir_all(&dest_dir).expect("create dest dir");
+
+        let source = source_dir.join("plan.md");
+        let destination = dest_dir.join("plan.md");
+        std::fs::write(&source, "# plan\n").expect("write source file");
+        insert_content_memory(&workspace, &source).await;
+
+        std::fs::rename(&source, &destination).expect("move file");
+        let service = MemoryService::new(workspace.path()).expect("memory service init");
+        service
+            .rebind_content_memories_for_path(
+                &source.to_string_lossy(),
+                &destination.to_string_lossy(),
+                false,
+            )
+            .await
+            .expect("rebind moved content memories");
+
+        let conn = Connection::open(workspace.db_path()).expect("open workspace db");
+        let old_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_items WHERE layer = 'content' AND source_ref = ?1",
+                params![source.to_string_lossy().to_string()],
+                |row| row.get(0),
+            )
+            .expect("count old refs");
+        let new_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_items WHERE layer = 'content' AND source_ref = ?1",
+                params![destination.to_string_lossy().to_string()],
+                |row| row.get(0),
+            )
+            .expect("count new refs");
+        assert_eq!(old_count, 0, "old source_ref should be fully cleared");
+        assert_eq!(new_count, 1, "new source_ref should take over");
+
+        let response = service
+            .search_memories(SearchMemoriesParams {
+                query: "content lifecycle".to_string(),
+                tab_id: None,
+                workspace_path: Some(workspace.path().to_string_lossy().to_string()),
+                scope: MemorySearchScope::Content,
+                limit: Some(10),
+                entity_types: Some(vec!["note".to_string()]),
+            })
+            .await
+            .expect("search content memories after move");
+        assert_eq!(response.total_found, 1);
+        assert_eq!(response.items[0].item.source_ref, destination.to_string_lossy());
+    }
+}

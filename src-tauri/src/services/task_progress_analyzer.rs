@@ -3,19 +3,18 @@
 //! 负责分析任务完成度，判断任务是否完成，生成任务进度提示
 
 use crate::services::tool_service::ToolResult;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 /// 任务类型
 #[derive(Debug, Clone, PartialEq)]
 pub enum TaskType {
-  FileMove,           // 文件移动任务
-  RecursiveCheck,     // 递归检查任务
-  FileClassification, // 文件分类任务
-  FileRead,           // 文件读取任务
-  FileDelete,         // 文件/文件夹删除任务
-  DocumentEdit,       // 文档编辑任务（edit_current_editor_document）
-  MultiDocumentEdit,  // edit_current_editor_document + update_file 组合（跨文件编辑）
-  Unknown,            // 未知任务类型
+  FileMove,
+  RecursiveCheck,
+  FileRead,
+  FileDelete,
+  DocumentEdit,
+  MultiDocumentEdit,
+  Unknown,
 }
 
 /// 任务进度信息
@@ -33,10 +32,10 @@ pub struct TaskProgress {
   /// 进度提示文本
   pub progress_hint: String,
 
-  /// 已处理文件数
+  #[allow(dead_code)]
   pub processed_count: usize,
 
-  /// 总文件数
+  #[allow(dead_code)]
   pub total_count: Option<usize>,
 }
 
@@ -417,17 +416,4 @@ impl TaskProgressAnalyzer {
           || content_lower.contains("递归")))
   }
 
-  /// 检查用户是否要求总结内容
-  pub fn user_asks_for_summary(user_message: &str) -> bool {
-    let content_lower = user_message.to_lowercase();
-    content_lower.contains("写了什么")
-      || content_lower.contains("内容是什么")
-      || (content_lower.contains("内容")
-        && (content_lower.contains("总结")
-          || content_lower.contains("概述")
-          || content_lower.contains("介绍")))
-      || content_lower.contains("总结")
-      || content_lower.contains("概述")
-      || content_lower.contains("介绍")
-  }
 }

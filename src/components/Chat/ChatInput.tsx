@@ -11,6 +11,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { memoryService } from '../../services/memoryService';
 import { extractUrls } from '../../utils/urlDetector';
 import { getReferenceDisplayText, type DisplayNode } from '../../utils/inlineContentParser';
+import { buildKnowledgeReference } from '../../utils/knowledgeReference';
 import { toast } from '../Common/Toast';
 
 interface ChatInputProps {
@@ -203,19 +204,31 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId, pendingMode = 'agen
         if (memoryData) {
             try {
                 const payload = JSON.parse(memoryData);
-                if (payload.type === 'memory' && payload.entityName && currentTabId) {
+                if (payload.type === 'memory' && currentTabId) {
+                    const payloadName = payload.entityName || payload.name || '记忆';
+                    let memoryId: string | null = payload.memoryId ?? null;
+                    let itemContent: string | null = payload.content ?? null;
                     const memories = currentWorkspace
                         ? await memoryService.getAllMemories(currentWorkspace).catch(() => [])
                         : [];
-                    const items = memories.filter(m => m.entity_name === payload.entityName);
+                    if (!memoryId && payload.entityName) {
+                        const matched = memories.find(m => m.entityName === payload.entityName);
+                        if (matched) {
+                            memoryId = matched.id;
+                            itemContent = matched.content;
+                        }
+                    }
+                    if (!memoryId) {
+                        return;
+                    }
                     addReference(currentTabId, {
                         id: '',
                         type: ReferenceType.MEMORY,
                         createdAt: Date.now(),
-                        memoryId: `memory-${payload.entityName}`,
-                        name: payload.entityName,
-                        itemCount: items.length,
-                        items: items.map(m => ({ content: m.content })),
+                        memoryId,
+                        name: payloadName,
+                        itemCount: 1,
+                        items: itemContent ? [{ id: memoryId, content: itemContent }] : undefined,
                     });
                     return;
                 }
@@ -243,6 +256,27 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId, pendingMode = 'agen
                 }
             } catch (err) {
                 console.warn('解析聊天标签拖拽数据失败:', err);
+            }
+        }
+
+        const knowledgeData = e.dataTransfer.getData('application/binder-reference-kb');
+        if (knowledgeData && currentWorkspace) {
+            try {
+                const payload = JSON.parse(knowledgeData);
+                if (payload.type === 'kb' && payload.kbId) {
+                    const knowledgeRef = await buildKnowledgeReference(currentWorkspace, {
+                        kbId: payload.kbId,
+                        entryId: payload.entryId ?? null,
+                        documentId: payload.documentId ?? null,
+                        entryTitle: payload.entryTitle || payload.name || '知识库条目',
+                        preview: payload.preview ?? null,
+                        assetKind: payload.assetKind ?? null,
+                    });
+                    addReference(currentTabId, knowledgeRef);
+                    return;
+                }
+            } catch (err) {
+                console.warn('解析知识库拖拽数据失败:', err);
             }
         }
         
@@ -558,6 +592,11 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId, pendingMode = 'agen
                             fileName: source.fileName,
                             lineRange: source.lineRange || { start: 1, end: 1 },
                             charRange: source.charRange || { start: 0, end: text.length },
+                            startBlockId: source.startBlockId,
+                            endBlockId: source.endBlockId,
+                            blockId: source.blockId,
+                            startOffset: source.startOffset,
+                            endOffset: source.endOffset,
                         },
                         text
                     );
@@ -630,16 +669,11 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId, pendingMode = 'agen
             return;
         }
         
-        // 格式化引用信息（发给 AI 的完整内容）
-        const { formatForAI, getReferences } = useReferenceStore.getState();
-        const referenceText = await formatForAI(currentTabId);
+        // 读取引用列表（后端 constraint 层注入内容，前端仅用于 displayNodes）
+        const { getReferences } = useReferenceStore.getState();
         const refs = getReferences(currentTabId);
-        
-        // 合并消息内容和引用
+
         let content = input.trim();
-        if (referenceText) {
-            content = `${content}\n\n[引用信息]\n${referenceText}`;
-        }
         // 消息记录展示：结构化节点，引用以标签形式渲染（与输入框一致）
         const displayNodes: DisplayNode[] = input.trim()
             ? [{ type: 'text', content: refs.length ? input.trim() + '\n\n' : input.trim() }, ...refs.map(r => ({ type: 'ref' as const, displayText: getReferenceDisplayText(r) }))]
@@ -711,7 +745,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId, pendingMode = 'agen
         }, 0);
     };
     
-    // 处理 @ 选择器选择（Phase 1.2：支持 file / memory / chat）
+    // 处理 @ 选择器选择（当前支持 file / memory / kb / template / chat）
     const handleMentionSelect = async (item: MentionItem) => {
         if (!textareaRef.current || !tabId) return;
         
@@ -740,22 +774,17 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId, pendingMode = 'agen
                 name: item.name,
             });
         } else if (item.type === 'memory') {
-            if (currentWorkspace) {
-                try {
-                    const memories = await memoryService.getAllMemories(currentWorkspace as string);
-                    const memoryItems = memories.filter(m => m.entity_name === item.name);
-                    addReference(tabId, {
-                        id: '',
-                        type: ReferenceType.MEMORY,
-                        createdAt: Date.now(),
-                        memoryId: `memory-${item.name}`,
-                        name: item.name,
-                        itemCount: memoryItems.length,
-                    });
-                } catch (error) {
-                    console.error('获取记忆库详情失败:', error);
-                }
-            }
+            const memoryId = item.memoryId || (item.id.startsWith('memory-') ? item.id.slice('memory-'.length) : '');
+            if (!memoryId) return;
+            addReference(tabId, {
+                id: '',
+                type: ReferenceType.MEMORY,
+                createdAt: Date.now(),
+                memoryId,
+                name: item.name,
+                itemCount: 1,
+                items: item.memoryContent ? [{ id: memoryId, content: item.memoryContent }] : undefined,
+            });
         } else if (item.type === 'chat' && item.chatTabId) {
             const chatTab = tabs.find(t => t.id === item.chatTabId);
             if (chatTab) {
@@ -769,6 +798,25 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId, pendingMode = 'agen
                     messageRange: { start: 0, end: chatTab.messages.length },
                 });
             }
+        } else if (item.type === 'kb' && item.kbId && currentWorkspace) {
+            const knowledgeRef = await buildKnowledgeReference(currentWorkspace, {
+                kbId: item.kbId,
+                entryId: item.entryId ?? null,
+                documentId: item.documentId ?? null,
+                entryTitle: item.name,
+                preview: item.preview ?? null,
+                assetKind: item.assetKind ?? null,
+            });
+            addReference(tabId, knowledgeRef);
+        } else if (item.type === 'template' && item.templateId) {
+            addReference(tabId, {
+                id: '',
+                type: ReferenceType.TEMPLATE,
+                createdAt: Date.now(),
+                templateId: item.templateId,
+                templateName: item.name,
+                templateType: 'workflow',
+            });
         }
         
         setTimeout(() => {
@@ -830,7 +878,10 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId, pendingMode = 'agen
                 const types = Array.from(e.dataTransfer.types);
                 const hasFilePath = types.includes('application/file-path') || types.includes('text/plain');
                 const hasFiles = types.includes('Files');
-                const hasBinderRef = types.includes('application/binder-reference-memory') || types.includes('application/binder-reference-chat');
+                const hasBinderRef =
+                    types.includes('application/binder-reference-memory') ||
+                    types.includes('application/binder-reference-chat') ||
+                    types.includes('application/binder-reference-kb');
                 
                 if (hasFilePath || hasFiles || hasBinderRef) {
                     e.dataTransfer.dropEffect = 'copy'; // 显示复制图标（创建引用）
@@ -928,4 +979,3 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId, pendingMode = 'agen
         </div>
     );
 };
-
