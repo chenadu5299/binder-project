@@ -1,593 +1,733 @@
 # Binder（合页）项目介绍
 
-## 文档头
+## 文档声明
 
-- 结构编码：`PROD-C-R-03`
-- 文档属性：`项目总览 / 当前代码实现全景介绍`
-- 主责模块：`PROD`
-- 文档职责：`对 Binder 当前代码实现的整体介绍；当前能力边界与实现状态说明；当前模块结构、技术栈、运行方式、已知限制的统一说明；面向项目理解、协作接入与现状认知的入口文档`
-- 直接承接：无
-- 使用边界：`本文描述的内容均以当前代码实现为唯一事实来源。所有结论均可在当前代码库中直接核对。本文不定义协议细节，不替代各专题主控文档，不作为需求或规划依据`
-- 变更要求：`修改本文前必须先核对相应代码实现，不得依据设计文档或需求文档判断当前事实；数据须重新统计代码库`
+本文以当前代码实现为唯一事实来源，用于说明 Binder 当前项目的真实实现状态、能力边界、系统结构与技术架构。
 
----
+本文不描述尚未落地的理想方案，不将规划能力视为现有能力，不以历史方案替代当前实现。仓库中的 PRD、方案文档和旧版介绍仅作为命名和背景核对材料；如与代码不一致，一律以当前代码为准。
 
 ## 文档信息
 
-- **版本**：v4.0
-- **更新日期**：2026年4月
-- **项目版本**：0.1.0（来源：`package.json` / `src-tauri/Cargo.toml`）
-- **数据来源**：当前代码库直接统计与核对（2026-04）；所有模块状态均基于代码实现，不基于设计文档
-
----
-
-## 一、项目概览
-
-### 1.1 基本信息
-
-| 项目 | 信息 |
-|------|------|
-| **项目名称** | Binder（合页） |
-| **产品形态** | 跨平台桌面应用（Tauri 2 + React 18） |
-| **应用定位** | 面向创作者与知识工作者的 AI 驱动文档编辑器 |
-| **当前版本** | 0.1.0 |
-
-### 1.2 当前代码已形成完整链路的能力
-
-以下能力在当前代码库中均有前后端完整调用链，可确认为已实现：
-
-1. **多格式文档编辑**：Markdown、HTML、TXT（TipTap 富文本直接编辑）；DOCX（经 Pandoc 转换后在 TipTap 中编辑，保存时转回 DOCX）
-2. **三层 AI 辅助**：
-   - 层次一：辅助续写（Cmd+J，`ai_autocomplete` → DeepSeek）
-   - 层次二：局部修改（Cmd+K，`ai_inline_assist` → DeepSeek）
-   - 层次三：对话编辑（右侧聊天面板，`ai_chat_stream`，两种用户可见模式：agent / chat）
-3. **AI 工具调用链**：对话 agent 模式下 AI 可调用文件读取、创建、更新、编辑器编辑、搜索等工具（DeepSeek 和 OpenAI 均已实现 SSE tool_calls 解析）
-4. **Diff 系统**：AI 编辑产生的变更以 DiffEntry 形式存入 diffStore（以 filePath 为键），用户逐条或批量接受/拒绝，接受操作逆序执行写盘
-5. **Workspace 数据库**（`.binder/workspace.db`，SQLite）：含文件 HTML 快照（file_cache）、待处理 Diff（pending_diffs）、文件依赖（file_dependencies）、Agent 任务（agent_tasks）、Agent Artifact（agent_artifacts）
-6. **Agent 任务跟踪**：前端 agentStore 维护每个聊天 Tab 的运行时状态（currentTask、stageState、verification、confirmation、artifacts）；后端写入 agent_tasks/agent_artifacts 表，推送 `ai-agent-stage-changed` 事件；前端监听并同步 shadow 状态
-7. **多格式预览**：DOCX、Excel、CSV、PDF、图片、演示文稿、音视频、HTML
-8. **全文搜索**：SQLite FTS5（`.binder/search.db`）
-9. **记忆库**：`.binder/workspace.db` + `user_memory.db`，分层记忆检索、注入与生命周期治理
-10. **图片处理**：插入、WebP 压缩、聊天图片保存
-
-### 1.3 当前代码可见预留结构或未形成完整能力的部分
-
-| 内容 | 当前状态 |
-|------|--------|
-| **Agent 显式 plan 阶段**（draft→structured 用户确认） | 代码中无此阶段逻辑，对话编辑直接从用户消息进入执行链 |
-| **知识库**（query_knowledge_base） | 协议有定义，代码中无完整实现 |
-| **模板库** | 代码中无实现 |
-| **Excel / 演示文稿编辑** | 当前仅预览，无编辑能力 |
-| **Anthropic / Gemini / Local 等 Provider** | 代码中仅有 DeepSeek 和 OpenAI 两个 Provider 实现 |
-| **记忆库与 Layer2/3 AI 集成** | 续写提示词中有记忆注入逻辑；Layer3 对话编辑中记忆注入尚未形成完整对接 |
-
----
-
-## 二、功能模块技术选型与实现状态
-
-### 2.1 文档编辑模块
-
-| 项目 | 技术选型 | 实现状态 | 说明 |
-|------|----------|----------|------|
-| **富文本引擎** | TipTap 3.11/3.13 + ProseMirror | ✅ 已实现 | StarterKit + Image、Link、Table、TaskList、TextStyle、Color、FontFamily、FontSize（自定义）、Underline、Subscript、Superscript、Highlight、TextAlign、Placeholder、CharacterCount |
-| **分页模式** | tiptap-pagination-plus（file: 本地依赖，v3.0.5） | ✅ 已实现 | DOCX 编辑时 `layoutMode='page'`，A4 794×1123px，PageTopCaretExtension 处理光标 |
-| **可编辑格式** | md / html / txt | ✅ 已实现 | TipTap 直接编辑；内容以 TipTap HTML 存储于 `file_cache` 保持 block ID |
-| **DOCX 编辑** | Pandoc + TipTap | ✅ 已实现 | Pandoc DOCX→HTML，TipTap 编辑，Pandoc HTML→DOCX 保存；需 Pandoc 安装 |
-| **保存** | documentService + Tauri | ✅ 已实现 | 文本 `write_file`；DOCX `save_docx`；保存后调用 `sync_workspace_file_cache_after_save` |
-| **精确块定位** | BlockIdExtension | ✅ 已实现 | paragraph、heading、blockquote、codeBlock、listItem、tableCell 带 `data-block-id` UUID |
-| **复制引用** | CopyReferenceExtension | ✅ 已实现 | 带 blockId + charOffset 四元组的精确文本引用 |
-| **外部修改检测** | check_external_modification（5s 轮询） | ✅ 已实现 | ExternalModificationDialog 弹窗；选择加载后静默 expire 当前文件所有 pending diffs |
-
-**DOCX 编辑完整流程**：
-```
-open_docx_for_edit → Pandoc DOCX→HTML → TipTap（layoutMode='page'）→ save_docx → Pandoc HTML→DOCX
-```
+- 结构编码：`PROD-C-R-03`
+- 文档属性：`项目总览 / 当前实现总览`
+- 更新时间：`2026-04-11`
+- 项目版本：`0.1.0`
+- 前端代码范围：`src/`
+- Tauri / Rust 代码范围：`src-tauri/src/`
 
-**Tab 关闭/重开 Block ID 保持**：每次保存后 `sync_workspace_file_cache_after_save` 写入 `file_cache`；重开时 `open_file_with_cache` 按 mtime 校验，命中则返回含原 block ID 的 HTML。DOCX 不走此路径，每次 open 重新 Pandoc 解析，block ID 全部重新生成。
+## I. 项目概述
 
----
+### 1.1 项目名称与当前定位
 
-### 2.2 预览模块
+Binder（合页）当前是一套基于 Tauri 2 的桌面端文档工作台。它已经不是单一的富文本编辑器，但也还不是完整办公套件。当前主链围绕四类能力组织：
 
-| 格式 | 实现状态 | 技术路径 | 关键组件/命令 |
-|------|----------|----------|--------------|
-| **DOCX** | ✅ 已实现 | LibreOffice → PDF → iframe（PDF 缓存） | DocxPdfPreview / `preview_docx_as_pdf` |
-| **Excel** | ✅ 已实现 | xlsx 解析（虚拟滚动）或 LibreOffice → PDF | ExcelTablePreview / `preview_excel_as_pdf` |
-| **CSV** | ✅ 已实现 | PapaParse 解析 + @tanstack/react-virtual 虚拟滚动 | CsvPreview |
-| **PDF** | ✅ 已实现 | `read_file_as_base64` → iframe | FilePreview |
-| **图片** | ✅ 已实现 | `read_file_as_base64` → img | FilePreview |
-| **演示文稿** | ✅ 已实现 | LibreOffice → PDF | PresentationPreview / `preview_presentation_as_pdf` |
-| **音视频** | ✅ 已实现 | `read_file_as_base64` → Blob URL → video/audio | MediaPreview |
-| **HTML** | ✅ 已实现 | Blob URL → iframe | FilePreview |
-
-**预览缓存位置**：
-- PDF 缓存：`{app_cache_dir}/pdf`
-- 临时文件：`{app_cache_dir}/temp`
-- LibreOffice 用户配置：`{app_cache_dir}/lo_user`
-
-**LibreOffice 依赖说明**：DOCX、Excel、演示文稿预览依赖 LibreOffice；PDF、图片、CSV、音视频预览不依赖。
+1. 本地工作区与文件树管理。
+2. 基于 TipTap 的文档编辑与多格式预览。
+3. 以 diff 审阅链为核心的 AI 辅助编辑。
+4. 以工作区数据库为中心的缓存、时间轴、记忆、知识、模板与 Agent 运行时持久化。
 
----
+### 1.2 当前产品形态
 
-### 2.3 AI 模块
+当前代码对应的产品形态是桌面应用，不是浏览器 SaaS，也不是云端协作系统。应用主界面由 `MainLayout` 组织，常态下包含：
 
-#### AI Provider 现状
+1. 左侧工作区面板：文件树、记忆库、知识库、模板库、时间轴。
+2. 中央编辑 / 预览区：编辑器、Office/PDF/媒体预览、文档分析等。
+3. 右侧聊天区：`chat` 和 `agent` 两种模式。
 
-| Provider | 实现状态 | 说明 |
-|----------|----------|------|
-| **DeepSeek** | ✅ 完整实现 | 流式响应、工具调用（SSE tool_calls 完整解析）均可用；HTTP/1.1 强制（避免 HTTP/2 连接问题）；请求超时 120s，连接超时 30s；支持 HTTP_PROXY / HTTPS_PROXY 环境变量 |
-| **OpenAI** | ✅ 完整实现 | 流式响应与工具调用均可用；SSE 解析覆盖 delta.tool_calls、finish_reason=tool_calls、[DONE] 三路分支；tool_choice 参数已正确传递 |
-| **Anthropic / Gemini / Local** | ❌ 未实现 | 仅有提及，代码中无对应 Provider 类 |
+### 1.3 当前主要服务对象
 
-**API Key 管理**：系统 Keyring（`ai_save_api_key` / `ai_get_api_key`），不明文存储。
+从当前能力边界看，Binder 更接近“面向知识工作者和内容创作者的本地文档工作台”，而不是通用企业协同平台。当前实现明显偏向单机、本地文件、个人工作区和 AI 审阅式改稿。
 
----
+### 1.4 当前版本性质
 
-#### 三层 AI 能力
-
-**层次一：辅助续写**
+当前版本应视为“演进中的桌面工作台 MVP”：
 
-| 项目 | 说明 |
-|------|------|
-| 触发 | Cmd+J |
-| 前端入口 | `useAutoComplete` hook → `AutoCompletePopover` 悬浮卡（Tab/Enter 应用，Esc 关闭） |
-| 后端命令 | `ai_autocomplete` → `deepseek.rs::autocomplete_enhanced` |
-| 输出 | 最多 3 条续写建议，`---` 分隔 |
-| 上下文构建 | context_before（≤600 字符）、context_after（≤400 字符）、文档结构信息、记忆库信息（可选） |
-| Prompt 结构 | `[文档概览]` + `[上下文内容]` + `[结构信息]` + `[记忆库信息]` + `[续写要求]` |
+1. 文档编辑、AI 审阅链、工作区缓存、时间轴、记忆等主能力已落地。
+2. 知识库和模板系统已有真实数据层与运行链，但产品化闭环仍不完全。
+3. 搜索、构建型工作流、多 Provider 扩展等能力存在明显未收口部分。
 
-**层次二：局部修改**
+## II. 项目基础规模概览
 
-| 项目 | 说明 |
-|------|------|
-| 触发 | Cmd+K |
-| 前端入口 | `useInlineAssist` hook → `InlineAssistPanel` 弹窗 |
-| 后端命令 | `ai_inline_assist` → `deepseek.rs::inline_assist` |
-| 输出格式 | JSON `{ kind: "edit" \| "reply", text: "..." }` |
-| 上下文构建 | instruction、选中文本、context_before/after（各 500 字符）、可选多轮 messages |
-| 独立性 | 独立弹窗，独立提示词，无聊天历史，结果不进入对话 Diff 主链 |
+### 2.1 统计口径
 
-**层次三：对话编辑**
-
-| 项目 | 说明 |
-|------|------|
-| 触发 | 右侧聊天面板；两种模式：**agent**（工具调用启用）/ **chat**（纯对话） |
-| 前端入口 | `chatStore` → `ChatPanel` → `ChatInput` / `InlineChatInput` |
-| 后端命令 | `ai_chat_stream`（SSE 流式）→ `context_manager.rs::build_prompt_package` |
-| 工具调用 | `tool_call_handler.rs` → `tool_service.rs`；结果写为 `role: "tool"` 消息，随后追加 `role: "user"` 的 `[NEXT_ACTION]` 控制消息驱动下一轮 |
-| 流式取消 | `ai_cancel_chat_stream`，基于 oneshot channel |
+本节统计以当前仓库核心源码为范围，前端按 `src/` 计，后端按 `src-tauri/src/` 计。纳入 `.ts`、`.tsx`、`.css`、`.rs` 四类源码文件，包含 `components`、`stores`、`services`、`hooks`、`utils`、`commands`、`workspace` 等主实现目录。未纳入 `node_modules`、`target`、`dist`、`build`、`.git`、缓存目录、文档文件、锁文件、配置文件、图片字体音视频等二进制或资源文件。
 
-**Prompt 构建（七层 PromptPackage）**：
+### 2.2 规模总览
 
-`context_manager.rs::build_prompt_package()` 产出七层结构，当前代码中实际注入内容的层：
-
-| 层 | Key | 内容 | 当前状态 |
-|----|-----|------|---------|
-| L1 | governance | 基础 system prompt（角色、规则、行为准则；agent / chat 两版差异） | ✅ 注入 |
-| L2 | task | agent_task_summary（最近 3 条 agent 任务状态）+ agent_artifacts_summary（最多 5 条 artifact） | ✅ 有值时注入 |
-| L3 | conversation | 消息历史（不在 system prompt 中，通过 messages 数组传递） | — |
-| L4 | fact | 当前文档内容、编辑器状态、block 列表、选区信息 | ✅ 注入 |
-| L5 | constraint | @mention 引用内容（按预算裁剪） | ✅ 有引用时注入 |
-| L6 | augmentation | 占位符（记忆库/知识库，暂未接入） | — |
-| L7 | tool_and_output | 占位符（工具 schema 通过 Provider 侧 function calling 传递） | — |
+| 指标 | 统计结果 |
+|---|---|
+| 核心源码文件数 | 239 |
+| 核心源码总行数 | 74,599 |
+| 前端代码行数 | 36,045 |
+| 后端代码行数 | 38,554 |
+| 前端占比 | 48.3% |
+| 后端占比 | 51.7% |
 
-**主要工具（agent 模式下可用）**：
-
-`read_file`、`create_file`、`update_file`（含 use_diff 模式）、`edit_current_editor_document`、`list_files`、`move_file`、`delete_file`、`search_documents`、`save_file_dependency`
-
-**`edit_current_editor_document` 特殊说明**：AI 编辑已在编辑器中打开的文件时必须使用此命令（不得用 `update_file`），否则编辑器 DOM 状态与磁盘文件不同步。
-
-**ToolResult.meta**：两条编辑链（`edit_current_editor_document` / `update_file`）成功时返回 candidate_ready meta（gate + verification=passed + confirmation=pending + artifact=diff_candidate）；NO_OP 时返回 no_op meta；错误路径返回 verification=failed meta。
-
-**BuildModePolicy**：`tool_policy.rs` 中的统一 TPA force-continue 门禁。`default_writing()` 关闭 TPA 裁定（主写作链默认）；`build_mode()` 仅对 RecursiveCheck / FileOrganization 任务类型开放自动续轮。
-
----
+从当前统计口径看，项目总体规模约 7.46 万行核心源码，前后端体量接近，Rust 后端略高于前端，整体更接近“前后端并重的桌面应用”而不是单纯 UI 工程。
 
-#### Agent 任务跟踪（当前代码已实现部分）
-
-当前代码中已形成完整链路的 Agent 跟踪能力：
-
-| 能力 | 实现位置 | 说明 |
-|------|---------|------|
-| **per-tab 运行时状态** | `src/stores/agentStore.ts` | `AgentRuntimeRecord`：currentTask、recentTasks（最近 5 条）、stageState、verification、confirmation、artifacts |
-| **任务持久化** | `src/services/agentTaskPersistence.ts` | 写入 `workspace.db::agent_tasks`（fire-and-forget） |
-| **Artifact 写穿** | `src-tauri/src/commands/ai_commands.rs` | 流启动写 verification/confirmation pending；candidate 产出写 verification=passed |
-| **Stage 写入与事件推送** | `ai_commands.rs::write_task_stage` | 写 DB + 发送 `ai-agent-stage-changed` Tauri 事件；shadow-tab: 代理键仅发事件不写 DB |
-| **前端事件接收** | `src/components/Chat/ChatPanel.tsx` | 监听 `ai-agent-stage-changed` → `agentStore.setStageState()` |
-| **Stage 流向** | 前后端联动 | `structured → candidate_ready → review_ready → user_confirmed → stage_complete` |
-| **Shadow lifecycle** | `src/utils/agentShadowLifecycle.ts` | markAgentUserConfirmed / markAgentStageComplete / markAgentRejected / markAgentInvalidated；状态变更同步写 DB |
-| **任务恢复** | `agentStore.loadTasksFromDb` | Tab 创建时从 `agent_tasks` 恢复 lifecycle=active 的任务 |
-| **Prompt 注入** | `context_manager.rs` L2 task 层 | 读取最近 3 条 agent_tasks + 最多 5 条 artifacts 注入系统提示 |
+### 2.3 技术分布概览
 
-当前代码中**未形成完整链路**（仅有设计文档，代码中无对应实现）：
+| 语言 / 技术类型 | 行数 | 占比 | 说明 |
+|---|---|---|---|
+| TypeScript / TSX | 35,595 | 47.7% | 前端主实现语言，覆盖 UI、编辑器、状态管理与前端服务编排 |
+| Rust | 38,554 | 51.7% | Tauri 后端主实现语言，承担文件、数据库、AI、工具链与本地服务能力 |
+| CSS | 450 | 0.6% | 前端样式补充，体量很小，不构成主要实现负担 |
 
-- 显式 plan 阶段（draft→structured 的用户确认流程）
-- 设计文档中描述的九状态 BA-STATE 正式状态机
-- 知识库集成
-
----
-
-### 2.4 Diff 系统
-
-| 项目 | 技术选型 | 实现状态 | 说明 |
-|------|----------|----------|------|
-| **状态存储** | diffStore（Zustand），以 filePath 为键 | ✅ 已实现 | 多文件 diff 并存；DiffEntry 含 startBlockId、endBlockId、originalText、newText、agentTaskId |
-| **文档内标记** | DiffDecorationExtension（ProseMirror Decoration.inline） | ✅ 已实现 | 红色删除线装饰，blockRangeToPMRange 定位 |
-| **批量接受/拒绝** | accept_file_diffs / reject_file_diffs | ✅ 已实现 | 逆序执行保证位置偏移正确 |
-| **单卡接受** | applyDiffReplaceInEditor | ✅ 已实现 | 含 originalText 校验 |
-| **批量操作 UI** | PendingDiffPanel / DiffAllActionsBar | ✅ 已实现 | 按文件分组展示，支持批量操作 |
-| **算法** | similar crate（后端）+ diff npm（前端） | ✅ 已实现 | 后端用于 canonical diff 计算；前端用于 diff 展示 |
-| **失效处理** | markExpired，9 种 DiffExpireReason | ✅ 已实现 | 所有失效路径均接入 markAgentInvalidated shadow 回写 |
-| **跨会话 block ID** | workspace.db file_cache | ✅ 已实现 | md/txt 跨 tab 关闭保持；DOCX 每次 open 重新生成 |
-
-**Diff 失效场景**：
-- 外部文件修改：用户选择"加载外部更改"时，当前文件所有 pending diffs 静默 expire
-- 应用关闭：有 pending diffs 时弹确认框（重启后 block ID 重生成，diffs 失效）
-- originalText 不匹配：编辑区域与 diff 记录不符时标记 expired + toast 提示
-
-**已知问题**：`ToolCallCard.tsx` 存在一条接受路径仅标记 expired 而不提示用户（主要路径已有 toast），属于残余不一致。
-
----
-
-### 2.5 文件与工作区
-
-| 项目 | 技术选型 | 实现状态 | 说明 |
-|------|----------|----------|------|
-| **工作区配置** | `~/.config/binder/workspaces.json` | ✅ 已实现 | 最多保留 10 个最近工作区；fileStore 管理 currentWorkspace |
-| **文件树** | build_file_tree + FileTreePanel | ✅ 已实现 | 递归扫描、拖拽、增删改移、右键菜单 |
-| **文件监听** | notify crate + FileWatcherService | ✅ 已实现 | 监听工作区文件变动 |
-| **外部修改检测** | check_external_modification（5s 轮询） | ✅ 已实现 | ExternalModificationDialog 弹窗 |
-| **文件分类** | file_classifier + classify_files | ✅ 已实现 | organize_files 整理文件 |
-
-**Workspace 数据库**（`.binder/workspace.db`，SQLite，migration v2）：
-
-| 表 | 迁移版本 | 用途 | 关键字段 |
-|----|---------|------|----------|
-| `file_cache` | v1 | 文件 HTML 快照（含 block ID） | file_path、file_type、cached_content、content_hash、mtime |
-| `pending_diffs` | v1 | 待处理 AI 编辑 Diff | file_path、original_text、new_text、diff_type、status |
-| `file_dependencies` | v1 | 文件间依赖关系 | source_path、target_path、dependency_type |
-| `ai_tasks` | v1 | 遗留表（v1 创建，当前不被主链消费） | task_id、status、affected_files |
-| `agent_tasks` | v2 | Agent 任务状态持久化 | id、chat_tab_id、goal、lifecycle、stage、stage_reason |
-| `agent_artifacts` | v2 | Agent 中间态 artifact | id、task_id、kind、status、summary |
-| `_schema_version` | — | 数据库迁移版本管理 | version（当前最高 3） |
-
----
-
-### 2.6 搜索模块
-
-| 项目 | 技术选型 | 实现状态 | 说明 |
-|------|----------|----------|------|
-| **全文索引** | SQLite FTS5（`.binder/search.db`） | ✅ 已实现 | FTS5 虚拟表 `documents_fts`，unicode61 tokenizer |
-| **索引构建** | `build_index_async` + walkdir | ✅ 已实现 | 递归扫描工作区，异步建索引 |
-| **单文档索引** | `index_document` / `remove_document_index` | ✅ 已实现 | 增量更新 |
-| **全文查询** | `search_documents` + SearchPanel | ✅ 已实现 | 全文匹配 |
-| **前端模糊搜索** | Fuse.js | ✅ 已实现 | 文件名/路径模糊过滤 |
-| **FTS5 兼容性** | unicode61 tokenizer | ⚠️ 已知问题 | 部分 SQLite 编译版本不支持 `remove_diacritics` 选项，导致索引初始化失败 |
-
----
-
-### 2.7 记忆库
-
-| 项目 | 实现状态 | 说明 |
-|------|----------|------|
-| **存储** | ✅ 已实现 | 工作区级记忆存放于 `.binder/workspace.db`；用户级记忆存放于 `user_memory.db` |
-| **来源** | ✅ 已实现 | 系统规则写入（tab 提炼、content 提炼、tab 删除升格）；本阶段不暴露 `save_memory` 工具 |
-| **操作命令** | ✅ 已实现 | `mark_orphan_tab_memories_stale`、`search_memories_cmd`、`on_tab_deleted_cmd`、`startup_memory_maintenance`、`expire_memory_item`、`expire_memory_layer`、`get_memory_user_data` |
-| **一致性检查** | ❌ 未作为当前主链实现 | 旧 `check_memory_consistency` / `ConsistencyChecker` 已移除，避免伪入口 |
-| **UI** | ✅ 已实现 | 当前主入口为 `MemoryTab`；旧 `MemorySection` 已移除 |
-| **虚拟滚动** | ⚠️ 待优化 | 大量记忆时无虚拟滚动，列表性能待处理 |
-| **与 Layer3 AI 集成** | ⚠️ 部分实现 | 续写（Layer1）提示词中有记忆注入逻辑；Layer3 对话编辑中记忆注入尚未形成完整对接 |
-
----
-
-### 2.8 图片处理
-
-| 项目 | 实现状态 | 说明 |
-|------|----------|------|
-| **插入** | ✅ 已实现 | `insert_image`；支持 base64 嵌入或相对路径 |
-| **WebP 压缩** | ✅ 已实现 | `image_service.rs`；pandoc_service 中处理 DOCX 内图片 |
-| **存在检查 / 删除** | ✅ 已实现 | `check_image_exists`、`delete_image` |
-| **聊天图片** | ✅ 已实现 | `save_chat_image`，保存到工作区 |
-
----
-
-## 三、技术栈
-
-### 3.1 前端
-
-以下版本来源于 `package.json`：
-
-| 技术 | 版本 | 用途 |
-|------|------|------|
-| React | ^18.2.0 | UI 框架 |
-| TypeScript | ^5.3.3 | 类型安全 |
-| Vite | ^5.0.8 | 构建工具 |
-| Zustand | ^4.4.7 | 状态管理 |
-| TipTap | ^3.11.x / ^3.13.x（多扩展混版） | 富文本编辑框架 |
-| tiptap-pagination-plus | file:（v3.0.5，本地 file: 依赖） | A4 分页扩展 |
-| Tailwind CSS | ^3.4.0 | 样式 |
-| @headlessui/react | ^1.7.17 | 无障碍 UI 组件 |
-| @heroicons/react | ^2.1.1 | 图标 |
-| @tanstack/react-virtual | ^3.13.13 | 虚拟滚动 |
-| Fuse.js | ^7.1.0 | 前端模糊搜索 |
-| PapaParse | ^5.5.3 | CSV 解析 |
-| xlsx | ^0.18.5 | Excel 解析 |
-| pdfjs-dist | ^3.11.174 | PDF 渲染 |
-| diff | ^8.0.2 | 前端文本差异计算 |
-| @tauri-apps/api | ^2.0.0 | Tauri IPC |
-| @tauri-apps/plugin-dialog | ^2.4.2 | 文件对话框 |
-
-### 3.2 后端（Rust）
-
-以下版本来源于 `src-tauri/Cargo.toml`：
-
-| 技术 | 版本 | 用途 |
-|------|------|------|
-| Tauri | 2.0 | 桌面应用框架 |
-| serde / serde_json | 1.0 | 序列化/反序列化 |
-| tokio | 1.0 (features: full) | 异步运行时 |
-| tokio-stream / tokio-util | 0.1 / 0.7 | 流式异步工具 |
-| reqwest | 0.11 (json, stream) | HTTP 客户端（AI API） |
-| keyring | 2.0 | 系统密钥链（API Key 存储） |
-| notify | 6.0 | 文件系统监听 |
-| rusqlite | 0.31 (bundled, FTS5) | SQLite 嵌入式数据库 |
-| zip | 0.6 | ZIP/DOCX 解压 |
-| quick-xml | 0.31 (serialize) | XML 解析（DOCX 内部） |
-| similar | 2.4 | 高性能 Diff 算法 |
-| image | 0.24 | 图片处理 |
-| webp | 0.3 | WebP 编解码 |
-| scraper | 0.18 | HTML 解析 |
-| regex | 1.10 | 正则表达式 |
-| walkdir | 2.4 | 目录递归遍历 |
-| uuid | 1.0 (v4) | UUID 生成 |
-| chrono | 0.4 (serde) | 时间处理 |
-| base64 | 0.22.1 | Base64 编解码 |
-| sha2 | 0.10 | 哈希校验 |
-| once_cell | 1.19 | 全局单例 |
-| async-trait | 0.1 | 异步 trait |
-| dirs | 5.0 | 系统目录路径 |
-| which | 5.0 | 外部工具查找 |
-
-### 3.3 外部工具依赖
-
-| 工具 | 用途 | 必要性 |
-|------|------|--------|
-| **Pandoc** | DOCX↔HTML 转换（编辑/保存）；AI 工具 read_file 读取 DOCX | DOCX 功能必须 |
-| **LibreOffice** | DOCX / Excel / 演示文稿 → PDF 预览 | 相关预览必须；其他功能不依赖 |
-
----
-
-## 四、代码规模
-
-以下数据基于 2026-04 代码库直接统计（删除废弃文件后的当前状态）：
-
-| 范围 | 行数 | 文件数 |
-|------|------|--------|
-| 前端 `src/`（.ts / .tsx） | ~32,755 | 153 |
-| 后端 `src-tauri/src/`（.rs） | ~26,072 | 60 |
-| **合计** | **~58,827** | **213** |
-
-### 前端大文件（≥800 行）
-
-| 文件 | 行数 | 说明 |
-|------|------|------|
-| `stores/diffStore.ts` | 1,633 | Diff 状态管理（最大前端文件） |
-| `components/Chat/InlineChatInput.tsx` | 1,417 | 行内聊天输入 |
-| `components/Chat/ChatPanel.tsx` | 1,083 | 聊天主面板 |
-| `components/Chat/ChatInput.tsx` | 930 | 聊天输入框 |
-| `components/Editor/EditorPanel.tsx` | 920 | 编辑器主面板 |
-| `components/Editor/CsvPreview.tsx` | 901 | CSV 预览 |
-| `components/Editor/ExcelTablePreview.tsx` | 879 | Excel 表格预览 |
-| `components/Chat/ToolCallCard.tsx` | 840 | 工具调用卡片 |
-| `stores/chatStore.ts` | 809 | 聊天状态管理 |
-
-### 后端大文件（≥900 行）
-
-| 文件 | 行数 | 说明 |
-|------|------|------|
-| `services/pandoc_service.rs` | 4,544 | DOCX↔HTML 转换（最大后端文件） |
-| `commands/ai_commands.rs` | 4,125 | AI 命令全部入口 |
-| `services/tool_service.rs` | 2,539 | 工具调用执行逻辑 |
-| `commands/file_commands.rs` | 1,940 | 文件操作命令 |
-| `services/libreoffice_service.rs` | 1,487 | LibreOffice 调用 |
-| `services/ai_providers/deepseek.rs` | 1,140 | DeepSeek Provider |
-| `services/context_manager.rs` | 946 | Prompt 构建（七层 PromptPackage） |
-
----
-
-## 五、Tauri 命令（共 74 个）
-
-以下命令均注册在 `main.rs::tauri::generate_handler![]` 中，当前统计 74 个：
-
-### 文件命令（file_commands.rs，34 个）
-
-```
-build_file_tree、read_file_content、read_file_as_base64、write_file、
-create_file、create_folder、open_workspace_dialog、load_workspaces、
-open_workspace、check_external_modification、get_file_modified_time、
-get_file_size、move_file_to_workspace、move_file、rename_file、
-delete_file、duplicate_file、check_pandoc_available、
-open_docx_for_edit、preview_docx_as_pdf、preview_excel_as_pdf、
-preview_presentation_as_pdf、create_draft_docx、create_draft_file、
-save_docx、list_folder_files、save_external_file、
-cleanup_temp_files、cleanup_expired_temp_files、cleanup_all_temp_files、
-record_binder_file、get_binder_file_source、remove_binder_file_record、
-clear_preview_cache
-```
-
-### AI 命令（ai_commands.rs + positioning_snapshot.rs，9 个）
-
-```
-ai_autocomplete、ai_inline_assist、ai_chat_stream、
-ai_save_api_key、ai_get_api_key、ai_cancel_request、
-ai_cancel_chat_stream、ai_analyze_document、
-positioning_submit_editor_snapshot
-```
-
-### Workspace 命令（workspace_commands.rs，13 个）
-
-```
-open_file_with_cache、open_docx_with_cache、ai_edit_file_with_diff、
-accept_file_diffs、reject_file_diffs、sync_workspace_file_cache_after_save、
-get_file_dependencies、save_file_dependency、
-upsert_agent_task、update_agent_task_stage、get_agent_tasks_for_chat_tab、
-upsert_agent_artifact、get_agent_artifacts_for_task
-```
-
-### 图片命令（image_commands.rs，4 个）
-
-```
-insert_image、check_image_exists、delete_image、save_chat_image
-```
-
-### 搜索命令（search_commands.rs，4 个）
-
-```
-search_documents、index_document、remove_document_index、build_index_async
-```
-
-### 记忆库命令（memory_commands.rs，7 个）
-
-```
-mark_orphan_tab_memories_stale、search_memories_cmd、on_tab_deleted_cmd、
-startup_memory_maintenance、expire_memory_item、expire_memory_layer、
-get_memory_user_data
-```
-
-### 分类命令（classifier_commands.rs，2 个）
-
-```
-classify_files、organize_files
-```
-
-### 工具命令（tool_commands.rs，2 个）
-
-```
-execute_tool、execute_tool_with_retry
-```
-
----
-
-## 六、前端组件与 Store
-
-### 6.1 主要组件
-
-| 模块 | 主要组件 |
-|------|---------|
-| **Layout** | MainLayout、TitleBar、PanelResizer、WelcomeDialog |
-| **Chat** | ChatPanel、ChatMessages、ChatInput、InlineChatInput、ToolCallCard、ToolCallSummary、DiffCard、DocumentDiffView、DiffAllActionsBar、FloatingActionButton、QuickApplyButton、EditMode、WorkPlanCard、FileDiffCard、AuthorizationCard、MentionSelector、ModelSelector、FileSelector、ReferenceManagerButton、InlineReferenceTag、CollapsibleReference、ChatTabs、MessageContextMenu |
-| **Editor** | TipTapEditor、EditorPanel、EditorToolbar、EditorStatusBar、EditorTabs、DocxPdfPreview、ExcelTablePreview、CsvPreview、PresentationPreview、MediaPreview、PreviewToolbar、FilePreview、InlineAssistPanel、InlineAssistInput、AutoCompletePopover、MarginsModal、PageSizeDropdown、DocxPageNavigator、PageNavigator、OutlinePanel、DocumentAnalysisPanel、DiffView、ExternalModificationDialog |
-| **FileTree** | FileTree、FileTreePanel、FileTreeNode、ResourceToolbar、SearchPanel、HistorySection、KnowledgeSection、InstructionSection、FileTreeContextMenu、NewFileButton、InputDialog、OrganizeFilesDialog、FileIcon、CollapsibleSection |
-| **Memory** | MemoryTab、MemoryEditor、MemoryDetailPanel |
-| **Common** | LoadingSpinner、Button、Modal、Toast、ErrorBoundary |
-| **Settings** | APIKeyConfig、ThemeSelector |
-
-### 6.2 TipTap Extensions（自定义）
-
-| Extension | 用途 |
-|-----------|------|
-| BlockIdExtension | 为每个块节点注入 `data-block-id`，支持精确定位 |
-| CopyReferenceExtension | 复制时携带 blockId + charOffset 四元组 |
-| DiffDecorationExtension | ProseMirror Decoration.inline 渲染红色删除线 |
-| FontSize | 字体大小调整 |
-| PageTopCaretExtension | 分页模式光标处理 |
-| BlankLineDebugExtension | 空行调试 |
-
-### 6.3 Zustand Store（8 个）
-
-| Store | 职责 |
-|-------|------|
-| `chatStore` | 聊天 tab、消息列表、ChatMode（`'agent' \| 'chat'`）、流式状态、工具调用块 |
-| `diffStore` | 以 filePath 为键的 DiffEntry 列表；ExecutionExposure 日志 |
-| `editorStore` | 编辑器 tab、TipTap Editor 实例引用、dirty/saving 状态、documentRevision |
-| `fileStore` | 当前工作区路径、文件树状态 |
-| `agentStore` | 每个聊天 tab 的 AgentRuntimeRecord（currentTask、stageState、verification、confirmation、artifacts、recentTasks） |
-| `referenceStore` | 行内 @mention 引用列表 |
-| `layoutStore` | 面板尺寸、侧边栏可见性 |
-| `themeStore` | 主题选择 |
-
-### 6.4 主要 Hook
-
-| Hook | 用途 |
-|------|------|
-| `useAutoComplete` | 辅助续写触发与 AutoCompletePopover 控制 |
-| `useInlineAssist` | 局部修改弹窗控制 |
-| `useMentionData` | @mention 数据获取 |
-| `usePaginationFromEditor` | 分页状态从编辑器提取 |
-
----
-
-## 七、构建与运行
-
-### 7.1 必要环境
-
-| 工具 | 要求 | 说明 |
-|------|------|------|
-| Node.js | ≥ 18 | 前端构建 |
-| Rust | ≥ 1.70 | 后端编译 |
-| Pandoc | 任意可用版本 | DOCX 编辑/保存必须 |
-| LibreOffice | 可选 | DOCX/Excel/演示文稿预览，无则相关预览不可用 |
-
-### 7.2 命令
-
-```bash
-# 安装依赖（首次 clone 后必须运行）
-npm install
-
-# 开发模式（同时启动 Tauri + Vite 开发服务器）
-npm run tauri:dev
-
-# 构建前端（包含先构建本地分页库 tiptap-pagination-plus）
-npm run build
-
-# 仅构建本地分页库
-npm run build:pagination
-
-# 打包桌面应用
-npm run tauri:build
-```
-
----
-
-## 八、当前已知问题与边界
-
-以下内容均基于当前代码库直接核对确认：
-
-### 功能性问题
-
-| 问题 | 位置 | 说明 |
-|------|------|------|
-| **无全局工具调用轮次上限** | `services/loop_detector.rs` | LoopDetector 可被参数微变绕过计数；max_force_continue_retries 不限制单轮工具调用数，可能在异常条件下形成无限工具链 |
-| **ToolResult.new_content 语义不一致** | `services/tool_service.rs` | Anchor/Resolver 路径返回当前文档 HTML，Legacy 路径返回完整新 HTML，两路语义不统一 |
-| **ToolCallCard 一条接受路径不提示** | `components/Chat/ToolCallCard.tsx` | 有一条接受路径仅标记 expired 而不 toast 提示用户；主要路径已有提示，属残余不一致 |
-| **Tauri save 回调竞态（残余）** | EditorPanel.tsx + editorStore | 主要竞态已修复；isSaving 短暂误清的残余影响极小 |
-
-### 功能限制
-
-| 限制 | 说明 |
-|------|------|
-| **FTS5 tokenizer 兼容性** | 部分 SQLite 编译版本不支持 `unicode61 remove_diacritics=2`，导致索引初始化失败 |
-| **DOCX block ID 不跨 session 保留** | 每次 open 重新 Pandoc 解析，block ID 全部重新生成；应用关闭后 pending diffs 对应 block ID 失效 |
-| **记忆库无虚拟滚动** | 大量记忆时列表性能差 |
-| **Excel / 演示文稿无编辑** | 当前仅预览 |
-| **单 Provider 主链** | 当前主写作链仅经测试的 Provider 为 DeepSeek；OpenAI 工具调用链代码已实现但实际集成程度需单独验证 |
-
----
-
-## 九、相关文档
-
-以下文档为各专题设计/规划文档，仅作阅读索引。**本文档不依据以下文档判断当前实现事实**：
-
-| 文档 | 定位 |
-|------|------|
-| `A-AG-X-L-01_Binder Agent落地开发计划.md` | Agent 分阶段落地计划 |
-| `R-DE-M-R-01_对话编辑-主控设计文档.md` | 对话编辑实现细节（Resolver、canonical diff、块列表） |
-| `R-DE-M-R-03_文档逻辑状态传递规范.md` | getLogicalContent / baseline 逻辑状态规范 |
-| `R-WS-M-R-02_Workspace改造可落地实施方案.md` | Workspace 改造方案 |
-| `AI功能优化开发计划.md` / `AI功能优化开发计划（下）.md` | AI Phase 0–3 开发计划 |
-| `A-VAL-X-R-02_代码遗留与清理台账.md` | 代码遗留项登记与清理追踪 |
-| `R-ED-M-R-08_分页功能说明.md` | 分页实现说明 |
-
----
-
-**文档更新时间**：2026年4月
+当前主实现语言是 TypeScript / TSX 与 Rust 双主栈，CSS 只占极小比例。就代码体量而言，Binder 不是“前端很薄、后端很轻”的壳应用，而是前端交互层和本地后端服务层都已形成较完整实现。
+
+### 2.4 主要代码区域分布
+
+| 目录 | 文件数 | 行数 | 说明 |
+|---|---|---|---|
+| `src/components` | 95 | 24,680 | 前端界面主体，包含编辑器、聊天、文件树、预览等交互实现 |
+| `src/components/Editor` | 33 | 9,533 | 编辑器主链、预览切换与文档交互核心 |
+| `src/components/Chat` | 26 | 8,841 | 对话、Agent、工具卡片与审阅交互主链 |
+| `src/stores` | 10 | 3,564 | Zustand 状态主链，承接文件、编辑器、聊天、diff、agent 等运行时状态 |
+| `src/services` | 9 | 2,022 | 前端服务封装与 Tauri 调用编排 |
+| `src/utils` | 30 | 3,596 | 前端通用工具、路径处理、定位与引用辅助 |
+| `src-tauri/src/services` | 52 | 26,524 | 后端主体体量，集中在 AI、文档转换、知识、记忆、模板、搜索等服务 |
+| `src-tauri/src/commands` | 11 | 8,248 | Tauri command 边界，负责前后端能力暴露 |
+| `src-tauri/src/workspace` | 7 | 3,384 | 工作区数据库、缓存、diff、时间轴与恢复主链 |
+
+如果按主链理解体量分布，前端的主要体量集中在 `components`，尤其是编辑器和聊天；后端的主要体量集中在 `services`，其次是 `commands` 与 `workspace`。这与项目当前形态一致：前端负责复杂交互与编辑器编排，后端负责文件系统、本地数据库、AI 调用和工作区事实层。
+
+### 2.5 规模结论
+
+在当前统计口径下，Binder 已具备中等以上桌面应用工程体量。代码主体由前端 TypeScript / TSX 与 Rust 后端双主栈构成，前端负责 UI、编辑器交互与状态编排，后端负责文件、数据库、AI、工作区与本地服务能力。从代码分布看，项目并非纯界面型应用，而是已经形成较完整本地桌面系统结构。
+
+## III. 当前系统能力总览
+
+### 3.1 已实现能力
+
+| 能力域 | 当前状态 | 说明 |
+|---|---|---|
+| 工作区打开与最近工作区管理 | 已实现 | `open_workspace` 打开工作区，最近工作区写入 `~/.config/binder/workspaces.json` |
+| 文件树与本地资源 CRUD | 已实现 | 新建、删除、移动、重命名、复制、拖拽与组织能力均有前后端链路 |
+| Markdown / TXT / HTML 编辑 | 已实现 | 基于 TipTap 直接编辑 |
+| DOCX 类文档编辑链 | 已实现 | `.docx/.doc/.odt/.rtf` 统一走文档转换链，编辑核心仍是 HTML + TipTap |
+| 多格式预览 | 已实现 | PDF、图片、音视频、CSV、Excel、演示文稿、DOCX 预览均有链路 |
+| AI 三层能力 | 已实现 | 续写、局部修改、对话式编辑均已接入 |
+| AI 流式响应与工具调用 | 已实现 | OpenAI / DeepSeek 均支持 SSE 流式输出和 tool calls |
+| Diff 审阅链 | 已实现 | 生成、展示、接受、拒绝、失效治理均已落地 |
+| 外部文件修改检测 | 已实现 | 编辑中轮询检测并弹出冲突处理对话框 |
+| 工作区缓存与 canonical 内容链 | 已实现 | `file_cache`、`content_hash`、`mtime`、block id 保真已接入主链 |
+| 时间轴与恢复 | 已实现 | 可记录保存/结构变更节点，支持预览恢复和正式恢复 |
+| Agent 任务 / Artifact 持久化 | 已实现 | `agent_tasks`、`agent_artifacts` 已进入主链 |
+| 记忆库 | 已实现 | 工作区级和用户级记忆、检索、过期治理、上下文注入均有实现 |
+
+### 3.2 部分实现或已接入但未完全闭环的能力
+
+| 能力域 | 当前状态 | 说明 |
+|---|---|---|
+| 知识库 | 部分实现 | 数据层、查询、重建、策略更新、自动检索注入已实现；当前主 UI 更偏管理和引用，导入入口不完整 |
+| 模板库 / 工作流模板 | 部分实现 | 已实现工作流模板、解析、编译、运行时；不是通用文档模板库 |
+| 全文搜索 | 部分实现 | `search.db` 与 FTS5 后端存在，但主布局未挂载独立全文检索面板，完整索引构建也未完全进入用户主链 |
+| Agent 工作流执行 | 部分实现 | 已有任务、Artifact、工作流执行状态和人工干预接口，但不是完整构建模式或多 Agent 系统 |
+| 非当前文件精确编辑 | 部分实现 | 已有 block id、anchor、baseline 与门禁链，但精度仍受 canonical 映射和基线有效性约束 |
+
+### 3.3 未实现、仅预留或不应写成现状的能力
+
+| 能力域 | 当前状态 | 说明 |
+|---|---|---|
+| Excel / 演示文稿编辑 | 未实现 | 当前仅预览，不存在正式编辑链 |
+| 完整多 Provider 体系 | 未实现 | 真实接入只有 OpenAI 与 DeepSeek；Anthropic、Gemini、Local 仅停留在注释或预留层 |
+| 完整构建模式 / 多 Agent 协同 | 未实现 | 仅有部分策略和运行时结构，不应描述为正式主链 |
+| 通用知识平台 / 模板平台 | 未实现 | 当前实现仍是工作区内的局部系统，不是完整平台产品 |
+
+### 3.4 已废弃、历史残留或不应再作为现行能力描述的内容
+
+| 项目 | 当前判断 | 说明 |
+|---|---|---|
+| `ai_tasks` 旧表 | 历史残留 | `workspace.db` 仍保留旧表，但主链使用 `agent_tasks` |
+| `src/components/Chat/EditMode.tsx` | 历史残留 | 文件存在，但当前主界面未挂载，不应作为当前聊天编辑主链描述 |
+| 独立全文搜索面板 | 未接入主布局 | `src/components/Search/SearchPanel.tsx` 存在，但当前挂载的是文件树过滤面板而非该组件 |
+| “模板库承接 skills / 通用模板” | 不成立 | 当前挂载的模板库明确只承接工作流模板 |
+
+## IV. 文件与文档能力
+
+### 4.1 当前支持边界
+
+Binder 当前不是“所有 Office 文档都可编辑”的系统，而是按三类链路处理文件：
+
+| 文件类型 | 当前处理方式 | 说明 |
+|---|---|---|
+| `.md` / `.txt` / `.html` | 直接编辑 | 直接进入 TipTap 编辑链 |
+| `.docx` / `.doc` / `.odt` / `.rtf` | 转换后编辑 | 统一映射为文档转换链，编辑核心仍为 HTML |
+| `.xlsx` / `.xls` / `.ods` / `.csv` | 预览为主 | CSV 有表格预览； Excel/ODS 走解析或预览链，不进入正式编辑器主链 |
+| `.pptx` / `.ppt` / `.ppsx` / `.pps` / `.odp` | 预览为主 | 通过 LibreOffice 转 PDF 预览 |
+| `.pdf` | 预览 | 不可编辑 |
+| 图片 / 音频 / 视频 | 预览 | 不可编辑 |
+
+### 4.2 文件打开策略
+
+`documentService` 会先识别文件类型，再结合文件来源决定“直接编辑”还是“只读预览”。
+
+当前来源判断分为：
+
+1. `new`：Binder 原生创建。
+2. `ai_generated`：AI 工具链创建。
+3. `external`：外部导入或未记录元数据的文件。
+
+当前实际规则是：
+
+1. 文本类文件即使来源为 `external`，也允许直接编辑。
+2. 文档转换类文件如果来源为 `external`，默认先进入预览，只能在强制编辑或草稿路径下进入编辑链。
+3. Binder 自己创建或 AI 生成的文档文件，可以直接进入编辑链。
+
+### 4.3 打开、保存与缓存复用
+
+当前保存链不是单纯写磁盘，而是“写盘 + 缓存同步 + 时间轴记录”三段式：
+
+1. 前端保存调用 `documentService.saveFile`。
+2. 文本类文件写盘后调用 `sync_workspace_file_cache_after_save` 更新 `file_cache`。
+3. 保存成功后调用 `record_saved_file_timeline_node` 记录时间轴节点。
+
+这意味着 `workspace.db` 中的缓存不是旁路缓存，而是编辑保真、AI 基线和时间轴的一部分。
+
+### 4.4 外部修改检测
+
+当前主链对“已打开且可编辑且未脏”的标签页做 5 秒轮询。检测到磁盘变更后，会弹出 `ExternalModificationDialog`，允许：
+
+1. 继续覆盖。
+2. 重新加载磁盘内容。
+3. 比较差异。
+4. 取消。
+
+如果用户选择重新加载，当前文件的 pending diffs 会被主动失效处理。
+
+## V. 编辑器系统与文档编辑机制
+
+### 5.1 编辑器基础架构
+
+前端编辑器基于 TipTap 3 和 ProseMirror，当前实际启用的核心能力包括：
+
+1. `StarterKit` 基础文档模型。
+2. 图片、链接、表格、任务列表、文本样式、颜色、下划线、上标、下标等扩展。
+3. `tiptap-pagination-plus` 分页模式，主要服务 DOCX 编辑链。
+4. 多个 Binder 自定义扩展：`BlockIdExtension`、`DiffDecorationExtension`、`CopyReferenceExtension`、`PageTopCaretExtension`、`FontSize` 等。
+
+### 5.2 分页编辑现状
+
+分页能力真实存在，但当前主要服务于 DOCX/类 DOCX 文档的页面化编辑视图。其本质仍然是 HTML 文档在 TipTap 中编辑，不是原生 Word 布局引擎，也不保证与 Office 完全一致。
+
+### 5.3 Block ID、anchor 与精确定位现状
+
+Binder 当前已经落地的是“块级稳定标识 + 偏移定位”链路：
+
+1. 块级节点会注入 `data-block-id`。
+2. 选区会被转换为 `{ startBlockId, startOffset, endBlockId, endOffset }` 形式的 anchor。
+3. 引用复制和 AI 精确编辑都依赖这套 block id / offset 机制。
+
+当前尚未落地的是更高阶的语义级定位系统。也就是说，当前精确编辑能力以 HTML 块和字符偏移为基准，不是语义 AST、版心布局或跨格式统一语义锚点。
+
+### 5.4 打开文件与未打开文件的处理差异
+
+这是当前系统中必须明确的一条主边界。
+
+对于已经在编辑器中打开的当前文件：
+
+1. AI 看到的是当前编辑器 HTML、当前 revision、当前 baseline、当前选区与光标信息。
+2. 编辑必须走 `edit_current_editor_document`，不能绕过编辑器直接写磁盘。
+3. 这样才能保证编辑器状态、diff 卡和磁盘状态一致。
+
+对于未打开文件或非当前文件：
+
+1. 前端会调用 `open_file_with_cache` / `open_docx_with_cache`。
+2. 后端要求通过四个门禁：`target_file_resolved`、`canonical_loaded`、`block_map_ready`、`context_injected`。
+3. 返回内容以 canonical HTML 和 `file_cache` 为主，并附带该文件的 `pending_diffs`。
+
+因此，当前系统已经明确区分“当前编辑器上下文”与“非当前文件 canonical 上下文”两条链路，二者不能混写。
+
+## VI. Diff 机制与审阅链
+
+### 6.1 当前主原则
+
+Binder 当前的 AI 编辑主链不是“AI 直接改正文”。主链原则是：
+
+1. AI 产出候选改动。
+2. 候选改动以 diff 形式进入待审阅状态。
+3. 用户接受后才真正写盘。
+
+这条原则同时适用于当前文件编辑和非当前文件编辑，只是生成 diff 的入口不同。
+
+### 6.2 Diff 的生成、存储与展示
+
+当前 diff 体系由两层组成：
+
+1. 持久化层：`workspace.db.pending_diffs`。
+2. 运行时层：前端 `diffStore`。
+
+`diffStore` 比数据库记录更“强”，它额外维护：
+
+1. `baselineId`。
+2. `documentRevision`。
+3. `contentSnapshotHash`。
+4. `blockOrderSnapshotHash`。
+5. `pending / accepted / rejected / expired` 等状态。
+
+编辑器内的可视化由 `DiffDecorationExtension` 负责。当前 UI 既有文档内高亮，也有按文件分组的 diff 卡面板。
+
+### 6.3 接受、拒绝与逻辑基线
+
+当前 pending diffs 不是孤立 patch，而是“绑定到某一基线快照”的候选操作。基线变化后，原 diff 就可能失效。
+
+当前接受链大致为：
+
+1. 从 `file_cache` 或当前基线内容加载待应用正文。
+2. 逆序应用 diff，避免位置偏移污染后续 patch。
+3. 写回磁盘或转换回文档格式。
+4. 清理对应 `pending_diffs`。
+5. 更新 `file_cache`。
+6. 写入时间轴节点。
+
+### 6.4 失效场景
+
+以下情况会触发 pending diff 失效或需要失效治理：
+
+1. 用户自己继续编辑，导致 `documentRevision` 变化。
+2. 外部文件被修改并选择重新加载。
+3. 应用退出后重新启动，旧 diff 的 block 定位不再可靠。
+4. `originalText` 与当前正文无法匹配。
+5. block 顺序或内容快照已经改变。
+
+因此，pending diffs 和逻辑基线是强绑定关系，不应理解为独立于当前内容状态的长期补丁。
+
+### 6.5 当前精度边界
+
+当前 diff 已经能做到块级定位和审阅，但其精度仍受以下边界限制：
+
+1. 依赖 block id 和 canonical HTML，不是语义结构差分。
+2. 对 DOCX 等转换型文档，重新打开后 block id 可能重建，跨会话稳定性弱于原生文本类文件。
+3. 结构性大改、外部覆盖和内容重排会更容易导致 diff 失效。
+
+## VII. AI 功能架构
+
+### 7.1 当前 AI 分层
+
+当前代码里真实存在三层 AI 能力：
+
+| 层级 | 入口 | 当前状态 | 说明 |
+|---|---|---|
+| 层次一：辅助续写 | `Cmd/Ctrl+J` | 已实现 | 基于当前上下文生成续写建议 |
+| 层次二：局部修改 | `Cmd/Ctrl+K` | 已实现 | 对选中文本做局部改写或回复 |
+| 层次三：对话编辑 | 右侧聊天区 | 已实现 | 支持 `chat` 与 `agent` 两种模式 |
+
+### 7.2 Provider 接入结构
+
+当前后端 `AIService` 实际注册的 Provider 只有：
+
+1. OpenAI。
+2. DeepSeek。
+
+二者都支持：
+
+1. 流式文本输出。
+2. SSE tool calls 解析。
+3. API Key 通过系统 keyring 保存。
+
+Anthropic、Gemini、本地模型等不应写成现有能力。
+
+### 7.3 Tool calling 与流式响应
+
+AI 对话主链由 `ai_chat_stream` 驱动，后端包含：
+
+1. `context_manager`：构建 prompt package 和上下文注入。
+2. Provider：发起流式请求。
+3. `streaming_response_handler`：处理增量文本。
+4. `tool_call_handler`：解析、修复和执行工具调用。
+5. `tool_service`：把工具调用落到文件 / 编辑器 / 工作区能力上。
+
+当前工具集已覆盖读取、列文件、搜索文件、创建、更新、删除、移动、重命名、创建文件夹、编辑当前编辑器文档和保存文件依赖。
+
+### 7.4 Agent 模式与 chat 模式边界
+
+当前聊天区有两种用户可见模式：
+
+1. `chat`：纯对话，不启用工具。
+2. `agent`：可启用工具，但要求聊天 tab 绑定工作区。
+
+也就是说，工具调用不是全局总开关，而是“`agent` 模式 + 已绑定工作区”共同成立时才进入主链。
+
+### 7.5 AI 与编辑器、工作区、文件系统的关系
+
+当前 AI 并不是游离系统，而是绑定到工作区事实层上的：
+
+1. 当前编辑内容、选区、光标和 revision 会进入 prompt。
+2. `workspace.db` 中的任务、Artifact、缓存、记忆、知识检索结果会进入上下文。
+3. 真正落盘的文件修改仍要经过 diff 审阅链或工具执行链。
+
+### 7.6 Agent task / artifact 的真实位置
+
+Agent task 与 artifact 当前不是单纯前端态，而是工作区主链的一部分：
+
+1. 前端 `agentStore` 维护 tab 级运行时视图。
+2. 后端写入 `agent_tasks`、`agent_artifacts`。
+3. 阶段变更通过 Tauri 事件推送给前端。
+4. 当前活跃任务可在重新进入聊天 tab 时从数据库恢复。
+
+### 7.7 当前未完成边界
+
+以下内容不应被写成“已完成的 AI 系统能力”：
+
+1. 完整构建模式。
+2. 完整多 Agent 协作。
+3. 通用外部工具生态。
+4. 所有知识 / 模板 / 任务系统都已经形成产品闭环。
+
+## VIII. Workspace / 工作台 / 文件管理系统
+
+### 8.1 工作区的真实定位
+
+当前 Binder 已经形成“工作台型系统”的雏形。工作区不是单纯目录选择器，而是以下能力的汇聚点：
+
+1. 文件树与资源操作。
+2. 工作区数据库与搜索索引。
+3. 时间轴、记忆、知识、模板、Agent 持久化。
+4. 文件监听和增量索引。
+
+### 8.2 左侧工作台结构
+
+当前 `FileTreePanel` 已挂载的工作台区块包括：
+
+1. 工作区文件树。
+2. 记忆库面板。
+3. 知识库面板。
+4. 模板库面板。
+5. 时间轴面板。
+
+这说明工作区左栏已经超出传统文件树，成为多个子系统的统一入口。
+
+### 8.3 文件管理与资源组织
+
+文件管理主链已经覆盖：
+
+1. 新建文件 / 文件夹。
+2. 删除、移动、重命名、复制。
+3. 工作区导入。
+4. 基于分类器的整理与归类。
+
+这部分能力由前端 `fileService` 和后端 `file_commands`、`classifier_commands` 共同完成。
+
+### 8.4 工作区与当前打开文件的关系
+
+当前所有强主链能力都更偏“工作区内文件”：
+
+1. `workspace.db`、`search.db`、知识条目、时间轴都依赖工作区路径。
+2. 未绑定工作区时仍可进入聊天，但 Agent 工具链会被限制。
+3. 临时聊天与无工作区状态是真实存在的，但能力边界明显收缩。
+
+### 8.5 当前持久化边界
+
+当前聊天 tab 元数据会通过 Zustand `persist` 写入 `localStorage`，但消息内容本身不在同一层完整持久化。编辑器标签页则主要是运行时内存状态，不构成同等级的跨重启恢复系统。
+
+## IX. 搜索、缓存、索引与依赖管理
+
+### 9.1 文件缓存
+
+`workspace.db.file_cache` 是当前系统的一条主链，不只是性能缓存。它承担：
+
+1. canonical HTML 快照保存。
+2. `content_hash` 和 `mtime` 校验。
+3. block id 保真。
+4. 非当前文件 AI 编辑的基线输入。
+
+文本类文件保存后会直接把带 block id 的 HTML 写回缓存；转换型文档会写 canonical 内容。
+
+### 9.2 content hash / mtime 机制
+
+当前缓存与一致性治理依赖两类信号：
+
+1. 磁盘时间戳 `mtime`。
+2. 缓存内容哈希 `content_hash`。
+
+前者用于快速判定文件是否被外部改写，后者用于更细粒度地判断缓存是否仍可作为 AI 与恢复链的可信基线。
+
+### 9.3 搜索索引现状
+
+后端已实现：
+
+1. `.binder/search.db`。
+2. SQLite FTS5 文档索引。
+3. `search_documents`、`index_document`、`remove_document_index`、`build_index_async` 命令。
+
+但当前主链仍有两个边界：
+
+1. 主布局中实际挂载的是文件树过滤输入，不是独立全文检索面板。
+2. 完整递归建索引虽有 `build_index_async`，但主界面未形成明显的统一触发链。
+
+因此，搜索应定性为“后端与局部 UI 已有实现，但完整产品主链未完全收口”。
+
+### 9.4 文件依赖
+
+当前系统已实现 `file_dependencies` 持久化，并且 AI 工具链中存在 `save_file_dependency`。这说明 Binder 已经开始记录文件间依赖关系，但目前更像底层事实层，而不是完整可视化依赖管理产品。
+
+### 9.5 临时目录与预览缓存
+
+当前本地缓存和临时文件至少分布在以下位置：
+
+| 路径 | 用途 |
+|---|---|
+| `workspace/.binder/workspace.db` | 工作区主数据库 |
+| `workspace/.binder/search.db` | 工作区全文索引 |
+| `~/.config/binder/workspaces.json` | 最近工作区列表 |
+| `{data_dir}/binder/user_memory.db` | 用户级跨工作区记忆 |
+| `{data_dir}/binder/cache/preview` | 预览缓存 |
+| `{data_dir}/binder/cache/odt` | 文档转换中间缓存 |
+
+## X. 历史、时间轴、恢复机制
+
+### 10.1 当前是否已真实落地
+
+时间轴不是文档方案残留，而是已经进入主链的能力。前端已有 `HistorySection`，后端已有：
+
+1. `list_timeline_nodes`
+2. `get_timeline_restore_preview`
+3. `restore_timeline_node`
+
+以及 `timeline_nodes`、`timeline_restore_payloads` 持久化表。
+
+### 10.2 当前记录的事实类型
+
+当前时间轴围绕两类事实记录：
+
+1. `file_content`：文件内容变更。
+2. `resource_structure`：文件/目录结构变更。
+
+保存文件、创建文件、创建文件夹等操作都会进入时间轴。
+
+### 10.3 恢复预览与正式恢复
+
+当前恢复链不是直接覆盖，而是：
+
+1. 先读取恢复预览。
+2. 检查当前状态是否允许恢复。
+3. 真正恢复时若内容发生变化，会再写入新的 restore 节点。
+
+时间轴节点当前还有上限裁剪，代码常量为 50 条。
+
+### 10.4 恢复边界
+
+当前恢复的是“逻辑文件状态”和“资源结构状态”，而不是整个应用会话。不会一并恢复的内容包括：
+
+1. 聊天消息运行时。
+2. Agent 对话过程。
+3. 待处理 diff 的完整运行时上下文。
+4. 任意 UI 局部状态。
+
+因此，时间轴已经可用，但作用域是“工作区事实恢复”，不是全量会话回放。
+
+## XI. 记忆库 / 知识库 / 模板库的当前状态
+
+### 11.1 记忆库
+
+记忆库当前已经落地到“数据层 + 主链注入 + 基础 UI 管理”层级。
+
+已实现部分：
+
+1. 工作区级记忆写入 `workspace.db`。
+2. 用户级记忆写入 `{data_dir}/binder/user_memory.db`。
+3. FTS 检索、使用日志、层级优先级与过期治理。
+4. `MemoryTab` 面板浏览、筛选、逐条过期、按层过期。
+5. AI 对话链中的记忆检索与注入。
+6. 标签关闭后的 stale 维护和启动时维护。
+
+当前边界：
+
+1. 记忆系统已进入主链，但还不是独立成熟产品。
+2. 更复杂的知识图谱、长期策略编排等不应写成现状。
+
+### 11.2 知识库
+
+知识库当前已经不是“只有方案没有实现”的状态。它至少已落地到以下层级：
+
+1. `workspace.db` 中的知识 schema、entry、document、chunk、execution stage。
+2. 文档导入 / 替换 / 删除 / 重建 / 重试 / 移动 / 重命名。
+3. 自动检索策略汇总与 AI 上下文注入切片。
+4. `KnowledgeSection` 中的列表、搜索、显式引用、验证状态和策略更新。
+
+当前边界：
+
+1. 当前 UI 更偏管理和引用，不是完整知识运营台。
+2. 用户可见的导入入口和主链收口仍不充分。
+3. 不应把它描述成“完整知识库产品”。
+
+### 11.3 模板库
+
+当前模板库已经有真实实现，但其真实定位是“工作流模板系统”，不是通用模板中心。
+
+已实现部分：
+
+1. `workflow_templates` 与 `workflow_template_documents` 存储。
+2. 模板文档编辑、保存、状态更新。
+3. 模板解析、编译和缓存。
+4. 运行时工作流计划和执行状态持久化。
+5. 手动介入、恢复执行、标记失败、推进步骤。
+6. 与 Agent shadow runtime 的有限集成。
+
+当前边界：
+
+1. 当前模板库只承接工作流模板。
+2. 不承接文档模板，也不应写成 skills 系统。
+3. 当前工作流执行仍是局部运行时能力，不是完整业务编排平台。
+
+## XII. 前后端技术架构
+
+### 12.1 前端主要技术栈
+
+| 层 | 技术 | 角色 |
+|---|---|---|
+| 桌面前端框架 | React 18 + TypeScript + Vite | UI 与应用壳层 |
+| 状态管理 | Zustand | 文件、编辑器、聊天、diff、agent、时间轴、模板、引用等状态管理 |
+| 编辑器 | TipTap 3 + ProseMirror | 文档编辑核心 |
+| 样式 | Tailwind CSS | UI 样式实现 |
+| 预览 / 数据处理 | `pdfjs-dist`、`xlsx`、`papaparse`、`diff` 等 | PDF、表格、差异展示等 |
+
+### 12.2 前端分层关系
+
+当前前端大体按以下层次组织：
+
+1. UI 层：`components/`
+2. 状态层：`stores/`
+3. 调用封装层：`services/`
+4. 领域工具层：`utils/`、`hooks/`、`types/`
+
+其中最关键的 store 包括：
+
+1. `fileStore`
+2. `editorStore`
+3. `chatStore`
+4. `diffStore`
+5. `agentStore`
+6. `timelineStore`
+7. `templateStore`
+8. `referenceStore`
+
+### 12.3 Tauri Command 边界
+
+当前 `main.rs` 已注册 103 个 Tauri command，已覆盖：
+
+1. 文件与工作区。
+2. 图像处理。
+3. AI。
+4. 搜索。
+5. 记忆。
+6. 知识。
+7. 分类器。
+8. 工具调用。
+9. 模板。
+10. 工作区缓存、diff、时间轴、Agent 持久化。
+
+这意味着 Tauri command 层已经不是薄壳，而是 Binder 前后端契约的主入口。
+
+### 12.4 Rust 服务层职责
+
+Rust 侧当前主要职责可以概括为：
+
+| 层 | 主要模块 | 责任 |
+|---|---|---|
+| AI 服务层 | `ai_service`、`ai_providers/*`、`context_manager`、`tool_call_handler`、`tool_service` | 模型调用、上下文构建、工具执行 |
+| 文档与预览服务层 | `pandoc_service`、`libreoffice_service`、`preview_service` | 文档转换、Office/PDF 预览 |
+| 工作区事实层 | `workspace_db`、`workspace_commands`、`timeline_support`、`canonical_html` | 缓存、diff、时间轴、Agent 持久化 |
+| 检索与知识层 | `search_service`、`memory_service`、`knowledge/*`、`template/service` | 搜索、记忆、知识、模板工作流 |
+| 环境与文件层 | `workspace`、`file_watcher`、`file_commands` | 工作区管理、文件监听、文件操作 |
+
+### 12.5 关键第三方依赖
+
+当前系统对外部依赖有明确分工：
+
+1. SQLite / `rusqlite`：本地持久化。
+2. Pandoc：DOCX 类文档与 HTML 转换。
+3. LibreOffice：Office 文档转 PDF 预览。
+4. `notify`：文件监听。
+5. `keyring`：API Key 安全存储。
+6. OpenAI / DeepSeek API：模型推理。
+
+## XIII. 数据持久化与本地存储结构
+
+### 13.1 `workspace.db` 的真实角色
+
+`workspace/.binder/workspace.db` 是当前项目的核心事实库，不只是缓存库。当前 schema 已演进到 `SCHEMA_VERSION = 8`，覆盖：
+
+1. `file_cache`
+2. `pending_diffs`
+3. `file_dependencies`
+4. `agent_tasks`
+5. `agent_artifacts`
+6. `memory_items` 及相关表
+7. `timeline_nodes`、`timeline_restore_payloads`
+8. `workflow_templates`、`workflow_template_documents`
+9. 模板解析 / 编译缓存
+10. 运行时工作流计划与执行状态
+
+### 13.2 业务对象与持久化映射
+
+| 持久化对象 | 主要表 / 文件 | 业务作用 |
+|---|---|---|
+| 文件 canonical 缓存 | `file_cache` | 打开复用、block id 保真、AI 基线 |
+| 待审阅改动 | `pending_diffs` | Diff 审阅主链 |
+| 文件依赖 | `file_dependencies` | 文件关系事实层 |
+| Agent 任务 | `agent_tasks` | 任务恢复与阶段跟踪 |
+| Agent Artifact | `agent_artifacts` | 中间产物记录 |
+| 工作区记忆 | `memory_items`、`memory_usage_logs` | 记忆检索与注入 |
+| 时间轴 | `timeline_nodes`、`timeline_restore_payloads` | 历史预览与恢复 |
+| 知识库 | `knowledge_*` 系列表 | 知识条目、文档、切片、执行阶段 |
+| 工作流模板 | `workflow_*` 系列表 | 模板与运行时执行 |
+
+### 13.3 其他本地存储
+
+除工作区数据库外，当前系统还有几类独立本地存储：
+
+1. `workspace/.binder/search.db`：工作区全文索引。
+2. `~/.config/binder/workspaces.json`：最近工作区。
+3. `{data_dir}/binder/user_memory.db`：用户级记忆。
+4. `{data_dir}/binder/cache/preview` 等缓存目录：预览和转换缓存。
+5. 浏览器侧 `localStorage`：聊天 tab 元数据持久化。
+
+## XIV. 当前系统边界、未完成项与风险说明
+
+### 14.1 当前系统边界
+
+当前 Binder 的真实边界应明确为：
+
+1. 它是本地桌面文档工作台，不是完整协同办公平台。
+2. 它能编辑文本类和文档转换类文件，但不能把所有 Office 类型都写成“可编辑”。
+3. 它已有知识、模板、记忆、时间轴等系统，但这些系统成熟度并不一致。
+4. 它的 AI 主链以“生成候选改动并交由用户审阅”为原则，不是无确认自动改正文。
+
+### 14.2 未完成项
+
+当前仍应明确写为未完成或待收口的部分包括：
+
+1. 全文搜索完整产品化闭环。
+2. 知识库导入与使用路径的统一入口。
+3. 模板 / 工作流系统的更完整产品化。
+4. Excel / 演示文稿编辑能力。
+5. 多 Provider 扩展。
+6. 构建模式或多 Agent 协作主链。
+
+### 14.3 当前风险点
+
+当前代码层面最需要注意的风险包括：
+
+1. diff 依赖 block id、baseline 和快照一致性，跨会话与跨格式稳定性有限。
+2. DOCX 类文档依赖 Pandoc，预览依赖 LibreOffice，外部环境缺失会直接影响功能可用性。
+3. 搜索后端和 UI 挂载状态不完全一致，容易让文档描述高于现状。
+4. 代码中仍保留旧表、旧组件和未接入组件，撰写现行文档时必须主动剔除。
+5. 时间轴恢复的是工作区逻辑事实，不是完整应用会话恢复。
+
+### 14.4 历史包袱与治理点
+
+当前仓库中存在一批“仍在代码里但不应再进入主叙述”的残留：
+
+1. 旧 `ai_tasks` 表。
+2. 未接入主链的 `EditMode.tsx`。
+3. 未挂载到主布局的独立全文检索面板。
+4. 若干注释中的旧阶段命名和旧设计术语。
+
+后续继续治理时，应优先区分“保留作为迁移兼容”与“继续作为现行能力维护”这两类代码。
+
+## XV. 当前项目总结
+
+从当前代码实现看，Binder 已经形成了一条清晰主链：以工作区为载体，以 TipTap 编辑器和本地文件系统为事实面，以 `workspace.db` 为核心持久化层，以 diff 审阅链承接 AI 编辑，并在其上逐步接入时间轴、记忆、知识、模板与 Agent 运行时能力。
+
+当前项目的真实状态不是“理想中的 AI 办公套件”，也不是“只有编辑器雏形”。更准确的判断是：它已经具备一个本地 AI 文档工作台的核心骨架，并且若干扩展系统已真实落地，但这些扩展系统的成熟度、闭环程度和用户入口仍不一致，仍需要继续收口和治理。
