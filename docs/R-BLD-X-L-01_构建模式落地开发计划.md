@@ -1,9 +1,15 @@
 # 构建模式落地开发计划
 
+> 状态：`REFERENCE ONLY`
+>
+> 本文档属于旧版 Build Mode / Discussion Build / Multi-Actor Build 设计参考，不是当前生效主线。
+> 当前唯一生效主线见 [`docs/README.md`](./README.md) 与 [`A-CBT-C-D-01_Chat Build产品定义与边界.md`](./A-CBT-C-D-01_Chat%20Build产品定义与边界.md)。
+> 若本文与当前代码现状或 Active 文档冲突，以 Active 文档和代码现状为准。
+
 ## 文档头
 
 - 结构编码：`BLD-X-L-01`
-- 文档属性：`主结构`
+- 文档属性：`旧体系参考`
 - 主责模块：`BLD`
 - 文档职责：`构建模式工程实现的阶段拆分、文档承接关系、改造点清单、验收口径`
 - 上游约束：`BLD-M-D-01`, `BLD-M-T-01`, `BLD-M-T-04`
@@ -38,7 +44,7 @@
 1. MVP 核心场景稳定（5 个核心场景通过验收）。
 2. Workspace 文件系统接口稳定（`A-WS-M-T-03` 主链路可用）。
 3. 模板库（TMP 模块）基础能力可用（模板读取可运行）。
-4. BLD 模块全部设计文档（A-BLD-*）完成评审。
+4. BLD 模块全部设计文档（R-BLD-*）完成评审。
 
 ---
 
@@ -56,7 +62,7 @@
    - `role_ai.rs`（Role AI 服务骨架）
    - `build_task.rs`（构建任务状态管理骨架）
    - `project_writer.rs`（Project Object 写入骨架）
-2. `workspace.db` 新增 `build_tasks` 表（Schema 见 `A-BLD-I-P-01`）。
+2. `workspace.db` 新增 `build_tasks` 表（Schema 见 `R-BLD-I-P-01`）。
 3. 前端 `src/stores/buildStore.ts` 建立（构建任务状态 Zustand Store）。
 4. 构建模式路由/Tab 入口占位（UI 空壳）。
 
@@ -76,7 +82,7 @@
    - 「开始构建」按钮。
 
 2. **规划阶段**：
-   - Master AI Build Outline 生成（`A-BLD-M-P-01` 第六节协议）。
+   - Master AI Build Outline 生成（`R-BLD-M-P-01` 第六节协议）。
    - Outline 展示 UI（用户确认/修改）。
 
 3. **执行阶段**：
@@ -216,22 +222,22 @@
 
 | 文档 | 主要待定项 |
 |---|---|
-| `A-BLD-M-T-01` | Master AI 工具集完整定义 |
-| `A-BLD-M-T-02` | 真人发言是否自动回退状态 |
-| `A-BLD-M-T-03` | Build Outline 中 `estimated_tokens` 用途 |
-| `A-BLD-M-T-04` | 并行执行方案、取消构建支持 |
-| `A-BLD-M-P-01` | 脱敏规则实现方案 |
-| `A-BLD-M-P-02` | 全部提示词具体文本 |
-| `A-BLD-I-P-01` | Tauri 命令名称、build_tasks 表 Schema |
-| `A-BLD-I-P-02` | TMP 模块资源格式（依赖 TMP 设计完成）|
-| `A-BLD-M-D-02` | 确认节点是否强制、后台执行 UI 通知形式 |
-| `A-BLD-M-D-03` | 收束触发时机、Role AI 数量限制 |
+| `R-BLD-M-T-01` | Master AI 工具集完整定义 |
+| `R-BLD-M-T-02` | 真人发言是否自动回退状态 |
+| `R-BLD-M-T-03` | Build Outline 中 `estimated_tokens` 用途 |
+| `R-BLD-M-T-04` | 并行执行方案、取消构建支持 |
+| `R-BLD-M-P-01` | 脱敏规则实现方案 |
+| `R-BLD-M-P-02` | 全部提示词具体文本 |
+| `R-BLD-I-P-01` | Tauri 命令名称、build_tasks 表 Schema |
+| `R-BLD-I-P-02` | TMP 模块资源格式（依赖 TMP 设计完成）|
+| `R-BLD-M-D-02` | 确认节点是否强制、后台执行 UI 通知形式 |
+| `R-BLD-M-D-03` | 收束触发时机、Role AI 数量限制 |
 
 ---
 
 ## 七、关联文档
 
-1. `A-BLD-M-D-01_构建模式主控设计文档.md`（承接关系）
+1. `R-BLD-M-D-01_构建模式主控设计文档.md`（承接关系）
 2. `A-PROD-C-L-01_产品路线图.md`（版本规划）
 3. `A-ENG-X-T-02_后端架构.md`（后端实现约束）
 4. `A-CORE-C-R-01_项目文档结构清单（标准目录）.md`（文档注册）

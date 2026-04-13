@@ -9,39 +9,39 @@ use serde_json::json;
 /// 工具类别
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolCategory {
-    /// 文件读取（read_file, list_files, search_files）
-    FileRead,
-    /// 文件写入（create_file, update_file, delete_file, move_file, rename_file, create_folder）
-    FileWrite,
-    /// 编辑器交互（edit_current_editor_document）
-    EditorEdit,
-    /// 元数据（save_file_dependency）
-    Metadata,
+  /// 文件读取（read_file, list_files, search_files）
+  FileRead,
+  /// 文件写入（create_file, update_file, delete_file, move_file, rename_file, create_folder）
+  FileWrite,
+  /// 编辑器交互（edit_current_editor_document）
+  EditorEdit,
+  /// 元数据（save_file_dependency）
+  Metadata,
 }
 
 /// 工具可见性——决定工具在哪些模式下暴露给模型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolVisibility {
-    /// 所有 agent 模式均可见（默认）
-    Always,
-    /// 仅在有打开的编辑器文件时可见
-    #[allow(dead_code)]
-    WhenEditorOpen,
-    /// 仅在 build mode 下可见（预留）
-    #[allow(dead_code)]
-    BuildModeOnly,
+  /// 所有 agent 模式均可见（默认）
+  Always,
+  /// 仅在有打开的编辑器文件时可见
+  #[allow(dead_code)]
+  WhenEditorOpen,
+  /// 保留的可见性分组；当前未绑定任何独立模式入口
+  #[allow(dead_code)]
+  Reserved,
 }
 
 /// 工具矩阵条目
 pub struct ToolMatrixEntry {
-    pub category: ToolCategory,
-    pub visibility: ToolVisibility,
-    pub definition: ToolDefinition,
+  pub category: ToolCategory,
+  pub visibility: ToolVisibility,
+  pub definition: ToolDefinition,
 }
 
 /// 构建完整工具矩阵（主源）
 pub fn build_tool_matrix() -> Vec<ToolMatrixEntry> {
-    vec![
+  vec![
         ToolMatrixEntry {
             category: ToolCategory::FileRead,
             visibility: ToolVisibility::Always,
@@ -252,9 +252,9 @@ pub fn build_tool_matrix() -> Vec<ToolMatrixEntry> {
 
 /// 从矩阵中提取 ToolDefinition 列表（兼容旧接口）
 pub fn definitions_from_matrix() -> Vec<ToolDefinition> {
-    build_tool_matrix()
-        .into_iter()
-        .filter(|e| e.visibility == ToolVisibility::Always)
-        .map(|e| e.definition)
-        .collect()
+  build_tool_matrix()
+    .into_iter()
+    .filter(|e| e.visibility == ToolVisibility::Always)
+    .map(|e| e.definition)
+    .collect()
 }

@@ -915,4 +915,4 @@ step failed / execution interrupted
 3. `A-TMP-M-T-01_模板机制.md`
 4. `A-AG-M-T-05_文档生成流程.md`
 5. `A-AST-M-P-01_上下文注入.md`
-6. `A-BLD-I-P-02_构建模式与模板库接口.md`
+6. `R-BLD-I-P-02_构建模式与模板库接口.md`

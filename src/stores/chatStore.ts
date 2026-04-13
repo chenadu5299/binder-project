@@ -5,6 +5,7 @@ import { useFileStore } from './fileStore';
 import { useEditorStore } from './editorStore';
 import { useDiffStore } from './diffStore';
 import { useAgentStore } from './agentStore';
+import { useChatBuildStore } from './chatBuildStore';
 
 import { ToolCall, MessageContentBlock } from '../types/tool';
 import type { KnowledgeInjectionSlice } from '../types/ai';
@@ -192,6 +193,7 @@ export const useChatStore = create<ChatState>()(persist((set, get) => {
             }
             useDiffStore.getState().cleanupDiffsForChatTab(tabId);
             useAgentStore.getState().dropRuntimeForTab(tabId);
+            useChatBuildStore.getState().dropSession(tabId);
             const newTabs = tabs.filter(t => t.id !== tabId);
             
             set({

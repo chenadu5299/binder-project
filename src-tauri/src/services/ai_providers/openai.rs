@@ -511,7 +511,8 @@ impl AIProvider for OpenAIProvider {
               }
             }
 
-            if completed_tool_call.is_none() && choice.finish_reason.as_deref() == Some("tool_calls")
+            if completed_tool_call.is_none()
+              && choice.finish_reason.as_deref() == Some("tool_calls")
             {
               let mut state_guard = state.lock().unwrap();
               if let (Some(ref id), Some(ref name)) = (&state_guard.0, &state_guard.1) {

@@ -5,6 +5,7 @@ import { useChatStore } from '../../stores/chatStore';
 import { ChatTabs } from './ChatTabs';
 import { ChatMessages } from './ChatMessages';
 import { InlineChatInput } from './InlineChatInput';
+import { ChatBuildPanel } from './ChatBuildPanel';
 import { DiffAllActionsBar } from './DiffAllActionsBar';
 import { PlusIcon } from '@heroicons/react/24/outline';
 import { parseToolCalls, removeToolCalls } from '../../utils/toolCallParser';
@@ -1086,6 +1087,7 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                     {/* 消息区域 */}
                     {activeTab ? (
                         <>
+                            <ChatBuildPanel tab={activeTab} />
                             {/* Agent 模式：移除独立编辑窗口，通过对话和工具调用来编辑 */}
                             <ChatMessages
                                 messages={activeTab.messages}

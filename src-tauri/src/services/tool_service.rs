@@ -21,7 +21,7 @@ pub struct ToolCall {
   pub arguments: serde_json::Value,
 }
 
-/// 工具错误类型（构建模式前置）：任务调度层据此决定重试/跳过/中止
+/// 工具错误类型：供上层调度或恢复策略区分重试/跳过/中止。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ToolErrorKind {
@@ -95,7 +95,7 @@ pub struct ToolResult {
   pub data: Option<serde_json::Value>,
   pub error: Option<String>,
   pub message: Option<String>,
-  /// 构建模式前置：错误类型，用于任务调度层决策
+  /// 错误类型，用于上层调度或恢复策略决策。
   #[serde(skip_serializing_if = "Option::is_none", default)]
   pub error_kind: Option<ToolErrorKind>,
   /// 用户可读的中文错误文案
@@ -143,7 +143,10 @@ fn build_noop_meta(tool_name: &str) -> ToolResultMeta {
     gate: Some(ToolGateMeta {
       status: Some("no_op".to_string()),
       stage: None,
-      summary: Some(format!("{}: content unchanged, no diff generated", tool_name)),
+      summary: Some(format!(
+        "{}: content unchanged, no diff generated",
+        tool_name
+      )),
     }),
     artifact: None,
     verification: Some(ToolVerificationMeta {
@@ -766,7 +769,13 @@ impl ToolService {
         };
         if should_run_workspace_canonical_pipeline(&file_type) {
           let (html, hash) = canonical_html_for_workspace_cache(&raw);
-          db.upsert_file_cache(file_path, &file_type, Some(&html), Some(hash.as_str()), mtime)?;
+          db.upsert_file_cache(
+            file_path,
+            &file_type,
+            Some(&html),
+            Some(hash.as_str()),
+            mtime,
+          )?;
           html
         } else {
           db.upsert_file_cache(file_path, &file_type, Some(&raw), None, mtime)?;
@@ -783,7 +792,6 @@ impl ToolService {
       .unwrap_or(true);
 
     if use_diff {
-
       let diffs =
         diff_engine::generate_pending_diffs_for_file_type(&old_content, content, &file_type);
       let rows: Vec<(String, String, i32)> = diffs
@@ -947,8 +955,8 @@ impl ToolService {
 
     match result {
       Ok(_) => {
-        let db = WorkspaceDb::new(workspace_path)
-          .map_err(|e| format!("WorkspaceDb 初始化失败: {}", e))?;
+        let db =
+          WorkspaceDb::new(workspace_path).map_err(|e| format!("WorkspaceDb 初始化失败: {}", e))?;
         let _ = record_resource_structure_timeline_node(
           &db,
           workspace_path,
@@ -1219,8 +1227,8 @@ impl ToolService {
     // 移动文件
     match std::fs::rename(&source_full, &dest_full) {
       Ok(_) => {
-        let db = WorkspaceDb::new(workspace_path)
-          .map_err(|e| format!("WorkspaceDb 初始化失败: {}", e))?;
+        let db =
+          WorkspaceDb::new(workspace_path).map_err(|e| format!("WorkspaceDb 初始化失败: {}", e))?;
         let _ = record_resource_structure_timeline_node(
           &db,
           workspace_path,
@@ -1331,8 +1339,8 @@ impl ToolService {
           .and_then(|p| p.to_str())
           .unwrap_or("");
 
-        let db = WorkspaceDb::new(workspace_path)
-          .map_err(|e| format!("WorkspaceDb 初始化失败: {}", e))?;
+        let db =
+          WorkspaceDb::new(workspace_path).map_err(|e| format!("WorkspaceDb 初始化失败: {}", e))?;
         let _ = record_resource_structure_timeline_node(
           &db,
           workspace_path,
@@ -1410,27 +1418,27 @@ impl ToolService {
         return Ok(ToolResult {
           success: true,
           data: Some(serde_json::json!({
-              "path": folder_path,
-              "full_path": full_path.to_string_lossy().to_string(),
-              "message": "文件夹已存在",
-            })),
-            error: None,
-            message: Some(format!("文件夹已存在: {}", folder_path)),
-            error_kind: None,
-            display_error: None,
-            meta: None,
-          });
+            "path": folder_path,
+            "full_path": full_path.to_string_lossy().to_string(),
+            "message": "文件夹已存在",
+          })),
+          error: None,
+          message: Some(format!("文件夹已存在: {}", folder_path)),
+          error_kind: None,
+          display_error: None,
+          meta: None,
+        });
       } else {
         eprintln!("❌ 路径已存在但不是文件夹: {:?}", full_path);
         return Ok(ToolResult {
           success: false,
           data: None,
-            error: Some(format!("路径已存在但不是文件夹: {}", folder_path)),
-            message: None,
-            error_kind: None,
-            display_error: None,
-            meta: None,
-          });
+          error: Some(format!("路径已存在但不是文件夹: {}", folder_path)),
+          message: None,
+          error_kind: None,
+          display_error: None,
+          meta: None,
+        });
       }
     }
 
@@ -1651,13 +1659,11 @@ impl ToolService {
           .index
           .nodes
           .iter()
-          .map(|n| {
-            BlockEntry {
-              block_id: n.block_id.clone(),
-              block_type: n.block_type.clone(),
-              text_content: n.text_content.clone(),
-              char_count: n.text_end.saturating_sub(n.text_start),
-            }
+          .map(|n| BlockEntry {
+            block_id: n.block_id.clone(),
+            block_type: n.block_type.clone(),
+            text_content: n.text_content.clone(),
+            char_count: n.text_end.saturating_sub(n.text_start),
           })
           .collect();
         (map, Vec::new())
@@ -2281,8 +2287,14 @@ impl ToolService {
     }
 
     if mode != "rewrite_document" {
-      if arguments.get("block_index").and_then(|v| v.as_u64()).is_none() {
-        return Err(err("block_index is required unless edit_mode=rewrite_document".to_string()));
+      if arguments
+        .get("block_index")
+        .and_then(|v| v.as_u64())
+        .is_none()
+      {
+        return Err(err(
+          "block_index is required unless edit_mode=rewrite_document".to_string(),
+        ));
       }
     }
 
@@ -2293,12 +2305,16 @@ impl ToolService {
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false);
       if !has_target {
-        return Err(err("target is required for replace/delete/insert".to_string()));
+        return Err(err(
+          "target is required for replace/delete/insert".to_string(),
+        ));
       }
     }
 
-    if matches!(mode, "replace" | "insert" | "rewrite_block" | "rewrite_document")
-      && arguments.get("content").and_then(|v| v.as_str()).is_none()
+    if matches!(
+      mode,
+      "replace" | "insert" | "rewrite_block" | "rewrite_document"
+    ) && arguments.get("content").and_then(|v| v.as_str()).is_none()
     {
       return Err(err(
         "content is required for replace/insert/rewrite_block/rewrite_document".to_string(),
@@ -2460,12 +2476,24 @@ impl ToolService {
           let mut data_obj = serde_json::Map::new();
           data_obj.insert("diff_area_id".to_string(), serde_json::Value::Null);
           data_obj.insert("file_path".to_string(), serde_json::json!(current_file_new));
-          data_obj.insert("old_content".to_string(), serde_json::json!(current_content_new));
-          data_obj.insert("new_content".to_string(), serde_json::json!(current_content_new));
-          data_obj.insert("diffs".to_string(), serde_json::json!(Vec::<serde_json::Value>::new()));
+          data_obj.insert(
+            "old_content".to_string(),
+            serde_json::json!(current_content_new),
+          );
+          data_obj.insert(
+            "new_content".to_string(),
+            serde_json::json!(current_content_new),
+          );
+          data_obj.insert(
+            "diffs".to_string(),
+            serde_json::json!(Vec::<serde_json::Value>::new()),
+          );
           data_obj.insert("document_revision".to_string(), serde_json::json!(doc_rev));
           data_obj.insert("no_op".to_string(), serde_json::json!(true));
-          data_obj.insert("route_source".to_string(), serde_json::json!(route_source.clone()));
+          data_obj.insert(
+            "route_source".to_string(),
+            serde_json::json!(route_source.clone()),
+          );
           data_obj.insert(
             "resolver_error_codes".to_string(),
             serde_json::json!(resolver_error_codes.clone()),
@@ -2487,7 +2515,9 @@ impl ToolService {
               None,
             ),
             error: None,
-            message: Some("edit_current_editor_document: NO_OP（内容无变化，未生成 diff）".to_string()),
+            message: Some(
+              "edit_current_editor_document: NO_OP（内容无变化，未生成 diff）".to_string(),
+            ),
             error_kind: None,
             display_error: None,
             meta: Some(build_noop_meta("edit_current_editor_document")),
@@ -2517,15 +2547,24 @@ impl ToolService {
           let mut data_obj = serde_json::Map::new();
           data_obj.insert("diff_area_id".to_string(), serde_json::json!(diff_area_id));
           data_obj.insert("file_path".to_string(), serde_json::json!(current_file_new));
-          data_obj.insert("old_content".to_string(), serde_json::json!(current_content_new));
-          data_obj.insert("new_content".to_string(), serde_json::json!(current_content_new));
+          data_obj.insert(
+            "old_content".to_string(),
+            serde_json::json!(current_content_new),
+          );
+          data_obj.insert(
+            "new_content".to_string(),
+            serde_json::json!(current_content_new),
+          );
           data_obj.insert("diffs".to_string(), serde_json::json!(vec![canonical_diff]));
           data_obj.insert("document_revision".to_string(), serde_json::json!(doc_rev));
           data_obj.insert(
             "resolver_error_codes".to_string(),
             serde_json::json!(resolver_error_codes.clone()),
           );
-          data_obj.insert("route_source".to_string(), serde_json::json!(route_source.clone()));
+          data_obj.insert(
+            "route_source".to_string(),
+            serde_json::json!(route_source.clone()),
+          );
           let warning_exposures = Self::resolver_warning_exposures(
             &resolver_error_codes,
             current_file_new,
@@ -2552,7 +2591,11 @@ impl ToolService {
             )),
             error_kind: None,
             display_error: None,
-            meta: Some(build_candidate_meta("edit_current_editor_document", current_file_new, 1)),
+            meta: Some(build_candidate_meta(
+              "edit_current_editor_document",
+              current_file_new,
+              1,
+            )),
           })
         }
       }

@@ -1,18 +1,24 @@
 # 构建模式与 Workspace 接口
 
+> 状态：`REFERENCE ONLY`
+>
+> 本文档属于旧版 Build Mode / Discussion Build / Multi-Actor Build 设计参考，不是当前生效主线。
+> 当前唯一生效主线见 [`docs/README.md`](./README.md) 与 [`A-CBT-C-D-01_Chat Build产品定义与边界.md`](./A-CBT-C-D-01_Chat%20Build产品定义与边界.md)。
+> 若本文与当前代码现状或 Active 文档冲突，以 Active 文档和代码现状为准。
+
 ## 文档头
 
 - 结构编码：`BLD-I-P-01`
-- 文档属性：`主结构`
+- 文档属性：`旧体系参考`
 - 主责模块：`BLD`
 - 文档职责：`构建模式与 Workspace 文件系统的接口契约：讨论结果写入规范、Project Object 落盘协议、标签记忆对接`
 - 上游约束：`BLD-M-T-03`, `BLD-M-T-04`
 - 直接承接：无
 - 接口耦合：`A-WS-M-T-03`, `A-WS-C-T-01`, `A-AST-M-T-01`
-- 汇聚影响：`A-BLD-M-T-03`
+- 汇聚影响：`R-BLD-M-T-03`
 - 扩散检查：`A-WS-M-T-03`
 - 使用边界：`定义构建模式对 Workspace 的写入契约，不承担 Workspace 内部实现细节`
-- 变更要求：`修改本文后，必须复核：A-BLD-M-T-03、A-BLD-M-T-04、A-WS-M-T-03`
+- 变更要求：`修改本文后，必须复核：R-BLD-M-T-03、R-BLD-M-T-04、A-WS-M-T-03`
 
 ---
 
@@ -243,8 +249,8 @@ CREATE TABLE build_tasks (
 
 ## 七、关联文档
 
-1. `A-BLD-M-T-03_项目实体模型.md`（Project Object 结构定义）
-2. `A-BLD-M-T-04_构建执行引擎.md`（写入时序）
+1. `R-BLD-M-T-03_项目实体模型.md`（Project Object 结构定义）
+2. `R-BLD-M-T-04_构建执行引擎.md`（写入时序）
 3. `A-WS-C-T-01_workspace模型定义.md`（Workspace 基础模型）
 4. `A-WS-M-T-03_文件系统.md`（文件系统实现）
 5. `A-AST-M-T-01_记忆模型.md`（标签记忆规范）

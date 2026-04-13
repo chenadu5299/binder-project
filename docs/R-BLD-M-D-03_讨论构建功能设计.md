@@ -1,18 +1,24 @@
 # 讨论构建功能设计
 
+> 状态：`REFERENCE ONLY`
+>
+> 本文档属于旧版 Build Mode / Discussion Build / Multi-Actor Build 设计参考，不是当前生效主线。
+> 当前唯一生效主线见 [`docs/README.md`](./README.md) 与 [`A-CBT-C-D-01_Chat Build产品定义与边界.md`](./A-CBT-C-D-01_Chat%20Build产品定义与边界.md)。
+> 若本文与当前代码现状或 Active 文档冲突，以 Active 文档和代码现状为准。
+
 ## 文档头
 
 - 结构编码：`BLD-M-D-03`
-- 文档属性：`主结构`
+- 文档属性：`旧体系参考`
 - 主责模块：`BLD`
 - 文档职责：`Discussion Build 路径完整功能定义：讨论组模型、角色体系、状态机、确认机制、构建触发`
 - 上游约束：`BLD-C-D-01`, `BLD-M-D-01`
-- 直接承接：`A-BLD-M-T-01`, `A-BLD-M-T-02`, `A-BLD-M-T-03`
-- 接口耦合：`A-BLD-I-P-01`, `A-AST-M-T-01`
-- 汇聚影响：`A-BLD-M-D-01`
-- 扩散检查：`A-BLD-M-T-01`, `A-BLD-M-T-02`
+- 直接承接：`R-BLD-M-T-01`, `R-BLD-M-T-02`, `R-BLD-M-T-03`
+- 接口耦合：`R-BLD-I-P-01`, `A-AST-M-T-01`
+- 汇聚影响：`R-BLD-M-D-01`
+- 扩散检查：`R-BLD-M-T-01`, `R-BLD-M-T-02`
 - 使用边界：`定义讨论构建路径功能边界，不承担状态机内部转换规则细节（见 BLD-M-T-02）`
-- 变更要求：`修改本文后，必须复核：BLD-M-D-01、A-BLD-M-T-01、A-BLD-M-T-02`
+- 变更要求：`修改本文后，必须复核：R-BLD-M-D-01、R-BLD-M-T-01、R-BLD-M-T-02`
 
 ---
 
@@ -22,7 +28,7 @@
 
 本文覆盖：讨论组类型、角色体系、讨论机制、状态机概述、确认机制、隐私模型、构建触发。
 
-状态机详细转换规则见 `A-BLD-M-T-02_讨论组状态机与协作机制.md`。
+状态机详细转换规则见 `R-BLD-M-T-02_讨论组状态机与协作机制.md`。
 
 ---
 
@@ -188,7 +194,7 @@ IN_PROGRESS → WAITING_CONFIRMATION → FINISHED
 | WAITING_CONFIRMATION | 等待确认 | 真人参与者确认，发起人触发构建 |
 | FINISHED | 讨论已结束 | 只读，不可追加消息 |
 
-**详细状态转换规则见 `A-BLD-M-T-02_讨论组状态机与协作机制.md`。**
+**详细状态转换规则见 `R-BLD-M-T-02_讨论组状态机与协作机制.md`。**
 
 ---
 
@@ -282,15 +288,15 @@ Build Outline 由主控 AI 综合以下内容生成：
 | 决策节点快照 | 结构化数据 | 构建触发时 |
 | Project Object | 项目文件结构 | 构建完成时 |
 
-写入规则见 `A-BLD-I-P-01_构建模式与Workspace接口.md`。
+写入规则见 `R-BLD-I-P-01_构建模式与Workspace接口.md`。
 
 ---
 
 ## 十一、关联文档
 
-1. `A-BLD-M-D-01_构建模式主控设计文档.md`（路径分工与整体结构）
-2. `A-BLD-M-T-01_构建模式AI架构.md`（主控 AI 与角色 AI 技术架构）
-3. `A-BLD-M-T-02_讨论组状态机与协作机制.md`（状态机详细规则）
-4. `A-BLD-M-T-03_项目实体模型.md`（Project Object 结构）
-5. `A-BLD-I-P-01_构建模式与Workspace接口.md`（结果写入契约）
+1. `R-BLD-M-D-01_构建模式主控设计文档.md`（路径分工与整体结构）
+2. `R-BLD-M-T-01_构建模式AI架构.md`（主控 AI 与角色 AI 技术架构）
+3. `R-BLD-M-T-02_讨论组状态机与协作机制.md`（状态机详细规则）
+4. `R-BLD-M-T-03_项目实体模型.md`（Project Object 结构）
+5. `R-BLD-I-P-01_构建模式与Workspace接口.md`（结果写入契约）
 6. `A-AST-M-T-01_记忆模型.md`（标签记忆规范）

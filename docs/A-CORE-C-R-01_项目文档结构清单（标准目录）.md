@@ -56,6 +56,8 @@
 4. 当前主结构文档、参考文档和归档文档已按该格式进入真实文件名。
 5. 后续新增文档时，应先确定状态字段，再分配结构编码。
 6. 旧数字命名仅代表历史阶段，不再作为新增文档命名方式。
+7. Chat Build 当前主线文档进入 `docs/` 根目录的正式 Active 序列，文件名采用 `A-CBT-*`。
+8. `docs/README.md`、`docs/active/README.md`、`docs/reference/README.md` 属于目录级状态索引文档，不参与结构编码，但属于当前必须维护的入口文档。
 
 ### 1.2 状态字段
 
@@ -149,7 +151,8 @@
 | `AG` | Agent | AI / Agent / Prompt / 工具 / 任务闭环 |
 | `AST` | Asset | 记忆、知识库、上下文资产 |
 | `TMP` | Template | 模板库系统（工作流模板资产） |
-| `BLD` | Build Mode | 构建模式（项目构建引擎、讨论构建、直接构建） |
+| `CBT` | Chat Build | 当前唯一生效的项目级构建主线 |
+| `BLD` | Build Mode Legacy | 旧 BLD / Discussion Build / Multi-Actor Build 参考体系 |
 | `ENG` | Engineering | 工程实现层 |
 | `VAL` | Validation | 验证、测试、运维、审计 |
 
@@ -254,6 +257,11 @@
 2. A-CORE-C-D-05_状态单一真源原则.md
 3. A-CORE-C-D-06_可观测错误处理原则.md
 
+#### 文档状态索引（目录级入口，无结构编码）
+1. docs/README.md
+2. docs/active/README.md
+3. docs/reference/README.md
+
 ### 2.2 10_product
 
 #### 使用场景
@@ -342,20 +350,18 @@
 6. A-TMP-M-S-02_统一执行模型与运行时状态规范.md
 7. A-TMP-X-L-01_Binder模板库模块开发计划文档.md
 
-#### 构建模式系统
-1. A-BLD-C-D-01_构建模式产品定义与边界.md
-2. A-BLD-M-D-01_构建模式主控设计文档.md
-3. A-BLD-M-D-02_直接构建功能设计.md
-4. A-BLD-M-D-03_讨论构建功能设计.md
-5. A-BLD-M-T-01_构建模式AI架构.md
-6. A-BLD-M-T-02_讨论组状态机与协作机制.md
-7. A-BLD-M-T-03_项目实体模型.md
-8. A-BLD-M-T-04_构建执行引擎.md
-9. A-BLD-M-P-01_主控AI与角色AI协议.md
-10. A-BLD-M-P-02_构建模式提示词架构.md
-11. A-BLD-I-P-01_构建模式与Workspace接口.md
-12. A-BLD-I-P-02_构建模式与模板库接口.md
-13. A-BLD-X-L-01_构建模式落地开发计划.md
+#### Chat Build 主结构文档
+1. A-CBT-C-D-01_Chat Build产品定义与边界.md
+2. A-CBT-M-D-01_Chat Build交互流程.md
+3. A-CBT-M-T-01_Chat Build执行模型.md
+4. A-CBT-I-P-01_Chat Build最小协议与状态.md
+5. A-CBT-I-D-01_Chat Build与当前实现承接.md
+6. A-CBT-I-T-01_Chat Build状态控制与实现映射.md
+7. A-CBT-I-T-02_Chat Build执行链与运行控制.md
+8. A-CBT-I-S-01_Workspace写入策略与资源边界.md
+9. A-CBT-I-S-02_构建中断机制.md
+10. A-CBT-I-S-03_Chat与Build接管机制.md
+11. A-CBT-X-L-01_Chat Build推进计划.md
 
 ### 2.5 40_engineering
 
@@ -450,9 +456,23 @@
 1. [旧体系参考] R-TMP-M-R-01_Binder模板库需求文档.md
 2. [归档参考] X-TMP-M-T-02_文档生成流程.md
 
-### 3.7 构建模式参考
+### 3.7 构建模式参考（旧 BLD / Future Design）
 
-1. [归档参考] R-BLD-M-R-01_构建模式主控设计文档（原始设计稿）.md
+1. [参考索引] docs/reference/README.md
+2. [旧体系参考] R-BLD-C-D-01_构建模式产品定义与边界.md
+3. [旧体系参考] R-BLD-M-D-01_构建模式主控设计文档.md
+4. [旧体系参考] R-BLD-M-D-02_直接构建功能设计.md
+5. [旧体系参考] R-BLD-M-D-03_讨论构建功能设计.md
+6. [旧体系参考] R-BLD-M-T-01_构建模式AI架构.md
+7. [旧体系参考] R-BLD-M-T-02_讨论组状态机与协作机制.md
+8. [旧体系参考] R-BLD-M-T-03_项目实体模型.md
+9. [旧体系参考] R-BLD-M-T-04_构建执行引擎.md
+10. [旧体系参考] R-BLD-M-P-01_主控AI与角色AI协议.md
+11. [旧体系参考] R-BLD-M-P-02_构建模式提示词架构.md
+12. [旧体系参考] R-BLD-I-P-01_构建模式与Workspace接口.md
+13. [旧体系参考] R-BLD-I-P-02_构建模式与模板库接口.md
+14. [旧体系参考] R-BLD-X-L-01_构建模式落地开发计划.md
+15. [归档参考] R-BLD-M-R-01_构建模式主控设计文档（原始设计稿）.md
 
 ### 3.8 编辑器参考
 
@@ -507,6 +527,7 @@
 4. 旧体系文档不再单独构成一套体系，只能按新结构模块归为“旧体系参考”。
 5. 非文档辅助文件放在 `第 4 部分`，不参与结构编码。
 6. 规则映射、迁移细节、模块说明不要继续堆回本文。
+7. 当前与项目级构建相关的唯一生效主线，必须以 `A-CBT-*` 进入标准目录主链；`docs/active/README.md` 仅作过渡入口；旧 `R-BLD-*` 只能出现在参考清单中。
 
 ---
 
@@ -562,7 +583,8 @@
 | `AG` | Agent | Agent / Prompt / Tool / Task 主链 |
 | `AST` | Asset | 记忆、知识库、上下文资产 |
 | `TMP` | Template | 模板库系统（工作流模板资产） |
-| `BLD` | Build Mode | 构建模式（项目构建引擎、讨论构建、直接构建） |
+| `CBT` | Chat Build | 当前唯一生效的项目级构建主线 |
+| `BLD` | Legacy Build System | 历史构建体系（仅作为参考层存在，不属于当前生效主线） |
 | `ENG` | Engineering | 工程实现与基础设施 |
 | `VAL` | Validation | 验证、测试、运维、审计 |
 
@@ -596,6 +618,7 @@
 | `PR-*` | `A-AG-M-T-02_prompt架构.md` 提示词架构本地规则 | `BR-AG-PROMPT-*` |
 | `TC-*` | `A-AG-M-P-01_工具调用体系.md` 工具调用本地规则 | `BR-AG-TOOL-*` |
 | `TP-*` | `A-AG-M-T-03_任务规划执行.md` 任务规划本地规则 | `BR-AG-TASK-*` |
+| `CBT` 主线规则 | `A-CBT-*` 主线中的 Chat Build 规则源头 | `BR-CBT-*` |
 
 说明：
 

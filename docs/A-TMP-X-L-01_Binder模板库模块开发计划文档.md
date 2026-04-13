@@ -10,7 +10,7 @@
 - 直接承接：`TMP-M-D-02`, `TMP-M-T-02`, `TMP-M-S-01`, `TMP-M-S-02`
 - 接口耦合：`AG-M-T-05`, `AST-M-P-01`, `AST-M-D-02`, `WS-M-D-01`, `BLD-I-P-02`, `BLD-M-D-01`, `AG-X-L-01`
 - 汇聚影响：`CORE-C-R-01`, `TMP-M-D-01`, `TMP-M-D-02`, `TMP-M-T-01`, `TMP-M-T-02`
-- 扩散检查：`A-AG-M-T-05_文档生成流程.md`, `A-AST-M-P-01_上下文注入.md`, `A-BLD-I-P-02_构建模式与模板库接口.md`, `src/types/reference.ts`, `src/utils/referenceProtocolAdapter.ts`, `src-tauri/src/services/context_manager.rs`, `src-tauri/src/commands/ai_commands.rs`
+- 扩散检查：`A-AG-M-T-05_文档生成流程.md`, `A-AST-M-P-01_上下文注入.md`, `R-BLD-I-P-02_构建模式与模板库接口.md`, `src/types/reference.ts`, `src/utils/referenceProtocolAdapter.ts`, `src-tauri/src/services/context_manager.rs`, `src-tauri/src/commands/ai_commands.rs`
 - 使用边界：`定义模板库模块的开发阶段、任务拆解、承接顺序、风险与验收；不直接替代技术主控文档、专项技术规范、代码实现设计稿与排期管理`
 - 变更要求：`修改本文后，必须复核：TMP-M-D-02、TMP-M-T-02、TMP-M-S-01、TMP-M-S-02、AG-M-T-05、AST-M-P-01、BLD-I-P-02、WS-M-D-01、CORE-C-R-01`
 
@@ -18,7 +18,7 @@
 > 文档层级：30_capabilities / 06_模板库系统 / 开发计划  
 > 上游主控：`A-TMP-M-D-02_Binder模板库模块描述文档.md`、`A-TMP-M-T-02_Binder模板库技术主控文档.md`  
 > 专项冻结：`A-TMP-M-S-01_工作流模板结构解析与流程编译规范.md`、`A-TMP-M-S-02_统一执行模型与运行时状态规范.md`  
-> 协同接口：`A-AG-M-T-05_文档生成流程.md`、`A-AST-M-P-01_上下文注入.md`、`A-BLD-I-P-02_构建模式与模板库接口.md`
+> 协同接口：`A-AG-M-T-05_文档生成流程.md`、`A-AST-M-P-01_上下文注入.md`、`R-BLD-I-P-02_构建模式与模板库接口.md`
 
 ---
 

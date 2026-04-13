@@ -278,7 +278,6 @@ impl ToolCallHandler {
       extracted
     }
   }
-
 }
 
 impl Default for ToolCallHandler {

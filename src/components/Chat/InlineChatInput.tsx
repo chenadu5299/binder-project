@@ -13,6 +13,7 @@ import { getTextBeforeCaret, getCaretPosition, deleteCharsBeforeCaret } from '..
 import { invoke } from '@tauri-apps/api/core';
 import { buildKnowledgeReference } from '../../utils/knowledgeReference';
 import { useFileStore } from '../../stores/fileStore';
+import { useChatBuildStore } from '../../stores/chatBuildStore';
 import { toast } from '../Common/Toast';
 import './InlineChatInput.css';
 
@@ -54,6 +55,12 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
     const isStreaming = React.useMemo(() => {
         return tab ? tab.messages.some(m => m.isLoading) : false;
     }, [tab]);
+
+    const buildSession = useChatBuildStore(
+        React.useCallback((state) => (tabId ? state.sessionsByTab[tabId] ?? null : null), [tabId])
+    );
+
+    const isBuildLocked = buildSession?.status === 'building';
     
     const references = React.useMemo(() => {
         return tabId ? getReferences(tabId) : [];
@@ -303,7 +310,7 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
     // 发送消息（先定义，因为 handleKeyDown 需要它）
     const handleSend = useCallback(async () => {
         if (!editorRef.current) return;
-        
+
         // 如果没有标签页，先创建标签页
         let currentTabId = tabId;
         if (!currentTabId) {
@@ -1359,6 +1366,7 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
                 <div className="mb-2 flex justify-end">
                     <button
                         onClick={handleRegenerate}
+                        disabled={isBuildLocked}
                         className="text-xs text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 flex items-center gap-1"
                     >
                         <ArrowPathIcon className="w-3 h-3" />
@@ -1395,7 +1403,7 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
                         maxHeight: '200px',
                     }}
                     suppressContentEditableWarning
-                    data-placeholder="输入消息... (Shift+Enter 换行)"
+                    data-placeholder={isBuildLocked ? '构建进行中，可继续普通聊天；不会影响当前构建' : '输入消息... (Shift+Enter 换行)'}
                 />
                 
                 {/* 发送/停止按钮 */}
@@ -1461,6 +1469,11 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
                     </button>
                 )}
             </div>
+            {isBuildLocked && (
+                <div className="mt-2 rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-700 dark:border-blue-800 dark:bg-blue-950/30 dark:text-blue-300">
+                    当前 Chat Build 正在执行。你现在发送的消息只会作为普通聊天内容显示，不会改变这次构建目标；若要停止当前运行，请使用上方“停止构建”按钮。
+                </div>
+            )}
             
             {/* 模型选择器（在输入框下方靠左，常显） */}
             <div className="mt-2 flex items-center">

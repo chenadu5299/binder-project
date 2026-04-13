@@ -83,12 +83,10 @@ pub trait AIProvider: Send + Sync {
 
   /// Simple non-streaming chat for background tasks (memory extraction etc.).
   /// Default: collect text from chat_stream using deepseek-chat.
-  async fn chat_simple(
-    &self,
-    prompt: &str,
-    max_tokens: u32,
-  ) -> Result<String, AIError> {
-    self.chat_with_model(prompt, max_tokens, "deepseek-chat").await
+  async fn chat_simple(&self, prompt: &str, max_tokens: u32) -> Result<String, AIError> {
+    self
+      .chat_with_model(prompt, max_tokens, "deepseek-chat")
+      .await
   }
 
   /// Non-streaming chat with explicit model override (used by ExtractionConfig).

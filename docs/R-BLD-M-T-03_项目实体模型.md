@@ -1,18 +1,24 @@
 # 项目实体模型（Project Object）
 
+> 状态：`REFERENCE ONLY`
+>
+> 本文档属于旧版 Build Mode / Discussion Build / Multi-Actor Build 设计参考，不是当前生效主线。
+> 当前唯一生效主线见 [`docs/README.md`](./README.md) 与 [`A-CBT-C-D-01_Chat Build产品定义与边界.md`](./A-CBT-C-D-01_Chat%20Build产品定义与边界.md)。
+> 若本文与当前代码现状或 Active 文档冲突，以 Active 文档和代码现状为准。
+
 ## 文档头
 
 - 结构编码：`BLD-M-T-03`
-- 文档属性：`主结构`
+- 文档属性：`旧体系参考`
 - 主责模块：`BLD`
 - 文档职责：`Project Object 数据结构定义、组织方式、写入 Workspace 时机与规则`
 - 上游约束：`BLD-M-D-01`, `BLD-M-D-02`, `BLD-M-D-03`
-- 直接承接：`A-BLD-I-P-01`
+- 直接承接：`R-BLD-I-P-01`
 - 接口耦合：`A-WS-C-T-01`, `A-WS-M-T-03`
-- 汇聚影响：`A-BLD-M-D-01`
-- 扩散检查：`A-BLD-I-P-01`
+- 汇聚影响：`R-BLD-M-D-01`
+- 扩散检查：`R-BLD-I-P-01`
 - 使用边界：`定义 Project Object 模型与写入规则，不承担 Workspace 文件系统实现细节`
-- 变更要求：`修改本文后，必须复核：A-BLD-I-P-01、A-BLD-M-T-04`
+- 变更要求：`修改本文后，必须复核：R-BLD-I-P-01、R-BLD-M-T-04`
 
 ---
 
@@ -76,7 +82,7 @@ Project Object 写入后，其内部文件与普通 Workspace 文件无本质区
 }
 ```
 
-> 待定：`build_outline_snapshot` 的完整字段定义（见 `A-BLD-M-T-04` 执行引擎）
+> 待定：`build_outline_snapshot` 的完整字段定义（见 `R-BLD-M-T-04` 执行引擎）
 
 ### 3.3 主文档
 
@@ -216,8 +222,8 @@ Project Object 目录名：
 
 ## 七、关联文档
 
-1. `A-BLD-M-D-02_直接构建功能设计.md`（产出规范描述）
-2. `A-BLD-M-D-03_讨论构建功能设计.md`（结果沉淀描述）
-3. `A-BLD-M-T-04_构建执行引擎.md`（Build Outline 生成与执行机制）
-4. `A-BLD-I-P-01_构建模式与Workspace接口.md`（写入接口契约）
+1. `R-BLD-M-D-02_直接构建功能设计.md`（产出规范描述）
+2. `R-BLD-M-D-03_讨论构建功能设计.md`（结果沉淀描述）
+3. `R-BLD-M-T-04_构建执行引擎.md`（Build Outline 生成与执行机制）
+4. `R-BLD-I-P-01_构建模式与Workspace接口.md`（写入接口契约）
 5. `A-WS-C-T-01_workspace模型定义.md`（Workspace 基础模型）

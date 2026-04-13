@@ -8,7 +8,7 @@
 - 文档职责：`系统总体架构 / 模型、架构与机制主控`
 - 上游约束：`CORE-C-D-04`, `CORE-C-D-05`, `CORE-C-D-06`
 - 直接承接：`SYS-I-P-01`, `SYS-I-P-02`
-- 接口耦合：`SYS-I-P-01`, `SYS-I-P-02`, `ENG-X-T-01`, `ENG-X-T-02`
+- 接口耦合：`SYS-I-P-01`, `SYS-I-P-02`, `ENG-X-T-01`, `ENG-X-T-02`, `A-CBT-I-P-01_Chat Build最小协议与状态.md`, `A-CBT-I-T-01_Chat Build状态控制与实现映射.md`
 - 汇聚影响：`CORE-C-R-01`
 - 扩散检查：`SYS-M-T-01`
 - 使用边界：`定义技术模型、实现约束与关键机制，不承担产品边界裁定与排期管理`
@@ -41,7 +41,7 @@
 不纳入发布阻塞：
 1. 移动端。
 2. Excel/演示文稿完整编辑。
-3. 构建模式全流程（BLD 模块，设计已完成，见 `A-BLD-C-D-01`；工程实现在 MVP 后推进）。
+3. Chat Build 完整工程主链（当前文档主线已生效，工程链路仍在后续阶段推进）。
 4. 分页/T-DOCX 作为首版前置条件。
 
 ---
@@ -90,9 +90,15 @@
 5. 可观测与恢复子系统
 负责错误码、关键日志、失败暴露、跳过继续。
 
-6. 构建模式子系统（BLD，非 MVP）
-独立于编辑模式的项目构建引擎：主控 AI 编排、角色 AI 协作、Project Object 写入 Workspace。
-不接入 AI 三层执行链和 Diff 机制，通过独立构建命令与 Workspace 文件系统交互。
+6. Chat Build 承接层（当前唯一生效构建主线）
+当前项目级构建能力以 Chat Build 为唯一生效主线，挂接在现有 chat / agent / workspace / template / task-artifact / reference 等通用基础设施之上。
+它当前定义为：单主控、冻结式、只生成新资源。
+当前不包含 discussion room、role AI、participant、project object 独立主链。
+
+未来说明：
+
+1. 旧 BLD / Discussion Build / Multi-Actor Build 只保留为参考层。
+2. 若未来重启，应作为 future/reference 架构专题单独规划，不属于当前系统架构事实。
 
 补充定位：
 
@@ -116,6 +122,17 @@
 
 对话请求 -> Resolver 定位 -> 生成 canonical diff -> Diff 卡展示 -> 接受/拒绝 -> 文档更新。  
 
+## 6.4 Chat Build 主链（当前文档主线）
+
+chat 自然讨论 -> 构建触发 -> 轻量确认 -> Build Outline 生成 -> 大纲确认 -> 正式构建 -> 状态/进度/可读过程展示 -> 完成/失败/中断。
+
+补充约束：
+
+1. 大纲确认前仍属于可讨论阶段。
+2. 大纲确认后进入冻结式构建。
+3. 构建中只接受手动中断，不接受自然语义改向。
+4. 构建输出只允许写入新的项目资源，不修改既有内容。
+
 ---
 
 ## 七、横切架构约束
@@ -131,6 +148,15 @@
 
 4. 边界稳定  
 模式切换不改变执行协议，不引入隐式分支。  
+
+5. 大纲确认硬边界  
+对应 `BR-CBT-VERIFY-001`。Chat Build 必须先完成大纲确认，才允许进入正式构建。  
+
+6. 构建冻结规则  
+对应 `BR-CBT-STATE-001`。Chat Build 一旦进入正式构建，不接受自然语义打断、修改或重定向。  
+
+7. 新资源写入边界  
+对应 `BR-CBT-ASSET-001` 与 `BR-CBT-DATA-001`。Chat Build 当前只生成新的项目资源，不修改既有工作区内容。  
 
 ---
 
@@ -161,3 +187,7 @@
 4. `A-PROD-C-D-02_场景边界清单.md`  
 5. `X-AG-M-R-16_Binder-AI功能优化方案-落地版-架构层-v2.md`  
 6. `R-AG-M-R-13_Binder AI 功能方案整合版.md`  
+7. `A-CBT-C-D-01_Chat Build产品定义与边界.md`
+8. `A-CBT-M-D-01_Chat Build交互流程.md`
+9. `A-CBT-M-T-01_Chat Build执行模型.md`
+10. `A-CBT-I-P-01_Chat Build最小协议与状态.md`

@@ -6,7 +6,7 @@ use serde_json::json;
 /// 兼容入口：从 tool_matrix 获取工具定义。
 /// 旧静态定义保留在 `get_tool_definitions_legacy` 中作为参照。
 pub fn get_tool_definitions() -> Vec<ToolDefinition> {
-    crate::services::tool_matrix::definitions_from_matrix()
+  crate::services::tool_matrix::definitions_from_matrix()
 }
 
 /// 旧静态定义（保留用于参照与回退，不再作为主源）

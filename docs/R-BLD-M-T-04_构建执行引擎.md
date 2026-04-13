@@ -1,18 +1,24 @@
 # 构建执行引擎
 
+> 状态：`REFERENCE ONLY`
+>
+> 本文档属于旧版 Build Mode / Discussion Build / Multi-Actor Build 设计参考，不是当前生效主线。
+> 当前唯一生效主线见 [`docs/README.md`](./README.md) 与 [`A-CBT-C-D-01_Chat Build产品定义与边界.md`](./A-CBT-C-D-01_Chat%20Build产品定义与边界.md)。
+> 若本文与当前代码现状或 Active 文档冲突，以 Active 文档和代码现状为准。
+
 ## 文档头
 
 - 结构编码：`BLD-M-T-04`
-- 文档属性：`主结构`
+- 文档属性：`旧体系参考`
 - 主责模块：`BLD`
 - 文档职责：`长任务编排机制、后台执行模型、不可打断约束、进度状态管理、失败恢复策略`
 - 上游约束：`BLD-M-D-02`, `BLD-M-T-01`, `BLD-M-T-03`
-- 直接承接：`A-BLD-X-L-01`
-- 接口耦合：`A-BLD-I-P-01`, `A-BLD-M-P-01`
-- 汇聚影响：`A-BLD-M-T-01`
-- 扩散检查：`A-BLD-M-P-01`, `A-BLD-I-P-01`
+- 直接承接：`R-BLD-X-L-01`
+- 接口耦合：`R-BLD-I-P-01`, `R-BLD-M-P-01`
+- 汇聚影响：`R-BLD-M-T-01`
+- 扩散检查：`R-BLD-M-P-01`, `R-BLD-I-P-01`
 - 使用边界：`定义执行引擎技术机制，不承担具体 AI 模型调用协议（见 BLD-M-P-01）`
-- 变更要求：`修改本文后，必须复核：A-BLD-M-T-03、A-BLD-I-P-01`
+- 变更要求：`修改本文后，必须复核：R-BLD-M-T-03、R-BLD-I-P-01`
 
 ---
 
@@ -238,7 +244,7 @@ PENDING → PLANNING → CONFIRMED → RUNNING → COMPLETED
 
 ## 八、关联文档
 
-1. `A-BLD-M-T-01_构建模式AI架构.md`（Master AI 执行职责）
-2. `A-BLD-M-T-03_项目实体模型.md`（Project Object 结构与写入规则）
-3. `A-BLD-M-P-01_主控AI与角色AI协议.md`（AI 调用协议）
-4. `A-BLD-I-P-01_构建模式与Workspace接口.md`（文件写入接口）
+1. `R-BLD-M-T-01_构建模式AI架构.md`（Master AI 执行职责）
+2. `R-BLD-M-T-03_项目实体模型.md`（Project Object 结构与写入规则）
+3. `R-BLD-M-P-01_主控AI与角色AI协议.md`（AI 调用协议）
+4. `R-BLD-I-P-01_构建模式与Workspace接口.md`（文件写入接口）

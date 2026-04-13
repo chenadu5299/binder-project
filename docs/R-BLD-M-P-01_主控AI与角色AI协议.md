@@ -1,18 +1,24 @@
 # 主控 AI 与角色 AI 协议
 
+> 状态：`REFERENCE ONLY`
+>
+> 本文档属于旧版 Build Mode / Discussion Build / Multi-Actor Build 设计参考，不是当前生效主线。
+> 当前唯一生效主线见 [`docs/README.md`](./README.md) 与 [`A-CBT-C-D-01_Chat Build产品定义与边界.md`](./A-CBT-C-D-01_Chat%20Build产品定义与边界.md)。
+> 若本文与当前代码现状或 Active 文档冲突，以 Active 文档和代码现状为准。
+
 ## 文档头
 
 - 结构编码：`BLD-M-P-01`
-- 文档属性：`主结构`
+- 文档属性：`旧体系参考`
 - 主责模块：`BLD`
 - 文档职责：`Master AI 与 Role AI 之间的任务分发协议、上下文传递规范、结果回流格式`
 - 上游约束：`BLD-M-T-01`, `BLD-M-T-02`
-- 直接承接：`A-BLD-M-P-02`
-- 接口耦合：`A-BLD-M-T-04`
-- 汇聚影响：`A-BLD-M-T-01`
-- 扩散检查：`A-BLD-M-P-02`
+- 直接承接：`R-BLD-M-P-02`
+- 接口耦合：`R-BLD-M-T-04`
+- 汇聚影响：`R-BLD-M-T-01`
+- 扩散检查：`R-BLD-M-P-02`
 - 使用边界：`定义 AI 间协议格式，不承担提示词具体内容（见 BLD-M-P-02）`
-- 变更要求：`修改本文后，必须复核：A-BLD-M-P-02、A-BLD-M-T-04`
+- 变更要求：`修改本文后，必须复核：R-BLD-M-P-02、R-BLD-M-T-04`
 
 ---
 
@@ -115,7 +121,7 @@ Role AI 的输出内容必须符合：
 3. 不输出文件内容（完整文档正文）。
 4. 不输出工具调用指令。
 
-> 待定：是否需要在 Role AI 的系统提示中明确禁止上述行为？（见 `A-BLD-M-P-02`）
+> 待定：是否需要在 Role AI 的系统提示中明确禁止上述行为？（见 `R-BLD-M-P-02`）
 
 ---
 
@@ -173,7 +179,7 @@ Master AI 在执行阶段使用 provider-side function calling（与编辑模式
 
 ### 5.2 核心工具定义
 
-> 待定：构建模式工具集完整定义（见 `A-BLD-M-T-01` 第 3.2 节）
+> 待定：构建模式工具集完整定义（见 `R-BLD-M-T-01` 第 3.2 节）
 
 工具调用结果格式：
 
@@ -249,13 +255,13 @@ Master AI 生成 Build Outline 时，输入包含：
 
 ### 6.2 输出
 
-Master AI 输出的 Build Outline 格式见 `A-BLD-M-T-03_项目实体模型.md` 第四节。
+Master AI 输出的 Build Outline 格式见 `R-BLD-M-T-03_项目实体模型.md` 第四节。
 
 ---
 
 ## 七、关联文档
 
-1. `A-BLD-M-T-01_构建模式AI架构.md`（AI 层级定义）
-2. `A-BLD-M-T-02_讨论组状态机与协作机制.md`（收束触发时机）
-3. `A-BLD-M-T-04_构建执行引擎.md`（工具调用执行上下文）
-4. `A-BLD-M-P-02_构建模式提示词架构.md`（提示词内容）
+1. `R-BLD-M-T-01_构建模式AI架构.md`（AI 层级定义）
+2. `R-BLD-M-T-02_讨论组状态机与协作机制.md`（收束触发时机）
+3. `R-BLD-M-T-04_构建执行引擎.md`（工具调用执行上下文）
+4. `R-BLD-M-P-02_构建模式提示词架构.md`（提示词内容）

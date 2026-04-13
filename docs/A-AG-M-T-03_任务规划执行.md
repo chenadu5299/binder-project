@@ -8,17 +8,17 @@
 - 文档职责：`任务规划执行 / 模型、架构与机制主控`
 - 上游约束：`CORE-C-D-04`, `AG-C-D-01`, `AG-M-D-01`
 - 直接承接：`AG-M-P-01`, `AG-X-L-01`
-- 接口耦合：`AST-M-P-01`, `SYS-I-P-01`, `SYS-I-P-02`
+- 接口耦合：`AST-M-P-01`, `SYS-I-P-01`, `SYS-I-P-02`, `A-CBT-I-P-01`, `A-CBT-I-T-01`
 - 汇聚影响：`CORE-C-R-01`, `AG-M-D-01`, `AG-M-T-01`
-- 扩散检查：`AG-M-T-02`, `AG-M-T-04`
+- 扩散检查：`AG-M-T-02`, `AG-M-T-04`, `A-CBT-I-P-01`, `A-CBT-I-T-01`, `A-AG-M-T-05`
 - 使用边界：`定义技术模型、实现约束与关键机制，不承担产品边界裁定与排期管理`
-- 变更要求：`修改本文后，必须复核：上游约束、直接承接、接口耦合、汇聚影响、扩散检查文档`
+- 变更要求：`修改本文后，必须复核：上游约束、直接承接、接口耦合、汇聚影响、扩散检查文档，尤其是 A-CBT-I-P-01、A-CBT-I-T-01、A-AG-M-T-05`
 
 ---
 > 文档层级：30_capabilities / 03_ai执行系统 / 任务规划执行主控  
 > 文档角色：任务闭环与收口控制文档  
 > 上游主控：`A-AG-M-T-01_ai执行架构.md`、`A-AG-M-D-01_Binder Agent能力描述文档.md`、`A-AG-M-T-04_Binder Agent技术主控文档.md`  
-> 下游专项：`A-DE-M-D-01_对话编辑统一方案.md`、未来构建模式执行文档
+> 下游专项：`A-DE-M-D-01_对话编辑统一方案.md`、`A-CBT-I-P-01_Chat Build最小协议与状态.md`
 
 ---
 
@@ -53,13 +53,13 @@
 ### 2.1 适用范围
 
 1. 当前层次三：对话编辑主链
-2. 未来构建模式工作流
+2. 当前 Chat Build 主线
 3. 层次一、层次二在明确需要时吸收的局部闭环规则
 
 ### 2.2 基本立场
 
 1. 本文定义任务闭环主链，不等于三层全部共享同一条任务主链。
-2. 当前完整任务闭环主要服务层次三和未来构建模式。
+2. 当前完整任务闭环主要服务层次三和当前 Chat Build。
 3. 层次一、层次二只在明确需要时吸收局部规则。
 
 ---
@@ -86,7 +86,7 @@
 
 | 规则ID | 规则名称 | 本文主定义位置 | 下游承接文档 |
 |---|---|---|---|
-| TP-CORE-001 | 完整任务闭环主要服务层次三与构建模式 | 4.1 | `A-AG-M-T-01_ai执行架构.md`、`A-AG-X-L-01_Binder Agent落地开发计划.md` |
+| TP-CORE-001 | 完整任务闭环主要服务层次三与 Chat Build | 4.1 | `A-AG-M-T-01_ai执行架构.md`、`A-AG-X-L-01_Binder Agent落地开发计划.md` |
 | BA-SCENE-006 | 新 Agent 优化不得在未明确决策前改写层次一/层次二运行逻辑 | 4.2 | `A-AG-M-T-01_ai执行架构.md`、`A-AG-M-D-01_Binder Agent能力描述文档.md`、`A-AG-X-L-01_Binder Agent落地开发计划.md` |
 | TP-PLAN-001 | 任务必须先理解目标、约束、对象、成功标准 | 5.1 | 层次三执行链 |
 | TP-PLAN-002 | 任务拆解必须最小可执行 | 5.2 | 层次三执行链 |
@@ -99,7 +99,7 @@
 | TP-ERR-001 | 流式异常治理必须并入执行链 | 9.1 | `A-AG-M-T-01_ai执行架构.md`、`A-AG-M-P-01_工具调用体系.md` |
 | TP-ERR-002 | 可恢复与不可恢复异常必须区分处理 | 9.2 | `A-AG-M-T-01_ai执行架构.md`、`A-AG-M-P-01_工具调用体系.md` |
 | TP-GOV-001 | 本文不单独定义 Agent 上位完成观与验证语义 | 10.1 | `A-AG-M-D-01_Binder Agent能力描述文档.md`、`A-AG-M-T-04_Binder Agent技术主控文档.md` |
-| TP-GOV-002 | 本文可被层次三和构建模式直接用于执行评审 | 10.2 | `A-AG-X-L-01_Binder Agent落地开发计划.md` |
+| TP-GOV-002 | 本文可被层次三和 Chat Build 直接用于执行评审 | 10.2 | `A-AG-X-L-01_Binder Agent落地开发计划.md` |
 
 ### 3.2 编码使用说明
 
@@ -118,7 +118,7 @@
 当前完整适用本文任务闭环主链的层次是：
 
 1. 层次三：对话编辑
-2. 未来构建模式
+2. 当前 Chat Build
 
 ## 4.2 其他层的适用方式
 
@@ -351,7 +351,7 @@ interface TaskClosureRecord {
 
 | 职责 | 前端模块 | 后端模块 | 当前落位 |
 |---|---|---|---|
-| 任务入口 | `src/stores/chatStore.ts` | `src-tauri/src/commands/ai_commands.rs` | 对话编辑与构建模式共用任务入口协议 |
+| 任务入口 | `src/stores/chatStore.ts` | `src-tauri/src/commands/ai_commands.rs` | 对话编辑主链直接使用；Chat Build 当前以 chat 入口壳承接并复用该入口基础 |
 | 计划生成 | `src/components/Chat/ChatPanel.tsx` | `src-tauri/src/services/context_manager.rs` + `src-tauri/src/commands/ai_commands.rs` | 由 L3 主链生成 plan artifact |
 | 步骤执行 | `src/stores/chatStore.ts` | `src-tauri/src/services/tool_call_handler.rs`、`src-tauri/src/services/tool_service.rs` | 工具步骤、纯生成步骤共用 step record |
 | 闭环判定 | `src/stores/diffStore.ts` | `src-tauri/src/commands/ai_commands.rs` | 汇总 verification / confirmation / error 形成 closure record |
@@ -452,13 +452,21 @@ async fn run_agent_task(req: AgentTaskRequest) -> Result<TaskClosureRecord, Stri
 
 ### 10.3 下游消费关系
 
-层次三执行链和未来构建模式，应直接消费本文关于：
+层次三执行链和当前 Chat Build，应直接消费本文关于：
 
 1. 任务理解
 2. 任务拆解
 3. 闭环验证
 4. 未完成处理
 5. 结束决策
+
+当本文被 Chat Build 复用时，还必须同时服从：
+
+1. `BR-CBT-VERIFY-001`：大纲确认是正式构建前的硬边界。
+2. `BR-CBT-STATE-001`：构建一旦开始不可语义改向。
+3. `BR-CBT-ASSET-001`：当前构建只生成新的项目资源，不修改既有内容。
+
+以上规则源头以 `A-CBT-I-P-01_Chat Build最小协议与状态.md` 为准，本文不再重复定义其控制语义。
 
 ---
 

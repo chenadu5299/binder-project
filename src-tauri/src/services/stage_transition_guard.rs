@@ -44,7 +44,11 @@ impl StageTransitionGuard {
     )
   }
 
-  pub fn decide(from: AgentStage, to: AgentStage, reason: Option<String>) -> StageTransitionDecision {
+  pub fn decide(
+    from: AgentStage,
+    to: AgentStage,
+    reason: Option<String>,
+  ) -> StageTransitionDecision {
     StageTransitionDecision {
       allowed: Self::can_transition(from, to),
       from_stage: from,

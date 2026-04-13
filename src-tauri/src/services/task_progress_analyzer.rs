@@ -415,5 +415,4 @@ impl TaskProgressAnalyzer {
           || content_lower.contains("子目录")
           || content_lower.contains("递归")))
   }
-
 }

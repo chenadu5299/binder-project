@@ -2,8 +2,8 @@
 //!
 //! 负责管理对话上下文，构建多层提示词，管理上下文长度
 
-use crate::services::knowledge::KnowledgeInjectionSlice;
 use crate::services::ai_providers::ChatMessage;
+use crate::services::knowledge::KnowledgeInjectionSlice;
 use std::path::PathBuf;
 
 // ── 文档内容注入策略 ──────────────────────────────────────────────────────────
@@ -447,7 +447,10 @@ pub enum ReferenceType {
   Template,      // 模板库引用
 }
 
-/// 截断策略（构建模式前置）
+/// 通用消息截断策略。
+///
+/// 除 `KeepRecent` 外，其余分支当前都回退到固定的最近消息截断，
+/// 这里只保留统一入口，不绑定任何独立模式管线。
 #[derive(Debug, Clone)]
 pub enum TruncationStrategy {
   /// 当前使用：保留最近 N 条历史
@@ -512,7 +515,13 @@ impl ContextManager {
       };
     }
 
-    if context.edit_target_present || context.selected_text.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false) {
+    if context.edit_target_present
+      || context
+        .selected_text
+        .as_ref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+    {
       return KnowledgeRetrievalDecision {
         should_trigger: false,
         reason: KnowledgeRetrievalTriggerReason::EditingContext,
@@ -573,11 +582,7 @@ impl ContextManager {
 
   /// Phase 3：七层语义 prompt 装配。
   /// 层次：governance → task → conversation → fact → constraint → augmentation → tool_and_output
-  pub fn build_prompt_package(
-    &self,
-    context: &ContextInfo,
-    enable_tools: bool,
-  ) -> PromptPackage {
+  pub fn build_prompt_package(&self, context: &ContextInfo, enable_tools: bool) -> PromptPackage {
     let mut layers = Vec::new();
 
     // L1 governance: 基础系统提示词（角色、规则、行为准则）
@@ -1036,7 +1041,7 @@ Only act on the LAST user message. Previous messages are completed history.
     refs
   }
 
-  /// 按策略截断消息（构建模式前置）
+  /// 按策略截断消息。
   pub fn truncate_with_strategy(
     &self,
     messages: &mut Vec<ChatMessage>,
@@ -1045,15 +1050,15 @@ Only act on the LAST user message. Previous messages are completed history.
     match strategy {
       TruncationStrategy::KeepRecent(n) => self.truncate_messages(messages, n),
       TruncationStrategy::SummarizeMiddle => {
-        // 构建模式实现
+        // 占位分支：当前统一回退为固定最近消息截断。
         self.truncate_messages(messages, 10);
       }
       TruncationStrategy::KeepTaskGoal => {
-        // 构建模式实现
+        // 占位分支：当前统一回退为固定最近消息截断。
         self.truncate_messages(messages, 10);
       }
       TruncationStrategy::LayeredPriority { .. } => {
-        // 未来实现：按分层权重截断
+        // 通用扩展点：当前尚无分层截断实现，先回退到固定最近消息截断。
         self.truncate_messages(messages, 10);
       }
     }
@@ -1106,10 +1111,7 @@ Only act on the LAST user message. Previous messages are completed history.
     messages.extend(recent_msgs);
   }
 
-  fn build_knowledge_augmentation_prompt(
-    &self,
-    slices: &[KnowledgeInjectionSlice],
-  ) -> String {
+  fn build_knowledge_augmentation_prompt(&self, slices: &[KnowledgeInjectionSlice]) -> String {
     let mut lines = vec![
       "[知识库补强]".to_string(),
       "以下内容来自知识库自动检索，仅作 augmentation 补强，不覆盖当前文档、显式引用或当前轮 artifact。".to_string(),
@@ -1246,7 +1248,10 @@ mod tests {
     );
 
     assert!(!decision.should_trigger);
-    assert_eq!(decision.reason, KnowledgeRetrievalTriggerReason::EditingContext);
+    assert_eq!(
+      decision.reason,
+      KnowledgeRetrievalTriggerReason::EditingContext
+    );
   }
 
   #[test]
@@ -1284,7 +1289,10 @@ mod tests {
     );
 
     assert!(!decision.should_trigger);
-    assert_eq!(decision.reason, KnowledgeRetrievalTriggerReason::CurrentScopeOnly);
+    assert_eq!(
+      decision.reason,
+      KnowledgeRetrievalTriggerReason::CurrentScopeOnly
+    );
   }
 
   #[test]
