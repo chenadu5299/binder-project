@@ -8,26 +8,12 @@ import { useDiffStore } from '../../stores/diffStore';
 import { useFileStore } from '../../stores/fileStore';
 import { ChevronDownIcon, ChevronUpIcon, DocumentTextIcon } from '@heroicons/react/24/outline';
 import { toast } from '../Common/Toast';
-import { markAgentStageComplete, markAgentUserConfirmed } from '../../utils/agentShadowLifecycle';
-
-function completeAgentPairs(entries: Array<{ chatTabId?: string; agentTaskId?: string }>, reason: string) {
-  const seen = new Set<string>();
-  for (const entry of entries) {
-    if (!entry.chatTabId || !entry.agentTaskId) continue;
-    const key = `${entry.chatTabId}:${entry.agentTaskId}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    markAgentUserConfirmed(entry.chatTabId, entry.agentTaskId, 'pending_panel_accept_confirmed');
-    markAgentStageComplete(entry.chatTabId, entry.agentTaskId, reason);
-  }
-}
+import { DiffActionService } from '../../services/DiffActionService';
 
 export const PendingDiffPanel: React.FC = () => {
   const { currentWorkspace } = useFileStore();
   const byFilePath = useDiffStore((s) => s.byFilePath);
   const byFilePathResolveStats = useDiffStore((s) => s.byFilePathResolveStats);
-  const acceptFileDiffs = useDiffStore((s) => s.acceptFileDiffs);
-  const rejectFileDiffs = useDiffStore((s) => s.rejectFileDiffs);
   const getPendingFileCount = useDiffStore((s) => s.getPendingFileCount);
 
   const [expanded, setExpanded] = useState(false);
@@ -43,8 +29,12 @@ export const PendingDiffPanel: React.FC = () => {
     for (const [filePath] of pendingFiles) {
       try {
         const entries = byFilePath[filePath] ?? [];
-        await acceptFileDiffs(filePath, currentWorkspace);
-        completeAgentPairs(entries, 'workspace_file_written');
+        // 取首个有效 agentTaskId/chatTabId 作为代表（workspace diffs 通常同属一个 task）
+        const rep = entries.find((e) => e.chatTabId && e.agentTaskId);
+        await DiffActionService.acceptFileDiffs(filePath, currentWorkspace ?? '', {
+          chatTabId: rep?.chatTabId,
+          agentTaskId: rep?.agentTaskId,
+        });
         ok++;
       } catch (e) {
         err++;
@@ -58,7 +48,12 @@ export const PendingDiffPanel: React.FC = () => {
   const handleRejectAll = async () => {
     for (const [filePath] of pendingFiles) {
       try {
-        await rejectFileDiffs(filePath, currentWorkspace);
+        const entries = byFilePath[filePath] ?? [];
+        const rep = entries.find((e) => e.chatTabId && e.agentTaskId);
+        await DiffActionService.rejectFileDiffs(filePath, currentWorkspace ?? '', {
+          chatTabId: rep?.chatTabId,
+          agentTaskId: rep?.agentTaskId,
+        });
       } catch (e) {
         toast.error(`${filePath.split('/').pop()}: ${e instanceof Error ? e.message : String(e)}`);
       }
@@ -117,8 +112,11 @@ export const PendingDiffPanel: React.FC = () => {
                     onClick={async () => {
                       try {
                         const entries = byFilePath[filePath] ?? [];
-                        await acceptFileDiffs(filePath, currentWorkspace);
-                        completeAgentPairs(entries, 'workspace_file_written');
+                        const rep = entries.find((e) => e.chatTabId && e.agentTaskId);
+                        await DiffActionService.acceptFileDiffs(filePath, currentWorkspace ?? '', {
+                          chatTabId: rep?.chatTabId,
+                          agentTaskId: rep?.agentTaskId,
+                        });
                         toast.success(`已应用 ${fileName} 的修改`);
                       } catch (e) {
                         toast.error(`接受失败: ${e instanceof Error ? e.message : String(e)}`);
@@ -131,7 +129,12 @@ export const PendingDiffPanel: React.FC = () => {
                   <button
                     onClick={async () => {
                       try {
-                        await rejectFileDiffs(filePath, currentWorkspace);
+                        const entries = byFilePath[filePath] ?? [];
+                        const rep = entries.find((e) => e.chatTabId && e.agentTaskId);
+                        await DiffActionService.rejectFileDiffs(filePath, currentWorkspace ?? '', {
+                          chatTabId: rep?.chatTabId,
+                          agentTaskId: rep?.agentTaskId,
+                        });
                         toast.info(`已拒绝 ${fileName} 的修改`);
                       } catch (e) {
                         toast.error(`拒绝失败: ${e instanceof Error ? e.message : String(e)}`);

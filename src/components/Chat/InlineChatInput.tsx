@@ -971,47 +971,18 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
             return;
         }
         
-        // 优先检查是否是从文件树拖拽的文件路径
-        // 注意：需要在 drop 事件中获取数据，而不是在 dragover 中
+        // 1. 文件树拖拽：application/file-path 明确标记
         let filePath = '';
         let isDirectory = false;
-        
-        // 方法 1：尝试获取 application/file-path（文件树拖拽的主要类型）
-        try {
-            filePath = dataTransfer.getData('application/file-path');
-        } catch (error) {
-            // 忽略错误，继续尝试其他方法
-        }
-        
-        // 方法 2：如果方法1失败，尝试 text/plain（备用方案）
-        if (!filePath) {
-            try {
-                filePath = dataTransfer.getData('text/plain');
-            } catch (error) {
-                // 忽略错误
-            }
-        }
-        
-        // 获取目录标识
-        try {
-            const dirFlag = dataTransfer.getData('application/is-directory');
-            isDirectory = dirFlag === 'true';
-        } catch (error) {
-            // 忽略错误
-        }
-        
-        // 处理文件树拖拽的文件
+        try { filePath = dataTransfer.getData('application/file-path'); } catch { /* ignore */ }
+        try { isDirectory = dataTransfer.getData('application/is-directory') === 'true'; } catch { /* ignore */ }
+
         if (filePath && !isDirectory) {
             console.log('✅ 检测到文件树拖拽，创建文件引用:', filePath);
             try {
                 const refId = await handleFileTreeReference(filePath, currentTabId);
-                
-                // 创建引用后，插入引用标签到输入框
                 if (refId && editorRef.current) {
-                    console.log('📎 插入引用标签到输入框:', refId);
                     handleInsertReference(refId);
-                } else {
-                    console.warn('⚠️ 引用创建失败或编辑器未就绪:', { refId, editorReady: !!editorRef.current });
                 }
             } catch (error) {
                 console.error('❌ 处理文件树引用失败:', error);
@@ -1057,6 +1028,56 @@ export const InlineChatInput: React.FC<InlineChatInputProps> = ({
                 }
             } catch (error) {
                 console.error('❌ 处理文件夹引用失败:', error);
+            }
+            return;
+        }
+
+        // 2. 编辑器文本拖拽：application/x-binder-source 由 CopyReferenceExtension dragstart 写入
+        const binderSourceStr = (() => {
+            try {
+                const s = dataTransfer.getData('application/x-binder-source');
+                if (s) return s;
+            } catch { /* ignore */ }
+            const gs = (window as any).__binderDragSource;
+            const gt = (window as any).__binderDragTimestamp;
+            if (gs && gt && Date.now() - gt < 10000) {
+                delete (window as any).__binderDragSource;
+                delete (window as any).__binderDragTimestamp;
+                return gs;
+            }
+            return '';
+        })();
+        const droppedText = (() => { try { return dataTransfer.getData('text/plain'); } catch { return ''; } })();
+
+        if (droppedText && binderSourceStr) {
+            try {
+                const source = JSON.parse(binderSourceStr);
+                const { createTextReferenceFromClipboard } = await import('../../utils/referenceHelpers');
+                const textRefBase = createTextReferenceFromClipboard(
+                    {
+                        filePath: source.filePath,
+                        fileName: source.fileName,
+                        lineRange: source.lineRange,
+                        charRange: source.charRange,
+                        startBlockId: source.startBlockId,
+                        endBlockId: source.endBlockId,
+                        blockId: source.blockId,
+                        startOffset: source.startOffset,
+                        endOffset: source.endOffset,
+                    },
+                    droppedText,
+                );
+                const textRef = {
+                    ...textRefBase,
+                    id: `ref-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+                    createdAt: Date.now(),
+                };
+                const refId = addReference(currentTabId, textRef);
+                if (refId && editorRef.current) {
+                    handleInsertReference(refId);
+                }
+            } catch (err) {
+                console.error('❌ 创建文本引用失败:', err);
             }
             return;
         }

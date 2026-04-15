@@ -61,8 +61,8 @@
 4. [`../A-TMP-M-D-02_Binder模板库模块描述文档.md`](../A-TMP-M-D-02_Binder%E6%A8%A1%E6%9D%BF%E5%BA%93%E6%A8%A1%E5%9D%97%E6%8F%8F%E8%BF%B0%E6%96%87%E6%A1%A3.md)
 5. [`../A-AG-M-T-03_任务规划执行.md`](../A-AG-M-T-03_%E4%BB%BB%E5%8A%A1%E8%A7%84%E5%88%92%E6%89%A7%E8%A1%8C.md)
 
-### 明确降级为 Reference 的文档
+### 已清理的旧构建文档
 
-旧 `R-BLD-*` 文档不再作为当前主线使用。
+旧 `R-BLD-*` 文档已清理出仓库，不再作为当前主线或参考层保留。
 
 索引见：[`../reference/README.md`](../reference/README.md)

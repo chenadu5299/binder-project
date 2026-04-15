@@ -15,25 +15,34 @@
 - 变更要求：`修改本文后，必须复核：上游约束、直接承接、接口耦合、汇聚影响、扩散检查文档`
 
 ---
-> 文档层级：30_capabilities / 01_对话编辑系统 / 开发计划  
-> 文档状态：执行标准（用于排期、开发、联调、验收）  
+> 文档分级：`L4 / 四级落地计划文档`
+> 文档类型：`落地计划 / 开发迁移承接`
+> 当前状态：`Active`
+> 受约束于：`A-DE-M-D-01`、`A-DE-M-T-01`、`A-DE-M-T-02`、`A-AG-M-T-03`、`A-AG-M-T-04`、`A-AST-M-P-01`、`A-AST-M-T-07`
+> 可约束：`开发排期、阶段拆解、任务映射、验收准备`
+> 可用于：`把既有 Active 规则转成阶段实施项、测试项和迁移清单`
+> 不可用于：`成为规则主源、术语主定义来源、状态或协议字段的重新定义来源`
 > 编制日期：2026-04-01  
-> 对齐主源：`R-DE-M-R-02_对话编辑-统一整合方案.md`、`R-DE-M-R-01_对话编辑-主控设计文档.md`
+> 对齐依据：`A-DE-M-D-01_对话编辑统一方案.md`、`A-DE-M-T-01_diff系统规则.md`、`A-DE-M-T-02_baseline状态协作.md`
 
 ---
 
 ## 零、对齐声明与使用方式
 
-本文是“落地执行计划”，不是新的规则主源。规则语义仍由以下文档主定义：
+本文是“落地执行计划”，不是新的规则主源。规则语义仍由以下 Active 文档主定义：
 
-1. `R-DE-M-R-02_对话编辑-统一整合方案.md`（规则ID唯一主源）。
-2. `R-DE-M-R-01_对话编辑-主控设计文档.md`（主控实现细化）。
+1. `A-DE-M-D-01_对话编辑统一方案.md`（DE 模块主控与边界）。
+2. `A-DE-M-T-01_diff系统规则.md`（Diff 专项规则与字段约束）。
+3. `A-DE-M-T-02_baseline状态协作.md`（`L/baselineId/revision` 状态协作）。
+4. `A-AG-M-T-03_任务规划执行.md` / `A-AG-M-T-04_Binder Agent技术主控文档.md`（`verification/confirmation/stage_complete/invalidated` 上位语义）。
+5. `A-AST-M-P-01_上下文注入.md` / `A-AST-M-T-07_Binder知识库自动检索协同规范.md`（上下文注入顺序与知识检索边界）。
 
 本文只做三件事：
 
 1. 把 `DE-*` 规则转成可实施任务与代码锚点。
 2. 把端到端主逻辑链转成可执行阶段计划。
 3. 把验收门禁转成可测试矩阵与发布清单。
+4. 若出现共享概念复述，均视为对上游 Active 文档的引用，不构成重新定义。
 
 ---
 
@@ -130,6 +139,15 @@
 3. Resolver：块内搜索，失败按严格降级到 `block_level`。  
 4. 全文扫描必须逐块调用，禁止一次 `rewrite_document` 代替多块局部编辑。  
 5. 用户“全部接受”执行同一批事务规则。
+
+## 2.5 当前文档优先级与外扩顺序
+
+1. 当前打开文档属于编辑事实层，不属于知识库依赖层。  
+2. 当前文档相关请求必须优先在当前文档内完成理解、定位与求解。  
+3. 若当前文档注入不足，先执行“当前文档内二次求解/补充注入/局部定位”，不得直接放行知识检索。  
+4. 仅当当前文档与当前 workspace 项目文档层都不足时，才允许进入知识库/外部资料层。  
+5. 若用户显式引用当前文件，可以去重正文注入，但必须保留“显式当前文件锚点”信号供后端路由使用。  
+6. 旧口径中把“当前文档问题”直接交给知识检索补偿的实现视为过时路径，本计划不再承接。  
 
 ---
 
@@ -273,7 +291,7 @@ textReference: {
 2. `edit_mode=rewrite_document`：走全文重写分支（仅明确整篇任务允许）。  
 3. `edit_mode=rewrite_block`：走整块重写分支。  
 4. 无精确坐标且非 rewrite 分支：块内搜索。  
-5. 块内 miss：整块替换降级（`block_level`）。  
+5. 块内 miss：触发受控 `block_level` 整块替换降级；该路径仅是 `A-DE-M-D-01_对话编辑统一方案.md` 明确授权的定位降级，不是默认兜底。  
 6. 不可恢复错误：报错重试。
 
 ## 5.3 零搜索
@@ -783,6 +801,25 @@ interface ExecutionExposure {
 4. 废弃代码统一删除。
 5. 删除旧的对话编辑临时 prompt 拼接路径，仅保留 `PromptPackage` 主链。
 
+## 12.9 Phase-CurrentDoc（P0）：当前文档事实层收口
+
+目标：恢复当前文档作为 agent / 对话编辑的最高优先级事实源。
+
+改造文件：
+
+1. `src/stores/chatStore.ts`  
+2. `src/utils/referenceProtocolAdapter.ts`  
+3. `src-tauri/src/commands/ai_commands.rs`  
+4. `src-tauri/src/services/context_manager.rs`
+
+交付：
+
+1. 当前文件显式引用不再被简单吞掉，后端可感知“当前文件被显式点名”。  
+2. 当前文档相关问题优先停留在当前文档事实层，不因未入知识库而外扩。  
+3. 长文档摘要不足时先执行文档内二次求解，再考虑项目文档层。  
+4. 自动知识检索只作为后备补充层，不再作为当前文档主链兜底。  
+5. 当前文档、项目文档、知识库三层扩展语料路径区分清晰。  
+
 ---
 
 ## 十三、测试矩阵与验收门禁
@@ -797,6 +834,7 @@ interface ExecutionExposure {
 6. 复制粘贴的同文档跨块引用在无显式选区下输出 `route_source=reference` 且区间跨块正确。  
 7. 引用元数据过期/损坏时可观测降级，且不得误标 `route_source=reference`。
 8. **DE-AGT-003**：pending_diffs 中任意条目均含 `diffId/targetFile/route_source/revision/createdAt`；构造缺字段 diff，写入被拒绝并有 `E_APPLY_FAILED` 记录。
+9. 显式 `@` 当前文件时，请求上下文中保留“current file explicitly referenced”信号，且不要求重复注入当前文档正文。
 
 ## 13.2 执行与状态验收
 
@@ -815,6 +853,8 @@ interface ExecutionExposure {
 3. 错误码与 Exposure 可检索。  
 4. 失败暴露与失效状态严格隔离。
 5. **DE-AGT-002**：正常轮次完成时 ExecutionExposure 含 `stageEvent: stage_complete`；存在 `constraint_failed` 悬置条目时 `stage_complete` 不触发。
+6. 长文档当前文档问题在摘要不足时，先触发文档内二次定位/补充注入，不直接进入知识检索。
+7. 当前文档问题默认扩展顺序固定为“当前文档 -> workspace 项目文档 -> 知识库/外部资料”，不得跳层。
 
 ## 13.4 风险与清理验收
 
@@ -853,11 +893,15 @@ interface ExecutionExposure {
 
 ## 十六、关联文档
 
-1. `R-DE-M-R-02_对话编辑-统一整合方案.md`  
-2. `R-DE-M-R-01_对话编辑-主控设计文档.md`  
-3. `A-DE-M-D-01_对话编辑统一方案.md`  
-4. `A-DE-M-T-01_diff系统规则.md`  
-5. `A-DE-M-T-02_baseline状态协作.md`  
-6. `A-DE-M-P-01_对话编辑提示词.md`  
-7. `A-ENG-X-T-04_diffstore设计.md`
-8. `A-AG-M-D-01_Binder Agent能力描述文档.md`（DE-AGT-* 规则上位主控来源）
+1. `A-DE-M-D-01_对话编辑统一方案.md`
+2. `A-DE-M-T-01_diff系统规则.md`
+3. `A-DE-M-T-02_baseline状态协作.md`
+4. `A-DE-M-P-01_对话编辑提示词.md`
+5. `A-AG-M-D-01_Binder Agent能力描述文档.md`（DE-AGT-* 规则上位主控来源）
+6. `A-AG-M-T-03_任务规划执行.md`
+7. `A-AG-M-T-04_Binder Agent技术主控文档.md`
+8. `A-AST-M-P-01_上下文注入.md`
+9. `A-AST-M-T-07_Binder知识库自动检索协同规范.md`
+10. `A-ENG-X-T-04_diffstore设计.md`
+11. `R-DE-M-R-02_对话编辑-统一整合方案.md`（仅作历史参考）
+12. `R-DE-M-R-01_对话编辑-主控设计文档.md`（仅作历史参考）

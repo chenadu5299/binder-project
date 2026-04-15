@@ -153,13 +153,9 @@ export const useChatStore = create<ChatState>()(persist((set, get) => {
             };
 
             // Phase 1：先建立 agentStore 运行态壳，不改变现有聊天行为。
+            // shadow runtime 为 session-only 内存投影，不从 DB 恢复（A-AG-M-T-05 §5.1）。
             useAgentStore.getState().ensureRuntimeForTab(tabId, mode);
 
-            // Phase 8：有 workspace 且 agent 模式时，异步恢复持久化的活跃任务
-            if (currentWorkspace && mode === 'agent') {
-                useAgentStore.getState().loadTasksFromDb(tabId).catch(() => {});
-            }
-            
             set({
                 tabs: [...get().tabs, newTab],
                 activeTabId: tabId,
@@ -532,13 +528,21 @@ export const useChatStore = create<ChatState>()(persist((set, get) => {
                     throw new Error('标签页不存在');
                 }
                 
-                // 构建消息列表（包含刚添加的用户消息，排除空的助手消息）
+                // 构建消息列表（包含刚添加的用户消息，排除占位符和 agent 编排控制消息）
                 const allMessages = currentTab.messages;
                 const messages = allMessages
                     .filter(m => {
                         // 排除空的助手消息占位符
                         if (m.role === 'assistant' && m.id === assistantMessageId && !m.content) {
                             return false;
+                        }
+                        // 过滤上一轮的 agent 编排控制消息：这些是系统自驱动的，不是用户真实意图，
+                        // 保留会加重历史任务信号、污染当前轮意图解析。
+                        if (m.role === 'user') {
+                            const c = (m.content || '').trimStart();
+                            if (c.startsWith('[NEXT_ACTION]') || c.startsWith('[TOOL_RESULTS]')) {
+                                return false;
+                            }
                         }
                         return true;
                     })
@@ -547,8 +551,13 @@ export const useChatStore = create<ChatState>()(persist((set, get) => {
                         content: m.content,
                     }));
                 
-                // 绑定工作区优先：记忆链与工具链都以 tab.workspacePath 为准，避免跨工作区污染
-                const tabWorkspacePath = currentTab.workspacePath;
+                // 运行时工作区（fileStore）为单一真源；tab.workspacePath 仅作重启后降级备用。
+                // 若两者不一致（重启后旧路径 / 切换工作区未更新 tab），自动修复 tab 绑定。
+                const runtimeWorkspace = useFileStore.getState().currentWorkspace;
+                const tabWorkspacePath = runtimeWorkspace ?? currentTab.workspacePath;
+                if (runtimeWorkspace && runtimeWorkspace !== currentTab.workspacePath) {
+                    get().bindToWorkspace(tabId, runtimeWorkspace);
+                }
                 
                 // P3 + §十三：注入 tab 与 RequestContext 同源（determineInjectionEditorTab）
                 const { getActiveTab, getTabByFilePath } = useEditorStore.getState();
@@ -680,8 +689,16 @@ export const useChatStore = create<ChatState>()(persist((set, get) => {
                 // 调用后端流式聊天（根据模式决定是否启用工具）
                 // 注意：如果没有工作区，工具调用应该禁用（临时聊天模式，只能是 chat 模式）
                 // Phase 0/1.1：引用功能 - 转为协议格式（refs 已在上方取过）
-                const { buildReferencesForProtocol } = await import('../utils/referenceProtocolAdapter');
+                const {
+                    buildReferencesForProtocol,
+                    hasExplicitCurrentFileReference,
+                } = await import('../utils/referenceProtocolAdapter');
                 const references = await buildReferencesForProtocol(refs, currentFile, validRefIdSet);
+                const currentFileExplicitlyReferenced = hasExplicitCurrentFileReference(
+                    refs,
+                    currentFile,
+                    validRefIdSet
+                );
 
                 const enableTools = currentTab.mode === 'agent' && !!tabWorkspacePath;
 
@@ -714,6 +731,7 @@ export const useChatStore = create<ChatState>()(persist((set, get) => {
                     enableTools: enableTools, // Agent 模式且有工作区时启用工具，否则禁用
                     workspacePath: tabWorkspacePath, // 绑定工作区作用域（memory/tool 主链一致）
                     currentFile: currentFile, // ⚠️ 关键修复：传递当前编辑器打开的文件路径
+                    currentFileExplicitlyReferenced: currentFileExplicitlyReferenced,
                     selectedText: selectedText, // ⚠️ 关键修复：传递当前选中的文本
                     currentEditorContent: currentEditorContent, // ⚠️ 文档编辑功能：传递当前编辑器内容
                     references: references.length > 0 ? references : undefined, // Phase 0：引用协议

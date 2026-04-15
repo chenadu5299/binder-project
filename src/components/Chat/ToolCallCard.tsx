@@ -21,10 +21,7 @@ import { DocumentDiffView } from './DocumentDiffView';
 import {
   useDiffStore,
   makeWorkspacePendingToolCallId,
-  preApplySnapshotGatesForAccept,
-  userVisibleMessageForSnapshotGate,
 } from '../../stores/diffStore';
-import { applyDiffReplaceInEditor } from '../../utils/applyDiffReplaceInEditor';
 import { blockRangeToPMRange, positionToLine } from '../../utils/editorOffsetUtils';
 import { getAbsolutePath, normalizePath, normalizeWorkspacePath } from '../../utils/pathUtils';
 import { DiffCard } from './DiffCard';
@@ -32,11 +29,8 @@ import { FileDiffCard } from './FileDiffCard';
 import type { FileDiffEntry } from '../../stores/diffStore';
 import { toast } from '../Common/Toast';
 import { AgentShadowStateSummary } from './AgentShadowStateSummary';
-import {
-    markAgentInvalidated,
-    markAgentStageComplete,
-    markAgentUserConfirmed,
-} from '../../utils/agentShadowLifecycle';
+import { DiffActionService } from '../../services/DiffActionService';
+import { DiffRetryController } from '../../services/DiffRetryController';
 
 interface ToolCallCardProps {
     toolCall: ToolCall;
@@ -407,81 +401,59 @@ export const ToolCallCard: React.FC<ToolCallCardProps> = ({ toolCall, chatTabId,
                                         const editor = tab.editor;
                                         if (!editor) return;
                                         const tabRev = tab.documentRevision ?? 1;
-                                        const gate = await preApplySnapshotGatesForAccept(entry, editor, tabRev, tab.filePath);
-                                        if (gate) {
-                                            diffStore.updateDiff(tab.filePath, entry.diffId, {
-                                                status: 'expired',
-                                                expireReason: gate,
-                                            });
-                                            markAgentInvalidated(chatTabId ?? '', entry.agentTaskId ?? toolCall.agentTaskId, gate);
-                                            toast.warning(userVisibleMessageForSnapshotGate(gate));
+                                        const agentTaskId = entry.agentTaskId ?? toolCall.agentTaskId;
+                                        const result = await DiffActionService.acceptDiff(
+                                            tab.filePath,
+                                            entry.diffId,
+                                            editor,
+                                            {
+                                                tabDocumentRevision: tabRev,
+                                                chatTabId: chatTabId ?? '',
+                                                agentTaskId,
+                                            },
+                                        );
+                                        if (!result.success) {
+                                            if (result.toastMessage) toast.warning(result.toastMessage);
                                             return;
                                         }
-                                        const r = entry.mappedFrom != null && entry.mappedTo != null
-                                            ? { from: entry.mappedFrom, to: entry.mappedTo }
-                                            : blockRangeToPMRange(
-                                                  editor.state.doc,
-                                                  entry.startBlockId,
-                                                  entry.startOffset,
-                                                  entry.endBlockId,
-                                                  entry.endOffset,
-                                                  entryBrOpts
-                                              );
-                                        if (!r) {
-                                            diffStore.updateDiff(tab.filePath, entry.diffId, {
-                                                status: 'expired',
-                                                expireReason: 'block_resolve_failed',
-                                            });
-                                            markAgentInvalidated(chatTabId ?? '', entry.agentTaskId ?? toolCall.agentTaskId, 'block_resolve_failed');
-                                            return;
-                                        }
-                                        const currentText = editor.state.doc.textBetween(r.from, r.to);
-                                        if (currentText !== entry.originalText) {
-                                            diffStore.updateDiff(tab.filePath, entry.diffId, {
-                                                status: 'expired',
-                                                expireReason: 'original_text_mismatch',
-                                            });
-                                            markAgentInvalidated(chatTabId ?? '', entry.agentTaskId ?? toolCall.agentTaskId, 'original_text_mismatch');
-                                            toast.warning('修改建议已失效：文档内容已被修改，无法应用此处的 AI 建议');
-                                            return;
-                                        }
-                                        const ins = applyDiffReplaceInEditor(editor, r, entry.newText);
-                                        if (!ins) {
-                                            diffStore.updateDiff(tab.filePath, entry.diffId, {
-                                                status: 'expired',
-                                                expireReason: 'apply_replace_failed',
-                                            });
-                                            markAgentInvalidated(chatTabId ?? '', entry.agentTaskId ?? toolCall.agentTaskId, 'apply_replace_failed');
-                                            return;
-                                        }
-                                        diffStore.acceptDiff(tab.filePath, entry.diffId, {
-                                            from: ins.insertFrom,
-                                            to: ins.insertTo,
-                                        });
-                                        updateTabContent(tab.id, editor.getHTML());
-                                        markAgentUserConfirmed(chatTabId ?? '', entry.agentTaskId ?? toolCall.agentTaskId, 'tool_card_accept_confirmed');
+                                        // 同时有关联文件 diff 时，写入工作区文件
                                         if (entry.fileDiffIndex != null) {
                                             (async () => {
                                                 try {
-                                                    await diffStore.acceptFileDiffs(filePath, currentWorkspace, [entry.fileDiffIndex!]);
-                                                    markAgentStageComplete(chatTabId ?? '', entry.agentTaskId ?? toolCall.agentTaskId, 'workspace_file_written');
+                                                    await DiffActionService.acceptFileDiffs(
+                                                        filePath,
+                                                        currentWorkspace ?? '',
+                                                        { chatTabId: chatTabId ?? '', agentTaskId, diffIndices: [entry.fileDiffIndex!] },
+                                                    );
                                                     toast.success('已应用修改并写入文件');
                                                 } catch (e) {
                                                     toast.error(`接受失败: ${e instanceof Error ? e.message : String(e)}`);
                                                 }
                                             })();
-                                        } else {
-                                            markAgentStageComplete(chatTabId ?? '', entry.agentTaskId ?? toolCall.agentTaskId, 'editor_revision_advanced');
                                         }
                                     }}
                                     onReject={() => {
                                         if (entry.fileDiffIndex != null) {
                                             diffStore.removeFileDiffEntry(filePath, entry.fileDiffIndex);
-                                            diffStore.rejectDiff(tab.filePath, entry.diffId);
-                                        } else {
-                                            diffStore.rejectDiff(tab.filePath, entry.diffId);
                                         }
+                                        DiffActionService.rejectDiff(tab.filePath, entry.diffId, {
+                                            chatTabId: chatTabId ?? '',
+                                            agentTaskId: entry.agentTaskId ?? toolCall.agentTaskId,
+                                        });
                                         tab.editor?.view.dispatch(tab.editor.state.tr);
+                                    }}
+                                    onRetry={async () => {
+                                        const editor = tab.editor;
+                                        if (!editor) return;
+                                        await DiffRetryController.retryDiff(
+                                            entry.diffId,
+                                            editor,
+                                            {
+                                                tabDocumentRevision: tab.documentRevision ?? 1,
+                                                chatTabId: chatTabId ?? '',
+                                                agentTaskId: entry.agentTaskId ?? toolCall.agentTaskId,
+                                            },
+                                        );
                                     }}
                                 />
                             );
@@ -519,9 +491,15 @@ export const ToolCallCard: React.FC<ToolCallCardProps> = ({ toolCall, chatTabId,
                             index={idx}
                             onAccept={async () => {
                                 try {
-                                    await diffStore.acceptFileDiffs(filePath, currentWorkspace, [entry.diff_index]);
-                                    markAgentUserConfirmed(chatTabId ?? '', entry.agentTaskId ?? toolCall.agentTaskId, 'file_diff_accept_confirmed');
-                                    markAgentStageComplete(chatTabId ?? '', entry.agentTaskId ?? toolCall.agentTaskId, 'workspace_file_written');
+                                    await DiffActionService.acceptFileDiffs(
+                                        filePath,
+                                        currentWorkspace ?? '',
+                                        {
+                                            chatTabId: chatTabId ?? '',
+                                            agentTaskId: entry.agentTaskId ?? toolCall.agentTaskId,
+                                            diffIndices: [entry.diff_index],
+                                        },
+                                    );
                                     toast.success('已应用修改并写入文件');
                                 } catch (e) {
                                     toast.error(`接受失败: ${e instanceof Error ? e.message : String(e)}`);

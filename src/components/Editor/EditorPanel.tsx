@@ -548,9 +548,9 @@ const EditorPanel: React.FC = () => {
         const pending = useDiffStore.getState().byFilePath[activeTab.filePath];
         const stats = useDiffStore.getState().byFilePathResolveStats[activeTab.filePath];
         if (!pending?.length) return null;
-        const diffStore = useDiffStore.getState();
         const total = pending.length;
         const resolved = stats?.resolved ?? total;
+        const rep = pending.find((e) => e.chatTabId && e.agentTaskId);
         return (
           <div className="flex-shrink-0 px-3 py-2 bg-amber-50 dark:bg-amber-900/20 border-b border-amber-200 dark:border-amber-700 flex items-center justify-between">
             <span className="text-xs text-amber-800 dark:text-amber-200">
@@ -562,7 +562,11 @@ const EditorPanel: React.FC = () => {
               <button
                 onClick={async () => {
                   try {
-                    await diffStore.acceptFileDiffs(activeTab.filePath, currentWorkspace);
+                    const { DiffActionService } = await import('../../services/DiffActionService');
+                    await DiffActionService.acceptFileDiffs(activeTab.filePath, currentWorkspace, {
+                      chatTabId: rep?.chatTabId,
+                      agentTaskId: rep?.agentTaskId,
+                    });
                     const { updateTabContent } = useEditorStore.getState();
                     const ext = activeTab.filePath.split('.').pop()?.toLowerCase();
                     const isDocx = ['docx', 'doc', 'odt', 'rtf'].includes(ext || '');
@@ -584,7 +588,11 @@ const EditorPanel: React.FC = () => {
               <button
                 onClick={async () => {
                   try {
-                    await diffStore.rejectFileDiffs(activeTab.filePath, currentWorkspace);
+                    const { DiffActionService } = await import('../../services/DiffActionService');
+                    await DiffActionService.rejectFileDiffs(activeTab.filePath, currentWorkspace, {
+                      chatTabId: rep?.chatTabId,
+                      agentTaskId: rep?.agentTaskId,
+                    });
                     const { toast } = await import('../Common/Toast');
                     toast.info('已拒绝修改');
                   } catch (e) {

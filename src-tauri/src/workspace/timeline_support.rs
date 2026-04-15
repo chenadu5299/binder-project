@@ -1,3 +1,4 @@
+use crate::utils::path_validator::PathValidator;
 use crate::workspace::workspace_db::{
   TimelineNodeRecord, TimelineRestorePayloadRecord, WorkspaceDb,
 };
@@ -308,6 +309,9 @@ pub fn restore_payload(
   workspace_root: &Path,
   payload: &TimelineRestorePayloadRecord,
 ) -> Result<Vec<String>, String> {
+  let canonical_workspace = workspace_root
+    .canonicalize()
+    .map_err(|e| format!("workspace canonicalize 失败: {}", e))?;
   match payload.payload_kind.as_str() {
     "file_content" => {
       let files = payload
@@ -333,7 +337,8 @@ pub fn restore_payload(
         let content = general_purpose::STANDARD
           .decode(content_b64)
           .map_err(|e| format!("解码文件内容失败: {}", e))?;
-        let full_path = workspace_root.join(path);
+        let full_path = PathValidator::resolve_workspace_relative_path(&canonical_workspace, path)
+          .map_err(|e| format!("时间轴还原路径非法: {}", e))?;
         if let Some(parent) = full_path.parent() {
           std::fs::create_dir_all(parent).map_err(|e| format!("创建父目录失败: {}", e))?;
         }
@@ -389,12 +394,16 @@ pub fn restore_payload(
       absent_entries.sort_by_key(|entry| std::cmp::Reverse(entry.path.matches('/').count()));
 
       for entry in present_dirs {
-        std::fs::create_dir_all(workspace_root.join(&entry.path))
-          .map_err(|e| format!("创建目录失败: {}", e))?;
+        let dir_path =
+          PathValidator::resolve_workspace_relative_path(&canonical_workspace, &entry.path)
+            .map_err(|e| format!("时间轴还原路径非法: {}", e))?;
+        std::fs::create_dir_all(dir_path).map_err(|e| format!("创建目录失败: {}", e))?;
       }
 
       for entry in present_files {
-        let full_path = workspace_root.join(&entry.path);
+        let full_path =
+          PathValidator::resolve_workspace_relative_path(&canonical_workspace, &entry.path)
+            .map_err(|e| format!("时间轴还原路径非法: {}", e))?;
         if let Some(parent) = full_path.parent() {
           std::fs::create_dir_all(parent).map_err(|e| format!("创建父目录失败: {}", e))?;
         }
@@ -408,7 +417,9 @@ pub fn restore_payload(
       }
 
       for entry in absent_entries {
-        let full_path = workspace_root.join(&entry.path);
+        let full_path =
+          PathValidator::resolve_workspace_relative_path(&canonical_workspace, &entry.path)
+            .map_err(|e| format!("时间轴还原路径非法: {}", e))?;
         if full_path.is_file() {
           let _ = std::fs::remove_file(&full_path);
         } else if full_path.is_dir() {

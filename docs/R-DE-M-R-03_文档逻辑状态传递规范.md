@@ -15,11 +15,16 @@
 - 变更要求：`修改本文后，必须复核：上游约束、直接承接、接口耦合、汇聚影响、扩散检查文档`
 
 ---
-> 与主控关系：对话编辑的定位、Resolver、canonical diff、工具协议以 [R-DE-M-R-01_对话编辑-主控设计文档.md](/Users/chenzhenqiang/Desktop/test/binder-project/docs/R-DE-M-R-01_对话编辑-主控设计文档.md) 为主轴；对话编辑状态、失效、接受规则以 [R-DE-M-R-02_对话编辑-统一整合方案.md](/Users/chenzhenqiang/Desktop/test/binder-project/docs/R-DE-M-R-02_对话编辑-统一整合方案.md) 为规则主源。本文只约定逻辑状态、显示状态、`L`、baseline、`revision` 的职责边界。
+> 文档分级：`L5 / 历史参考文档`
+> 文档类型：`旧状态规范 / 历史归档`
+> 当前状态：`Historical Reference`
+> 当前口径以：`A-CORE-C-D-05_状态单一真源原则.md`、`A-DE-M-T-02_baseline状态协作.md` 为准
+> 可用于：`追溯旧版状态分层、pending 语义和迁移背景`
+> 不可用于：`作为当前状态规则主源`
 
 ## 零、规则ID映射表（来源/去向）
 
-| 规则ID | 来自（统一整合方案） | 本文承接位置 | 去向 |
+| 规则ID | 来自（旧版统一整合方案） | 本文承接位置 | 当前 Active 去向 |
 |---|---|---|---|
 | DE-STATE-001 | 3.3 | 2.1/2.2 | 状态机定义 |
 | DE-STATE-002 | 3.3 | 2.3/6.x | 接受前后语义 |

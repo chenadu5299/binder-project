@@ -4,30 +4,44 @@ import { TextReference, ReferenceType, TextReferenceAnchor } from '../types/refe
 
 /**
  * 创建完整的 TextReference
- * 确保包含所有必需字段：displayText, fileName, preview 等
+ * 依据：A-DE-M-D-01 §5.8 第4条——行级引用可携带可选四元组
  */
 export function createTextReference(params: {
     content: string;
     sourceFile: string;
-    lineRange: { start: number; end: number };
-    charRange: { start: number; end: number };
-    fileName?: string; // 可选，如果没有则从 sourceFile 提取
-    preview?: string; // 可选，如果没有则从 content 生成
+    lineRange?: { start: number; end: number };
+    charRange?: { start: number; end: number };
+    fileName?: string;
+    preview?: string;
+    textReference?: TextReferenceAnchor;
 }): Omit<TextReference, 'id' | 'createdAt'> {
     const fileName = params.fileName || params.sourceFile.split('/').pop() || params.sourceFile.split('\\').pop() || '未命名文件';
     const preview = params.preview || params.content.substring(0, 100) + (params.content.length > 100 ? '...' : '');
-    const displayText = `${fileName} (行 ${params.lineRange.start}-${params.lineRange.end})`;
-    
-    return {
+    const displayText = params.lineRange
+        ? `${fileName} (行 ${params.lineRange.start}-${params.lineRange.end})`
+        : fileName;
+
+    const base: Omit<TextReference, 'id' | 'createdAt'> = {
         type: ReferenceType.TEXT,
         content: params.content,
         sourceFile: params.sourceFile,
         fileName,
-        lineRange: params.lineRange,
-        charRange: params.charRange,
+        ...(params.lineRange && { lineRange: params.lineRange }),
+        ...(params.charRange && { charRange: params.charRange }),
         preview,
         displayText,
     };
+
+    if (params.textReference) {
+        return {
+            ...base,
+            textReference: params.textReference,
+            startBlockId: params.textReference.startBlockId,
+            endBlockId: params.textReference.endBlockId,
+        };
+    }
+
+    return base;
 }
 
 /**
@@ -37,8 +51,8 @@ export function createTextReference(params: {
 export function createTextReferenceFromClipboard(source: {
     filePath: string;
     fileName?: string;
-    lineRange: { start: number; end: number };
-    charRange: { start: number; end: number };
+    lineRange?: { start: number; end: number };
+    charRange?: { start: number; end: number };
     startBlockId?: string;
     endBlockId?: string;
     blockId?: string;

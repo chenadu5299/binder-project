@@ -438,6 +438,17 @@ fn with_execution_observability(
   tool_result
 }
 
+fn tool_result_awaits_confirmation(
+  tool_result: &crate::services::tool_service::ToolResult,
+) -> bool {
+  tool_result
+    .meta
+    .as_ref()
+    .and_then(|meta| meta.gate.as_ref())
+    .and_then(|gate| gate.status.as_deref())
+    == Some("awaiting_confirmation")
+}
+
 // 注意：analyze_task_progress 函数已废弃，统一使用 TaskProgressAnalyzer::analyze
 // 这样可以避免重复控制逻辑，确保新的优化能够全面生效
 
@@ -703,7 +714,7 @@ pub async fn ai_inline_assist(
   }
 }
 
-/// 前端引用协议（设计文档 6.1）
+/// 前端引用协议（A-CORE-C-D-02 §3.3 / A-DE-M-D-01 §5.8）
 /// edit_target 必须为 Option，非 Text 类型引用无此字段，反序列化时避免 panic
 #[derive(Debug, Deserialize)]
 pub struct ReferenceFromFrontend {
@@ -971,6 +982,8 @@ fn sanitize_edit_current_editor_document_arguments(arguments: &mut serde_json::V
   }
 }
 
+/// 将前端引用转为 RichReferenceInfo，保留 text_reference 和 KB 细粒度 ID。
+/// 依据：A-CORE-C-D-02 §3.3 RichReferenceInfo / 引用结构保真
 fn frontend_ref_to_reference_info(r: &ReferenceFromFrontend) -> Option<ReferenceInfo> {
   let ref_type = match r.reference_type.as_str() {
     "text" => ReferenceType::Text,
@@ -987,10 +1000,25 @@ fn frontend_ref_to_reference_info(r: &ReferenceFromFrontend) -> Option<Reference
     "template" => return None,
     _ => return None,
   };
+
+  let text_reference = r.text_reference.as_ref().map(|tr| {
+    crate::services::context_manager::TextReferenceAnchorInfo {
+      start_block_id: tr.start_block_id.clone(),
+      start_offset: tr.start_offset,
+      end_block_id: tr.end_block_id.clone(),
+      end_offset: tr.end_offset,
+    }
+  });
+
   Some(ReferenceInfo {
     ref_type,
     source: r.source.clone(),
     content: r.content.clone(),
+    text_reference,
+    knowledge_base_id: r.knowledge_base_id.clone(),
+    knowledge_entry_id: r.knowledge_entry_id.clone(),
+    knowledge_document_id: r.knowledge_document_id.clone(),
+    knowledge_citation_key: r.knowledge_citation_key.clone(),
   })
 }
 
@@ -1250,6 +1278,7 @@ pub async fn ai_chat_stream(
   enable_tools: Option<bool>, // 是否启用工具调用（Agent 模式为 true，Chat 模式为 false）
   workspace_path: Option<String>, // 绑定工作区路径（优先于 watcher 全局路径）
   current_file: Option<String>, // 当前打开的文档路径（第二层上下文）
+  current_file_explicitly_referenced: Option<bool>, // 当前文档是否被本轮显式引用
   selected_text: Option<String>, // 当前选中的文本（第二层上下文）
   current_editor_content: Option<String>, // 当前编辑器内容（用于文档编辑功能）
   references: Option<Vec<ReferenceFromFrontend>>, // Phase 0：前端引用协议
@@ -1438,8 +1467,13 @@ pub async fn ai_chat_stream(
     if !already_referenced {
       final_references.push(ReferenceInfo {
         ref_type: ReferenceType::File,
-        source: normalized_path.clone(), // 使用规范化后的路径
-        content: String::new(),          // 当前文件内容会在需要时通过工具读取，这里留空
+        source: normalized_path.clone(),
+        content: String::new(),
+        text_reference: None,
+        knowledge_base_id: None,
+        knowledge_entry_id: None,
+        knowledge_document_id: None,
+        knowledge_citation_key: None,
       });
     }
   }
@@ -1478,9 +1512,9 @@ pub async fn ai_chat_stream(
   }
   // 后续流程统一使用“有效选区”变量（显式选区优先，其次引用四元组）
   let selected_text = effective_selected_text;
-  let selection_start_block_id = effective_selection_start_block_id;
+  let selection_start_block_id = effective_selection_start_block_id.clone();
   let selection_start_offset = effective_selection_start_offset;
-  let selection_end_block_id = effective_selection_end_block_id;
+  let selection_end_block_id = effective_selection_end_block_id.clone();
   let selection_end_offset = effective_selection_end_offset;
   eprintln!("📌 zero-search selection source={}", selection_source);
 
@@ -1493,63 +1527,95 @@ pub async fn ai_chat_stream(
   let cursor_offset_for_spawn = cursor_offset;
 
   // 读取当前 chat tab 的 agent task 状态摘要
+  // 精确锚点 / 同文件 TEXT 引用判定（供 agent_task_summary 抑制 + augmentation 阻断共用）
+  let has_precise_anchor = effective_selection_start_block_id.is_some()
+    && effective_selection_start_offset.is_some()
+    && effective_selection_end_block_id.is_some()
+    && effective_selection_end_offset.is_some();
+
+  let has_same_file_text_ref = references.as_ref().map_or(false, |refs| {
+    refs.iter().any(|r| {
+      r.reference_type == "text"
+        && same_source_file_for_reference(&r.source, &current_file, &workspace_path)
+    })
+  });
+
+  // 依据：A-DE-M-D-01 §5.8 第5条——局部编辑场景下不注入旧任务摘要
   let (agent_task_summary, agent_artifacts_summary): (Option<String>, Option<String>) = {
-    let db_opt = crate::workspace::workspace_db::WorkspaceDb::new(&workspace_path).ok();
-    let tasks = db_opt
-      .as_ref()
-      .and_then(|db| db.get_agent_tasks_by_chat_tab(&tab_id).ok())
-      .unwrap_or_default();
+    let user_msg_len = messages
+      .iter()
+      .rev()
+      .find(|m| m.role == "user")
+      .and_then(|m| m.content.as_ref())
+      .map_or(0, |c| c.chars().count());
+    let user_msg_short = user_msg_len < 100;
 
-    let task_summary = if tasks.is_empty() {
-      None
+    let suppress_task_summary =
+      has_precise_anchor || (has_same_file_text_ref && user_msg_short);
+
+    if suppress_task_summary {
+      eprintln!(
+        "[ai_chat_stream] agent_task_summary suppressed: precise_anchor={}, same_file_text_ref={}, short_msg={}",
+        has_precise_anchor, has_same_file_text_ref, user_msg_short
+      );
+      (None, None)
     } else {
-      let lines: Vec<String> = tasks
-        .iter()
-        .take(3)
-        .map(|t| {
-          format!(
-            "- Task [{}]: goal=\"{}\", lifecycle={}, stage={}, reason={}",
-            &t.id[..8.min(t.id.len())],
-            t.goal.chars().take(80).collect::<String>(),
-            t.lifecycle,
-            t.stage,
-            t.stage_reason.as_deref().unwrap_or("none"),
-          )
-        })
-        .collect();
-      Some(lines.join("\n"))
-    };
+      let db_opt = crate::workspace::workspace_db::WorkspaceDb::new(&workspace_path).ok();
+      let tasks = db_opt
+        .as_ref()
+        .and_then(|db| db.get_agent_tasks_by_chat_tab(&tab_id).ok())
+        .unwrap_or_default();
 
-    // Phase 7: 读取最近活跃任务的 artifacts 摘要
-    let artifacts_summary = tasks
-      .first()
-      .and_then(|active_task| {
-        db_opt
-          .as_ref()?
-          .get_agent_artifacts_by_task(&active_task.id)
-          .ok()
-      })
-      .and_then(|artifacts| {
-        if artifacts.is_empty() {
-          return None;
-        }
-        let lines: Vec<String> = artifacts
+      let task_summary = if tasks.is_empty() {
+        None
+      } else {
+        let lines: Vec<String> = tasks
           .iter()
-          .take(5)
-          .map(|a| {
+          .take(3)
+          .map(|t| {
             format!(
-              "- [{}] kind={} status={} summary={}",
-              &a.id[..8.min(a.id.len())],
-              a.kind,
-              a.status,
-              a.summary.as_deref().unwrap_or("—"),
+              "- Task [{}]: goal=\"{}\", lifecycle={}, stage={}, reason={}",
+              &t.id[..8.min(t.id.len())],
+              t.goal.chars().take(80).collect::<String>(),
+              t.lifecycle,
+              t.stage,
+              t.stage_reason.as_deref().unwrap_or("none"),
             )
           })
           .collect();
         Some(lines.join("\n"))
-      });
+      };
 
-    (task_summary, artifacts_summary)
+      let artifacts_summary = tasks
+        .first()
+        .and_then(|active_task| {
+          db_opt
+            .as_ref()?
+            .get_agent_artifacts_by_task(&active_task.id)
+            .ok()
+        })
+        .and_then(|artifacts| {
+          if artifacts.is_empty() {
+            return None;
+          }
+          let lines: Vec<String> = artifacts
+            .iter()
+            .take(5)
+            .map(|a| {
+              format!(
+                "- [{}] kind={} status={} summary={}",
+                &a.id[..8.min(a.id.len())],
+                a.kind,
+                a.status,
+                a.summary.as_deref().unwrap_or("—"),
+              )
+            })
+            .collect();
+          Some(lines.join("\n"))
+        });
+
+      (task_summary, artifacts_summary)
+    }
   };
 
   // ── L6 augmentation：记忆库检索（gating + search + format）──────────────
@@ -1669,9 +1735,10 @@ pub async fn ai_chat_stream(
     selection_end_offset,
     cursor_block_id: cursor_block_id.clone(),
     cursor_offset,
+    user_message: last_user_message.clone(),
+    current_file_explicitly_referenced: current_file_explicitly_referenced.unwrap_or(false),
     baseline_id: baseline_id.clone(),
     document_revision,
-    user_message: last_user_message.clone(),
     agent_task_summary: agent_task_summary.clone(),
     agent_artifacts_summary: agent_artifacts_summary.clone(),
     memory_context: memory_context.clone(),
@@ -1708,9 +1775,13 @@ pub async fn ai_chat_stream(
         }
     };
 
+  // 精确锚点（四元组）或同文件 TEXT 引用视为 granular 显式引用，阻断知识增强。
+  // 原始 granular_reference_count 只覆盖 KB 引用；TEXT 引用在此补计。
+  let text_ref_granular_bonus: usize = if has_precise_anchor || has_same_file_text_ref { 1 } else { 0 };
   let knowledge_retrieval_context = KnowledgeRetrievalContext {
     explicit_reference_count: usize::from(explicit_knowledge_suppression.has_explicit_reference),
-    granular_explicit_reference_count: explicit_knowledge_suppression.granular_reference_count,
+    granular_explicit_reference_count: explicit_knowledge_suppression.granular_reference_count
+      + text_ref_granular_bonus,
     automatic_candidate_count: knowledge_policy_summary.automatic_entry_count,
     automatic_policy_blocked: knowledge_policy_summary.active_entry_count > 0
       && knowledge_policy_summary.policy_allowed_entry_count == 0,
@@ -1873,6 +1944,11 @@ pub async fn ai_chat_stream(
           ..runtime.clone()
         },
       ),
+      text_reference: None,
+      knowledge_base_id: None,
+      knowledge_entry_id: None,
+      knowledge_document_id: None,
+      knowledge_citation_key: None,
     });
   }
 
@@ -1915,14 +1991,15 @@ pub async fn ai_chat_stream(
     selection_end_offset,
     cursor_block_id,
     cursor_offset,
-    baseline_id: baseline_id.clone(),
-    document_revision,
     user_message: messages
       .iter()
       .rev()
       .find(|m| m.role == "user")
       .map(|m| m.content.clone().unwrap_or_default())
       .unwrap_or_default(),
+    current_file_explicitly_referenced: current_file_explicitly_referenced.unwrap_or(false),
+    baseline_id: baseline_id.clone(),
+    document_revision,
     agent_task_summary,
     agent_artifacts_summary,
     memory_context,
@@ -2319,21 +2396,24 @@ pub async fn ai_chat_stream(
                       3, // max_retries
                     )
                     .await;
-                  let skip_continue = !raw_tool_result.success;
+                  let awaiting_confirmation = tool_result_awaits_confirmation(&raw_tool_result);
+                  let skip_continue = !raw_tool_result.success || awaiting_confirmation;
                   let tool_result = with_execution_observability(
                     raw_tool_result,
                     &name,
                     Some(&parsed_args_for_result),
                     skip_continue,
                   );
-                  maybe_sync_workflow_execution_from_tool_result(
-                    &app_handle,
-                    &tab_id,
-                    &effective_task_id,
-                    &workspace_path,
-                    &name,
-                    &tool_result,
-                  );
+                  if !awaiting_confirmation {
+                    maybe_sync_workflow_execution_from_tool_result(
+                      &app_handle,
+                      &tab_id,
+                      &effective_task_id,
+                      &workspace_path,
+                      &name,
+                      &tool_result,
+                    );
+                  }
 
                   // ⚠️ 关键修复：在工具调用执行后检查取消标志
                   {
@@ -2364,14 +2444,32 @@ pub async fn ai_chat_stream(
                   }
 
                   // 更新工具调用状态：完成或失败
-                  let tool_status = if tool_result.success {
+                  let tool_status = if awaiting_confirmation {
+                    crate::services::conversation_manager::ToolCallStatus::Pending
+                  } else if tool_result.success {
                     crate::services::conversation_manager::ToolCallStatus::Completed
                   } else {
                     crate::services::conversation_manager::ToolCallStatus::Failed
                   };
                   conversation_manager.update_tool_call_status(&tab_id, tool_status);
 
-                  if tool_result.success {
+                  if awaiting_confirmation {
+                    let payload = serde_json::json!({
+                        "tab_id": tab_id,
+                        "chunk": "",
+                        "done": false,
+                        "tool_call": {
+                            "id": id,
+                            "name": name,
+                            "arguments": parsed_args_for_result,
+                            "result": tool_result,
+                            "status": "pending",
+                        },
+                    });
+                    if let Err(e) = app_handle.emit("ai-chat-stream", payload) {
+                      eprintln!("发送确认门工具调用失败: {}", e);
+                    }
+                  } else if tool_result.success {
                     eprintln!("✅ 工具执行成功: {}", name);
 
                     // 如果是文件操作工具，且执行成功，手动触发文件树刷新事件
@@ -2725,23 +2823,42 @@ pub async fn ai_chat_stream(
                 }
               }
             };
-            let skip_continue = !raw_tool_result.success;
+            let awaiting_confirmation = tool_result_awaits_confirmation(&raw_tool_result);
+            let skip_continue = !raw_tool_result.success || awaiting_confirmation;
             let tool_result = with_execution_observability(
               raw_tool_result,
               &name,
               Some(&parsed_args_for_result),
               skip_continue,
             );
-            maybe_sync_workflow_execution_from_tool_result(
-              &app_handle,
-              &tab_id,
-              &effective_task_id,
-              &workspace_path,
-              &name,
-              &tool_result,
-            );
+            if !awaiting_confirmation {
+              maybe_sync_workflow_execution_from_tool_result(
+                &app_handle,
+                &tab_id,
+                &effective_task_id,
+                &workspace_path,
+                &name,
+                &tool_result,
+              );
+            }
 
-            if tool_result.success {
+            if awaiting_confirmation {
+              let payload = serde_json::json!({
+                  "tab_id": tab_id,
+                  "chunk": "",
+                  "done": false,
+                  "tool_call": {
+                      "id": id.clone(),
+                      "name": name.clone(),
+                      "arguments": parsed_args_for_result.clone(),
+                      "result": tool_result,
+                      "status": "pending",
+                  },
+              });
+              if let Err(e) = app_handle.emit("ai-chat-stream", payload) {
+                eprintln!("发送确认门工具调用失败: {}", e);
+              }
+            } else if tool_result.success {
               eprintln!("✅ 工具执行成功: {}", name);
 
               // 如果是文件操作工具，且执行成功，手动触发文件树刷新事件
@@ -3614,21 +3731,25 @@ pub async fn ai_chat_stream(
                               }
                             }
                           };
-                          let skip_continue = !raw_tool_result.success;
+                          let awaiting_confirmation =
+                            tool_result_awaits_confirmation(&raw_tool_result);
+                          let skip_continue = !raw_tool_result.success || awaiting_confirmation;
                           let tool_result = with_execution_observability(
                             raw_tool_result,
                             &name,
                             Some(&parsed_args_for_result_continue),
                             skip_continue,
                           );
-                          maybe_sync_workflow_execution_from_tool_result(
-                            &app_handle,
-                            &tab_id,
-                            &effective_task_id,
-                            &workspace_path,
-                            &name,
-                            &tool_result,
-                          );
+                          if !awaiting_confirmation {
+                            maybe_sync_workflow_execution_from_tool_result(
+                              &app_handle,
+                              &tab_id,
+                              &effective_task_id,
+                              &workspace_path,
+                              &name,
+                              &tool_result,
+                            );
+                          }
 
                           // ⚠️ 关键修复：在继续对话的工具调用执行后检查取消标志
                           {
@@ -3658,7 +3779,24 @@ pub async fn ai_chat_stream(
                             }
                           }
 
-                          if tool_result.success {
+                          if awaiting_confirmation {
+                            let payload = serde_json::json!({
+                                "tab_id": tab_id,
+                                "chunk": "",
+                                "done": false,
+                                "tool_call": {
+                                    "id": id,
+                                    "name": name,
+                                    "arguments": parsed_args_for_result_continue.clone(),
+                                    "result": tool_result,
+                                    "status": "pending",
+                                },
+                            });
+                            if let Err(e) = app_handle.emit("ai-chat-stream", payload) {
+                              eprintln!("发送确认门工具调用失败: {}", e);
+                            }
+                            continue_loop = false;
+                          } else if tool_result.success {
                             eprintln!("✅ 继续对话中工具执行成功: {}", name);
 
                             // 保存工具调用结果
@@ -5735,8 +5873,12 @@ pub async fn chat_build_generate_outline(
     }
   }
 
-  let json = extract_json_object_block(&response)
-    .ok_or_else(|| format!("Build Outline 响应不是有效 JSON: {}", safe_truncate(&response, 200)))?;
+  let json = extract_json_object_block(&response).ok_or_else(|| {
+    format!(
+      "Build Outline 响应不是有效 JSON: {}",
+      safe_truncate(&response, 200)
+    )
+  })?;
 
   let mut payload: ChatBuildOutlinePayload =
     serde_json::from_str(json).map_err(|e| format!("Build Outline JSON 解析失败: {}", e))?;

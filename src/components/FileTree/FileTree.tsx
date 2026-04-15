@@ -5,7 +5,9 @@ import { documentService } from '../../services/documentService';
 import { knowledgeService } from '../../services/knowledge/knowledgeService';
 import FileTreeNode from './FileTreeNode';
 import OrganizeFilesDialog from './OrganizeFilesDialog';
+import InputDialog from './InputDialog';
 import LoadingSpinner from '../Common/LoadingSpinner';
+import Modal from '../Common/Modal';
 import { toast } from '../Common/Toast';
 import { listen } from '@tauri-apps/api/event';
 
@@ -19,6 +21,8 @@ const FileTree = forwardRef<FileTreeRef>((_props, ref) => {
   const [isLoading, setIsLoading] = useState(false);
   const [isDragOver, setIsDragOver] = useState(false);
   const [organizeFiles, setOrganizeFiles] = useState<string[] | null>(null);
+  const [renameTargetPath, setRenameTargetPath] = useState<string | null>(null);
+  const [deleteTargetPath, setDeleteTargetPath] = useState<string | null>(null);
 
   /** @param preserveExpanded 为 true 时保持当前展开状态（用于外部修改刷新），否则重置为仅根目录 */
   const loadFileTree = async (preserveExpanded = false) => {
@@ -282,15 +286,19 @@ const FileTree = forwardRef<FileTreeRef>((_props, ref) => {
     await loadFileTree(true);
   };
 
+  const handleRenameRequest = (filePath: string) => {
+    setRenameTargetPath(filePath);
+  };
+
   // ⚠️ Week 18.2：处理文件重命名
-  const handleRename = async (filePath: string) => {
-    const newName = prompt('请输入新名称:', filePath.split('/').pop() || '');
-    if (!newName || newName.trim() === '') {
+  const handleRenameConfirm = async (newName: string) => {
+    if (!renameTargetPath) {
       return;
     }
 
     try {
-      await fileService.renameFile(filePath, newName.trim());
+      await fileService.renameFile(renameTargetPath, newName.trim());
+      setRenameTargetPath(null);
       await loadFileTree(true);
     } catch (error) {
       console.error('重命名文件失败:', error);
@@ -298,8 +306,19 @@ const FileTree = forwardRef<FileTreeRef>((_props, ref) => {
     }
   };
 
+  const handleDeleteRequest = (filePath: string) => {
+    setDeleteTargetPath(filePath);
+  };
+
   // ⚠️ Week 18.2：处理文件删除
-  const handleDelete = async (filePath: string) => {
+  const handleDeleteConfirm = async () => {
+    if (!deleteTargetPath) {
+      return;
+    }
+
+    const filePath = deleteTargetPath;
+    setDeleteTargetPath(null);
+
     try {
       await fileService.deleteFile(filePath);
       await loadFileTree(true);
@@ -398,8 +417,8 @@ const FileTree = forwardRef<FileTreeRef>((_props, ref) => {
             expandedPaths={expandedPaths}
             onToggleExpand={toggleExpand}
             onSelectFile={handleFileSelect}
-            onRename={handleRename}
-            onDelete={handleDelete}
+            onRename={handleRenameRequest}
+            onDelete={handleDeleteRequest}
             onDuplicate={handleDuplicate}
             onOrganize={handleOrganize}
             onStoreToKnowledge={handleStoreToKnowledge}
@@ -422,6 +441,46 @@ const FileTree = forwardRef<FileTreeRef>((_props, ref) => {
           }}
         />
       )}
+
+      {renameTargetPath && (
+        <InputDialog
+          title="重命名资源"
+          message="请输入新名称："
+          defaultValue={renameTargetPath.split('/').pop() || ''}
+          onConfirm={handleRenameConfirm}
+          onCancel={() => setRenameTargetPath(null)}
+        />
+      )}
+
+      <Modal
+        isOpen={!!deleteTargetPath}
+        onClose={() => setDeleteTargetPath(null)}
+        title="确认删除"
+      >
+        <div className="space-y-4">
+          <p className="text-sm text-gray-600 dark:text-gray-300">
+            {deleteTargetPath
+              ? `确定要删除 "${deleteTargetPath.split('/').pop() || deleteTargetPath}" 吗？此操作不可撤销。`
+              : ''}
+          </p>
+          <div className="flex justify-end gap-2">
+            <button
+              type="button"
+              onClick={() => setDeleteTargetPath(null)}
+              className="px-4 py-2 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors"
+            >
+              取消
+            </button>
+            <button
+              type="button"
+              onClick={handleDeleteConfirm}
+              className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors"
+            >
+              确认删除
+            </button>
+          </div>
+        </div>
+      </Modal>
     </div>
   );
 });

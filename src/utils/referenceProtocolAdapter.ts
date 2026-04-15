@@ -1,7 +1,7 @@
 /**
  * 引用协议适配器
  * 将 Reference[] 转为 ai_chat_stream 协议格式
- * 依据：《引用功能完整设计文档》6.1
+ * 依据：A-CORE-C-D-02 §3.3（引用系统术语）/ A-DE-M-D-01 §5.8（引用结构保真）
  */
 
 import { invoke } from '@tauri-apps/api/core';
@@ -109,6 +109,25 @@ export async function buildReferencesForProtocol(
     }
 
     return results;
+}
+
+/**
+ * 当前打开文件是否被用户在本轮显式引用。
+ * 仅返回元语义信号，不代表需要把当前文件正文重复注入 references。
+ */
+export function hasExplicitCurrentFileReference(
+    refs: Reference[],
+    currentFile: string | null,
+    validRefIds?: Set<string>
+): boolean {
+    if (!currentFile) return false;
+
+    return refs.some((ref) => {
+        if (validRefIds && !validRefIds.has(ref.id)) {
+            return false;
+        }
+        return isCurrentFileRef(ref, currentFile);
+    });
 }
 
 /** 判断是否为当前打开文件的引用（需忽略） */

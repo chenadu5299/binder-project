@@ -21,7 +21,7 @@ import {
   editorMatchesContentSnapshot,
   editorMatchesBlockOrderSnapshot,
 } from '../utils/contentSnapshotHash';
-import { markAgentInvalidated, markAgentRejected } from '../utils/agentShadowLifecycle';
+import { markAgentInvalidated, markVerificationFailed } from '../utils/agentShadowLifecycle';
 
 export type DiffEntryStatus = 'pending' | 'accepted' | 'rejected' | 'expired';
 export type DiffEntryType = 'replace' | 'delete' | 'insert';
@@ -50,6 +50,26 @@ export type ExecutionErrorCode =
   | 'E_BLOCKTREE_NODE_MISSING'
   | 'E_BLOCKTREE_STALE'
   | 'E_BLOCKTREE_BUILD_FAILED';
+
+/** DE-OBS-005：执行失败事件对象（A-DE-M-T-01 §6.4）。独立于 DiffEntryStatus 与 ExpiredReason。 */
+export interface DiffExecuteFailedEvent {
+  diffId: string;
+  code: ExecutionErrorCode;
+  retryable: boolean;
+  route_source: 'selection' | 'reference' | 'block_search';
+  agentTaskId?: string;
+  chatTabId?: string;
+  timestamp: number;
+  retryCount: number;
+}
+
+/** retryable=true 的 ExecutionErrorCode 集合（A-DE-M-T-01 §6.6.1） */
+export const RETRYABLE_EXECUTION_CODES: ReadonlySet<ExecutionErrorCode> = new Set([
+  'E_APPLY_FAILED',
+  'E_BLOCKTREE_STALE',
+  'E_BLOCKTREE_NODE_MISSING',
+  'E_BLOCKTREE_BUILD_FAILED',
+]);
 
 export type ExecutionExposureLevel = 'info' | 'warn' | 'error';
 export type ExecutionExposurePhase = 'route' | 'resolve' | 'validate' | 'apply' | 'refresh';
@@ -530,7 +550,7 @@ async function executeAcceptAllForPending(
   for (const f of failed) {
     updateDiff(filePath, f.diff.diffId, { status: 'expired', expireReason: f.reason });
     if (f.diff.chatTabId && f.diff.agentTaskId) {
-      markAgentInvalidated(f.diff.chatTabId, f.diff.agentTaskId, `accept_all_${f.reason}`);
+      markVerificationFailed(f.diff.chatTabId, f.diff.agentTaskId, `accept_all_${f.reason}`);
     }
   }
   for (const row of overlapExpired) {
@@ -539,7 +559,7 @@ async function executeAcceptAllForPending(
       expireReason: 'overlapping_range',
     });
     if (row.diff.chatTabId && row.diff.agentTaskId) {
-      markAgentInvalidated(row.diff.chatTabId, row.diff.agentTaskId, 'accept_all_overlapping_range');
+      markVerificationFailed(row.diff.chatTabId, row.diff.agentTaskId, 'accept_all_overlapping_range');
     }
   }
 
@@ -558,7 +578,7 @@ async function executeAcceptAllForPending(
       console.warn('[对话编辑] acceptAll: applyDiffReplaceInEditor 失败', { diffId: row.diff.diffId });
       updateDiff(filePath, row.diff.diffId, { status: 'expired', expireReason: 'apply_replace_failed' });
       if (row.diff.chatTabId && row.diff.agentTaskId) {
-        markAgentInvalidated(row.diff.chatTabId, row.diff.agentTaskId, 'accept_all_apply_failed');
+        markVerificationFailed(row.diff.chatTabId, row.diff.agentTaskId, 'accept_all_apply_failed');
       }
       expired++;
       continue;
@@ -727,6 +747,8 @@ export interface DiffStoreState {
   removeFileDiffEntry: (filePath: string, diffIndex: number) => void;
   /** 标记某文件的 diffs 已全部处理（接受/拒绝后），用于 UI 显示「修改已应用」 */
   isFileDiffsCleared: (filePath: string) => boolean;
+  /** restore 后批量清理受影响文件的候选层，避免旧候选继续污染当前文件事实层 */
+  invalidateForFilePaths: (filePaths: string[], reason: string) => void;
 }
 
 const clearedFilePaths = new Set<string>();
@@ -817,6 +839,20 @@ export const useDiffStore = create<DiffStoreState>((set, get) => ({
         messageId,
       });
     }
+    console.log('[CROSS_FILE_TRACE][STORE]', JSON.stringify({
+      op: 'setDiffsForToolCall',
+      filePath,
+      toolCallId,
+      chatTabId,
+      messageId,
+      agentTaskId: meta?.agentTaskId,
+      count: entries.length,
+      diffs: entries.map((e) => ({
+        diffId: e.diffId,
+        originalText: e.originalText?.slice(0, 60),
+        newText: e.newText?.slice(0, 60),
+      })),
+    }));
     const snapRev = meta?.documentRevision;
     const tabRev = meta?.currentTabRevision;
     const snapStale = snapRev != null && tabRev != null && snapRev !== tabRev;
@@ -875,7 +911,7 @@ export const useDiffStore = create<DiffStoreState>((set, get) => ({
       const resolvedChatTabId = chatTabId ?? entries[0]?.chatTabId;
       const resolvedAgentTaskId = meta?.agentTaskId ?? entries[0]?.agentTaskId;
       if (resolvedChatTabId && resolvedAgentTaskId) {
-        markAgentInvalidated(resolvedChatTabId, resolvedAgentTaskId, 'diff_batch_stale_revision');
+        markVerificationFailed(resolvedChatTabId, resolvedAgentTaskId, 'diff_batch_stale_revision');
       }
     }
   },
@@ -926,9 +962,8 @@ export const useDiffStore = create<DiffStoreState>((set, get) => ({
         byTab: { ...state.byTab, [filePath]: { ...tab, diffs: newMap } },
       };
     });
-    if (entry?.chatTabId && entry.agentTaskId) {
-      markAgentRejected(entry.chatTabId, entry.agentTaskId, 'diff_rejected');
-    }
+    // reject 是用户主动决策，不等于 verification failed。
+    // AgentTaskController.checkAndAdvanceStage 由 DiffActionService.rejectDiff 负责调用。
   },
 
   getPendingDiffs: (filePath, toolCallId?: string) => {
@@ -1004,14 +1039,15 @@ export const useDiffStore = create<DiffStoreState>((set, get) => ({
   markExpired: (filePath, diffId) => {
     const entry = get().byTab[filePath]?.diffs.get(diffId);
     get().updateDiff(filePath, diffId, { status: 'expired' });
+    // 仅写 verification；lifecycle 由 AgentTaskController.checkAndAdvanceStage 裁决
     if (entry?.chatTabId && entry.agentTaskId) {
-      markAgentInvalidated(entry.chatTabId, entry.agentTaskId, 'diff_expired');
+      markVerificationFailed(entry.chatTabId, entry.agentTaskId, 'diff_expired');
     }
   },
 
   expirePendingForStaleRevision: (filePath, currentDocumentRevision) => {
     // Collect entries that will be expired before mutating state,
-    // so we can call markAgentInvalidated (LEG-016 补齐: stale-revision expire 路径)
+    // so we can call markVerificationFailed after state update (LEG-016 补齐: stale-revision expire 路径)
     const tab = get().byTab[filePath];
     if (!tab) return;
     const toInvalidate: Array<{ chatTabId: string; agentTaskId: string }> = [];
@@ -1055,9 +1091,9 @@ export const useDiffStore = create<DiffStoreState>((set, get) => ({
       };
     });
 
-    // Shadow invalidation after state update
+    // 仅写 verification；lifecycle 由 AgentTaskController.checkAndAdvanceStage 裁决
     for (const { chatTabId, agentTaskId } of toInvalidate) {
-      markAgentInvalidated(chatTabId, agentTaskId, 'diff_expired_stale_revision');
+      markVerificationFailed(chatTabId, agentTaskId, 'diff_expired_stale_revision');
     }
   },
 
@@ -1101,6 +1137,19 @@ export const useDiffStore = create<DiffStoreState>((set, get) => ({
   },
 
   setFilePathDiffs: (filePath, pendingDiffs, options) => {
+    console.log('[CROSS_FILE_TRACE][STORE]', JSON.stringify({
+      op: 'setFilePathDiffs',
+      filePath,
+      chatTabId: options?.chatTabId,
+      agentTaskId: options?.agentTaskId,
+      sourceToolCallId: options?.sourceToolCallId,
+      count: pendingDiffs.length,
+      diffs: pendingDiffs.map((d) => ({
+        diff_index: d.diff_index,
+        originalText: d.original_text?.slice(0, 60),
+        newText: d.new_text?.slice(0, 60),
+      })),
+    }));
     clearedFilePaths.delete(filePath);
     if (pendingDiffs.length === 0) {
       set((state) => {
@@ -1447,6 +1496,23 @@ export const useDiffStore = create<DiffStoreState>((set, get) => ({
   },
 
   acceptFileDiffs: async (filePath, workspacePath, diffIndices) => {
+    const storeSnapshot = {
+      byFilePathEntry: get().byFilePath[filePath]?.map((d) => ({
+        diff_index: d.diff_index,
+        agentTaskId: d.agentTaskId,
+        chatTabId: d.chatTabId,
+        originalText: d.original_text?.slice(0, 60),
+        newText: d.new_text?.slice(0, 60),
+      })),
+      byTabKeys: Object.keys(get().byTab),
+    };
+    console.log('[CROSS_FILE_TRACE][STORE]', JSON.stringify({
+      op: 'acceptFileDiffs:pre-invoke',
+      filePath,
+      workspacePath,
+      diffIndices,
+      storeSnapshot,
+    }));
     const ws = normalizeWorkspacePath(workspacePath);
     const relPath = getRelativePath(filePath, ws);
     await invoke('accept_file_diffs', {
@@ -1503,12 +1569,66 @@ export const useDiffStore = create<DiffStoreState>((set, get) => ({
       }
       return { byTab: next };
     });
-    forEachUniqueAgentPair(entries, (chatTabId, agentTaskId) => {
-      markAgentRejected(chatTabId, agentTaskId, 'file_diffs_rejected');
-    });
+    // reject 是用户主动决策，不等于 verification failed；不调用 markAgent*。
+    // AgentTaskController.checkAndAdvanceStage 由 DiffActionService.rejectFileDiffs 负责调用。
   },
 
   isFileDiffsCleared: (filePath) => clearedFilePaths.has(filePath),
+
+  invalidateForFilePaths: (filePaths, reason) => {
+    const targets = Array.from(new Set(filePaths.filter(Boolean)));
+    if (targets.length === 0) return;
+
+    const toInvalidate: Array<{ chatTabId: string; agentTaskId: string }> = [];
+    for (const filePath of targets) {
+      const tab = get().byTab[filePath];
+      if (tab) {
+        for (const entry of tab.diffs.values()) {
+          if (entry.chatTabId && entry.agentTaskId) {
+            toInvalidate.push({ chatTabId: entry.chatTabId, agentTaskId: entry.agentTaskId });
+          }
+        }
+      }
+      for (const entry of get().byFilePath[filePath] ?? []) {
+        if (entry.chatTabId && entry.agentTaskId) {
+          toInvalidate.push({ chatTabId: entry.chatTabId, agentTaskId: entry.agentTaskId });
+        }
+      }
+    }
+
+    set((state) => {
+      const nextByTab = { ...state.byTab };
+      const nextByFilePath = { ...state.byFilePath };
+      const nextStats = { ...state.byFilePathResolveStats };
+
+      for (const filePath of targets) {
+        delete nextByTab[filePath];
+        delete nextByFilePath[filePath];
+        delete nextStats[filePath];
+        clearedFilePaths.delete(filePath);
+      }
+
+      for (const [fp, tab] of Object.entries(nextByTab)) {
+        const newMap = new Map(tab.diffs);
+        for (const [id, entry] of newMap.entries()) {
+          if (targets.some((filePath) => matchesWorkspacePendingForFile(entry.toolCallId, filePath))) {
+            newMap.delete(id);
+          }
+        }
+        nextByTab[fp] = { ...tab, diffs: newMap };
+      }
+
+      return {
+        byTab: nextByTab,
+        byFilePath: nextByFilePath,
+        byFilePathResolveStats: nextStats,
+      };
+    });
+
+    forEachUniqueAgentPair(toInvalidate, (chatTabId, agentTaskId) => {
+      markVerificationFailed(chatTabId, agentTaskId, reason);
+    });
+  },
 
   removeFileDiffEntry: (filePath, diffIndex) => {
     const row = get().byFilePath[filePath]?.find((e) => e.diff_index === diffIndex);
@@ -1547,9 +1667,7 @@ export const useDiffStore = create<DiffStoreState>((set, get) => ({
       }
       return { byFilePath: nextByFilePath, byFilePathResolveStats: nextStats, byTab: nextByTab };
     });
-    if (row?.chatTabId && row.agentTaskId) {
-      markAgentRejected(row.chatTabId, row.agentTaskId, 'file_diff_entry_rejected');
-    }
+    // 文件 diff 条目移除由 UI 主动触发，不等于 verification failed；不调用 markAgent*。
   },
 
   markReviewConfirmed: (filePath?: string) => {

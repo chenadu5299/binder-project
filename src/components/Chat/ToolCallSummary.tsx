@@ -75,6 +75,9 @@ export const ToolCallSummary: React.FC<ToolCallSummaryProps> = ({
     };
 
     const getStatusText = () => {
+        if (toolCall.result?.meta?.gate?.status === 'awaiting_confirmation') {
+            return '⏸️ 等待确认';
+        }
         switch (toolCall.status) {
             case 'completed':
                 if (toolCall.name === 'list_files' && toolCall.result?.data?.files) {
@@ -188,4 +191,3 @@ export const ToolCallSummary: React.FC<ToolCallSummaryProps> = ({
         </div>
     );
 };
-

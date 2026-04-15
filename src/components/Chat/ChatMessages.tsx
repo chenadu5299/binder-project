@@ -1,24 +1,20 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { ChatMessage, useChatStore } from '../../stores/chatStore';
 import { ClipboardDocumentIcon } from '@heroicons/react/24/outline';
 import { ToolCallCard } from './ToolCallCard';
-import { ToolResult } from '../../types/tool';
+import { ToolCall, ToolResult } from '../../types/tool';
 import { MessageContextMenu } from './MessageContextMenu';
 import { WorkPlanCard } from './WorkPlanCard';
 import { parseWorkPlan } from '../../utils/workPlanParser';
 import { ToolCallSummary } from './ToolCallSummary';
 import { AuthorizationCard } from './AuthorizationCard';
 import { QuickApplyButton } from './QuickApplyButton';
-import { needsAuthorization, generateAuthorizationDescription } from '../../utils/toolDescription';
+import { generateAuthorizationDescription, isAwaitingAuthorization } from '../../utils/toolDescription';
 import { useFileStore } from '../../stores/fileStore';
 import { useEditorStore } from '../../stores/editorStore';
-import {
-  useDiffStore,
-  buildAcceptReadRow,
-  userVisibleMessageForSnapshotGate,
-} from '../../stores/diffStore';
+import { useDiffStore } from '../../stores/diffStore';
 import { resolveEditorTabForEditResultWithRequestContext } from '../../utils/editToolTabResolve';
-import { applyDiffReplaceInEditor } from '../../utils/applyDiffReplaceInEditor';
 import { blockRangeToPMRange } from '../../utils/editorOffsetUtils';
 import { DiffCard } from './DiffCard';
 import { positionToLine } from '../../utils/editorOffsetUtils';
@@ -29,11 +25,8 @@ import {
     createPendingConfirmationRecord,
     createShadowStageState,
 } from '../../types/agent_state';
-import {
-    markAgentInvalidated,
-    markAgentStageComplete,
-    markAgentUserConfirmed,
-} from '../../utils/agentShadowLifecycle';
+import { DiffActionService } from '../../services/DiffActionService';
+import { DiffRetryController } from '../../services/DiffRetryController';
 import type { KnowledgeInjectionSlice } from '../../types/knowledge';
 import './InlineChatInput.css';
 
@@ -58,7 +51,7 @@ export const ChatMessages: React.FC<ChatMessagesProps> = ({
     const scrollContainerRef = useRef<HTMLDivElement>(null);
     const { updateToolCall, regenerate, deleteMessage, updateContentBlock } = useChatStore();
     const { currentWorkspace } = useFileStore();
-    const { getActiveTab, updateTabContent } = useEditorStore();
+    const { getActiveTab } = useEditorStore();
     const agentRuntime = useAgentStore((s) => s.runtimesByTab[tabId]);
     useDiffStore((s) => s.byTab);
     
@@ -68,6 +61,108 @@ export const ChatMessages: React.FC<ChatMessagesProps> = ({
     } | null>(null);
     // 工作计划确认状态（按消息 ID 存储）
     const [confirmedPlans, setConfirmedPlans] = useState<Set<string>>(new Set());
+
+    const buildAuthorizationRequest = (toolCall: ToolCall) => ({
+        id: toolCall.id,
+        type: 'file_system' as const,
+        operation: toolCall.name,
+        details: toolCall.arguments,
+    });
+
+    const resolveAuthorization = async (
+        messageId: string,
+        blockId: string,
+        toolCall: ToolCall,
+        action: 'confirm' | 'deny'
+    ) => {
+        if (!currentWorkspace) {
+            toast.error('当前未绑定 workspace，无法执行确认操作。');
+            return;
+        }
+
+        const recordId = toolCall.result?.meta?.confirmation?.recordId;
+        if (!recordId) {
+            toast.error('确认记录尚未准备好，请稍后重试。');
+            return;
+        }
+
+        const nextArguments = {
+            ...toolCall.arguments,
+            _confirmation_action: action,
+            _confirmation_id: recordId,
+        };
+
+        const nextToolCall: ToolCall = {
+            ...toolCall,
+            arguments: nextArguments,
+            status: action === 'confirm' ? 'executing' : 'pending',
+        };
+
+        updateToolCall(tabId, messageId, toolCall.id, {
+            arguments: nextArguments,
+            status: action === 'confirm' ? 'executing' : 'pending',
+        });
+        updateContentBlock(tabId, messageId, blockId, {
+            type: 'authorization',
+            toolCall: nextToolCall,
+            authorization: buildAuthorizationRequest(nextToolCall),
+        });
+
+        try {
+            const command = action === 'confirm' ? 'execute_tool_with_retry' : 'execute_tool';
+            const payload = {
+                toolCall: {
+                    id: toolCall.id,
+                    name: toolCall.name,
+                    arguments: nextArguments,
+                },
+                workspacePath: currentWorkspace,
+                ...(action === 'confirm' ? { maxRetries: 3 } : {}),
+            };
+
+            const result = await invoke<ToolResult>(command, payload);
+            const awaiting = result.meta?.gate?.status === 'awaiting_confirmation';
+            const status: ToolCall['status'] = awaiting
+                ? 'pending'
+                : result.success
+                    ? 'completed'
+                    : 'failed';
+            const finalToolCall: ToolCall = {
+                ...toolCall,
+                arguments: nextArguments,
+                status,
+                result,
+                error: result.error,
+            };
+            const stillAwaiting = isAwaitingAuthorization(finalToolCall, currentWorkspace ?? undefined);
+
+            updateToolCall(tabId, messageId, toolCall.id, {
+                arguments: nextArguments,
+                status,
+                result,
+                error: result.error,
+            });
+            updateContentBlock(tabId, messageId, blockId, {
+                type: stillAwaiting ? 'authorization' : 'tool',
+                toolCall: finalToolCall,
+                authorization: stillAwaiting ? buildAuthorizationRequest(finalToolCall) : undefined,
+            });
+
+            if (action === 'deny') {
+                toast.info('已拒绝该工具操作。');
+            }
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            updateToolCall(tabId, messageId, toolCall.id, {
+                status: 'failed',
+                error: message,
+            });
+            updateContentBlock(tabId, messageId, blockId, {
+                type: 'tool',
+            });
+            toast.error(`执行确认操作失败: ${message}`);
+        }
+    };
 
     useEffect(() => {
         if (!agentRuntime?.currentTask) return;
@@ -388,26 +483,14 @@ export const ChatMessages: React.FC<ChatMessagesProps> = ({
             case 'tool':
                 if (!block.toolCall) return null;
                 
-                // 检查是否需要授权
-                if (needsAuthorization(block.toolCall.name, block.toolCall.arguments, currentWorkspace ?? undefined)) {
+                if (isAwaitingAuthorization(block.toolCall, currentWorkspace ?? undefined)) {
                     return (
                         <div key={block.id} className="mt-2">
                             <AuthorizationCard
-                                request={block.authorization || {
-                                    id: block.toolCall.id,
-                                    type: 'file_system',
-                                    operation: block.toolCall.name,
-                                    details: block.toolCall.arguments,
-                                }}
+                                request={block.authorization || buildAuthorizationRequest(block.toolCall)}
                                 description={generateAuthorizationDescription(block.toolCall)}
-                                onAuthorize={() => {
-                                    // TODO: 实现授权逻辑
-                                    console.log('授权工具调用:', block.toolCall);
-                                }}
-                                onDeny={() => {
-                                    // TODO: 实现拒绝逻辑
-                                    console.log('拒绝工具调用:', block.toolCall);
-                                }}
+                                onAuthorize={() => void resolveAuthorization(message.id, block.id, block.toolCall, 'confirm')}
+                                onDeny={() => void resolveAuthorization(message.id, block.id, block.toolCall, 'deny')}
                             />
                         </div>
                     );
@@ -525,52 +608,39 @@ export const ChatMessages: React.FC<ChatMessagesProps> = ({
                                         onAccept={async () => {
                                             const editor = diffTab.editor;
                                             if (!editor) return;
-                                            const readRow = await buildAcceptReadRow(entry, editor, {
-                                                tabDocumentRevision: tabRev,
-                                                filePath: diffTab.filePath,
-                                            });
-                                            if (readRow.kind === 'fail') {
-                                                const reason = readRow.reason;
-                                                diffStore.updateDiff(diffTab.filePath, entry.diffId, {
-                                                    status: 'expired',
-                                                    expireReason: reason,
-                                                });
-                                                markAgentInvalidated(tabId, entry.agentTaskId, reason);
-                                                if (
-                                                    reason === 'document_revision_mismatch' ||
-                                                    reason === 'content_snapshot_mismatch' ||
-                                                    reason === 'block_order_snapshot_mismatch'
-                                                ) {
-                                                    toast.warning(userVisibleMessageForSnapshotGate(reason));
-                                                } else if (reason === 'original_text_mismatch') {
-                                                    toast.warning('修改建议已失效：文档内容已被修改，无法应用此处的 AI 建议');
-                                                }
-                                                return;
-                                            }
-                                            const inserted = applyDiffReplaceInEditor(
+                                            const result = await DiffActionService.acceptDiff(
+                                                diffTab.filePath,
+                                                entry.diffId,
                                                 editor,
-                                                { from: readRow.from, to: readRow.to },
-                                                entry.newText
+                                                {
+                                                    tabDocumentRevision: tabRev,
+                                                    chatTabId: tabId,
+                                                    agentTaskId: entry.agentTaskId,
+                                                },
                                             );
-                                            if (!inserted) {
-                                                diffStore.updateDiff(diffTab.filePath, entry.diffId, {
-                                                    status: 'expired',
-                                                    expireReason: 'apply_replace_failed',
-                                                });
-                                                markAgentInvalidated(tabId, entry.agentTaskId, 'apply_replace_failed');
-                                                return;
+                                            if (!result.success && result.toastMessage) {
+                                                toast.warning(result.toastMessage);
                                             }
-                                            diffStore.acceptDiff(diffTab.filePath, entry.diffId, {
-                                                from: inserted.insertFrom,
-                                                to: inserted.insertTo,
-                                            });
-                                            updateTabContent(diffTab.id, editor.getHTML());
-                                            markAgentUserConfirmed(tabId, entry.agentTaskId, 'diff_card_accept_confirmed');
-                                            markAgentStageComplete(tabId, entry.agentTaskId, 'editor_revision_advanced');
                                         }}
                                         onReject={() => {
-                                            diffStore.rejectDiff(diffTab.filePath, entry.diffId);
+                                            DiffActionService.rejectDiff(diffTab.filePath, entry.diffId, {
+                                                chatTabId: tabId,
+                                                agentTaskId: entry.agentTaskId,
+                                            });
                                             diffTab.editor?.view.dispatch(diffTab.editor.state.tr);
+                                        }}
+                                        onRetry={async () => {
+                                            const editor = diffTab.editor;
+                                            if (!editor) return;
+                                            await DiffRetryController.retryDiff(
+                                                entry.diffId,
+                                                editor,
+                                                {
+                                                    tabDocumentRevision: tabRev,
+                                                    chatTabId: tabId,
+                                                    agentTaskId: entry.agentTaskId,
+                                                },
+                                            );
                                         }}
                                     />
                                 )})}
@@ -632,18 +702,32 @@ export const ChatMessages: React.FC<ChatMessagesProps> = ({
                     </div>
                 );
             case 'authorization':
+                if (!block.toolCall || isAwaitingAuthorization(block.toolCall, currentWorkspace ?? undefined)) {
                 return (
                     <div key={block.id} className="mt-2">
                         <AuthorizationCard
-                            request={block.authorization!}
-                            description={block.content || '需要授权'}
-                            onAuthorize={() => {
-                                // TODO: 实现授权逻辑
-                                console.log('授权:', block.authorization);
-                            }}
-                            onDeny={() => {
-                                // TODO: 实现拒绝逻辑
-                                console.log('拒绝:', block.authorization);
+                            request={block.authorization || (block.toolCall ? buildAuthorizationRequest(block.toolCall) : {
+                                id: block.id,
+                                type: 'file_system',
+                                operation: 'unknown',
+                                details: {},
+                            })}
+                            description={block.toolCall ? generateAuthorizationDescription(block.toolCall) : (block.content || '需要授权')}
+                            onAuthorize={() => block.toolCall ? void resolveAuthorization(message.id, block.id, block.toolCall, 'confirm') : undefined}
+                            onDeny={() => block.toolCall ? void resolveAuthorization(message.id, block.id, block.toolCall, 'deny') : undefined}
+                        />
+                    </div>
+                );
+                }
+                return (
+                    <div key={block.id} className="mt-2">
+                        <ToolCallSummary
+                            toolCall={block.toolCall}
+                            expanded={block.expanded || false}
+                            onToggle={() => {
+                                updateContentBlock(tabId, message.id, block.id, {
+                                    expanded: !block.expanded,
+                                });
                             }}
                         />
                     </div>

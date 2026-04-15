@@ -15,9 +15,13 @@
 - 变更要求：`修改本文后，必须复核：上游约束、直接承接、接口耦合、汇聚影响、扩散检查文档`
 
 ---
-> 文档层级：30_capabilities / 01_对话编辑系统 / Diff 专项规范  
-> 文档状态：执行标准（用于开发、联调、验收）  
-> 规则主源：`R-DE-M-R-02_对话编辑-统一整合方案.md`
+> 文档分级：`L2 / 二级规则文档`
+> 文档类型：`专项规则 / Diff 协议与执行规则`
+> 当前状态：`Active`
+> 受约束于：`A-CORE-C-D-02`、`A-CORE-C-D-05`、`A-DE-M-D-01`
+> 可约束：`DE` 相关提示词、计划、实现和验收文档中的 Diff 协议与展示/执行规则
+> 可用于：`定义 canonical diff、区间约束、展示规则、执行与失效规则`
+> 不可用于：`重定义模块边界、当前文档优先级、Agent 上位状态语义`
 
 ---
 
@@ -30,10 +34,11 @@
 4. 失效与失败暴露隔离。
 
 生效优先级：
-1. `R-DE-M-R-02_对话编辑-统一整合方案.md`（DE 规则主源）。
-2. `R-DE-M-R-01_对话编辑-主控设计文档.md`（主控实现口径）。
-3. 本文（Diff 专项落地规范）。
-4. `A-DE-M-D-01_对话编辑统一方案.md`（跨模块总纲）。
+1. `A-CORE-C-D-02_产品术语边界.md`（共享字段与术语主定义）。
+2. `A-CORE-C-D-05_状态单一真源原则.md`（状态真源与执行/展示边界）。
+3. `A-DE-M-D-01_对话编辑统一方案.md`（模块边界与 DE 统一规则）。
+4. 本文（Diff 专项规则）。
+5. `R-DE-*` 文档只作历史参考，不再构成当前 Diff 规则来源。
 
 ---
 
@@ -101,14 +106,15 @@ MUST：
 建议扩展字段：
 1. `status`、`acceptedAt`
 2. `mappedFrom`、`mappedTo`
-3. `baselineId`、`documentRevision`
-4. `routeSource`、`executionExposure`
-5. `expireReason`
+3. `executionExposure`
+4. `expireReason`
 
 MUST：
 1. 同一次工具返回中各 diff 区间不重叠。
 2. `originalText` 必须与生成时逻辑态区间一致。
-3. 扩展字段缺失不得破坏主链执行语义（向后兼容）。
+3. `route_source`、`baselineId`、`documentRevision(revision)` 属于主链执行字段，主定义以 `A-CORE-C-D-02_产品术语边界.md` 与 `A-DE-M-D-01_对话编辑统一方案.md` 为准，不得作为可缺省扩展字段处理。
+4. 只有展示增强类扩展字段缺失时，才允许在不破坏主链语义的前提下临时兼容读取。
+5. 上述临时兼容仅限旧存量 diff 记录的展示读取，不得作为新写入、新协议输出或执行链缺字段兜底；待旧记录迁移完成后应删除该兼容。
 
 ---
 
@@ -206,9 +212,149 @@ MUST：
 ### 6.3 强制隔离
 
 MUST：
-1. “失败暴露”与“失效处理”必须两条独立分支。
+1. “失败暴露”与”失效处理”必须两条独立分支。
 2. 任何层不得把失败直接映射为 expired。
 3. 任何层不得把 expired 直接映射为执行失败。
+
+### 6.4 `execute_failed` 事件对象定义
+
+`DiffExecuteFailedEvent` 为独立业务事件对象，不替代 `ExpiredReason` 或 `ExecutionExposure`，也不等于 `DiffEntryStatus`。
+
+必须字段：
+
+```typescript
+interface DiffExecuteFailedEvent {
+  diffId: string;
+  code: ExecutionErrorCode;        // 错误码，见 diffStore ExecutionErrorCode 枚举
+  retryable: boolean;              // 是否允许重试
+  route_source: 'selection' | 'reference' | 'block_search';
+  agentTaskId?: string;
+  chatTabId?: string;
+  timestamp: number;
+  retryCount: number;              // 当前已重试次数，初始为 0
+}
+```
+
+产生点：apply 失败路径（`preApplySnapshotGatesForAccept` 失败、`applyDiffReplaceInEditor` 失败、`originalText` 校验失败）。产生 `DiffExecuteFailedEvent` 后交由 `DiffRetryController` 消费，不直接推进 diff 状态。
+
+### 6.5 `DiffRetryController` 消费规则
+
+`DiffRetryController` 是 `execute_failed` 事件的唯一合法消费方。消费规则：
+
+```
+retryable = true && retryCount < MAX_RETRY（当前定为 2）
+  → 将 diff 加入重试队列，绑定 agentTaskId
+  → 下一轮 sendMessage 或手动触发时重新执行
+  → retryCount += 1
+
+retryable = false || retryCount >= MAX_RETRY
+  → diffStore.updateDiff(status: 'expired', expireReason: 对应原因)
+  → markVerificationFailed(chatTabId, agentTaskId, reason)  // 注意：不直接触发 invalidated
+  → 生成 ExecutionExposure 写入观测层
+```
+
+MUST：
+1. `execute_failed` 事件不得直接推进 `expired`；仅 `DiffRetryController` 在重试耗尽后才推进。
+2. `DiffRetryController` 触发 `markVerificationFailed`，不直接触发 `markAgentInvalidated`；`invalidated` 由 `AgentTaskController` 按规则裁决。
+3. 重试队列按 `diffId` 去重；同一 diff 在重试期间不允许再次进入执行链。
+4. 重试触发点：本期仅实现手动触发（DiffCard 重试按钮）；`sendMessage` 自动触发作为后续迭代。
+
+### 6.6 工程实现规范（Implementation Spec）
+
+#### 6.6.1 `retryable` 判定表
+
+| ExecutionErrorCode | retryable | 说明 |
+|---|---|---|
+| `E_APPLY_FAILED` | true | 编辑器 DOM 临时不可用，下次可能成功 |
+| `E_BLOCKTREE_STALE` | true | 块树过期，刷新后可重试 |
+| `E_BLOCKTREE_NODE_MISSING` | true | 块节点缺失，可能因 DOM 时序导致，可重试 |
+| `E_BLOCKTREE_BUILD_FAILED` | true | 块树构建失败，可重试 |
+| `E_ORIGINALTEXT_MISMATCH` | false | 文档已变更，原文不匹配，不可重试 |
+| `E_RANGE_UNRESOLVABLE` | false | 区间无法解析，diff 已失效 |
+| `E_PARTIAL_OVERLAP` | false | 非法重叠，协议错误，不可重试 |
+| `E_BASELINE_MISMATCH` | false | 基线不一致，文档版本已变 |
+| `E_ROUTE_MISMATCH` | false | 路由来源不匹配 |
+| `E_TARGET_NOT_READY` | false | 目标未准备好，归类为 expire |
+| `E_REFRESH_FAILED` | false | 刷新失败，兜底错误码，不可重试 |
+
+注：`preApplySnapshotGatesForAccept` 校验失败路径（`originalText` 不匹配、区间无法解析等）**不产生** `DiffExecuteFailedEvent`，直接走 `expired` 路径（此类失败为文档语义失效，非执行失败）。只有 `applyDiffReplaceInEditor` 调用失败才产生 `DiffExecuteFailedEvent`。
+
+#### 6.6.2 DiffEntry 重试期间的状态
+
+- diff 加入重试队列期间，`DiffEntry.status` **保持 `pending`**，不新增状态枚举。
+- `DiffEntry.executionExposure` 在首次失败时写入（用于 DiffCard 展示失败信息与重试按钮）。
+- `checkAndAdvanceStage` 遇到 `pending` diff 时不推进，天然兼容重试期间不推进 stage。
+
+#### 6.6.3 `DiffRetryController` 接口与存储
+
+```typescript
+// src/services/DiffRetryController.ts
+// 内存单例，session-only，无持久化。
+
+interface RetryQueueEntry {
+  event: DiffExecuteFailedEvent;
+  filePath: string;
+}
+
+interface DiffRetryController {
+  /**
+   * 消费 execute_failed 事件。
+   * retryable=true && retryCount < MAX_RETRY → 加入队列，写 executionExposure 到 diffStore
+   * 否则 → 推进 expired + markVerificationFailed + checkAndAdvanceStage
+   */
+  handleFailedEvent(
+    event: DiffExecuteFailedEvent,
+    filePath: string,
+    expireReason: DiffExpireReason,
+  ): void;
+
+  /**
+   * 手动触发单条 diff 重试（DiffCard 重试按钮调用）。
+   * 内部：event.retryCount += 1 → DiffActionService.acceptDiff()
+   * 成功 → 从队列移除
+   * 再次失败 → 回调 handleFailedEvent（retryCount 已递增）
+   */
+  retryDiff(
+    diffId: string,
+    editor: Editor,
+    options: {
+      tabDocumentRevision: number;
+      chatTabId?: string;
+      agentTaskId?: string;
+    },
+  ): Promise<void>;
+
+  /** 查询 diff 是否在重试队列中（DiffCard 据此展示重试 UI） */
+  isInRetry(diffId: string): boolean;
+
+  /** 移除（重试成功或耗尽后由内部调用，外部不直接调用） */
+  _remove(diffId: string): void;
+}
+
+const MAX_RETRY = 2;
+```
+
+存储：`DiffRetryController` 为模块级单例，持有 `retryQueue: Map<diffId, RetryQueueEntry>`，无需 Zustand 或持久化。
+
+#### 6.6.4 DiffCard 重试 UI 规范
+
+- 触发条件：`diff.status === 'pending' && DiffRetryController.isInRetry(diff.diffId)`
+- 展示：diff 卡顶部显示橙色警告横条，文案：`执行失败（${diff.executionExposure.code}）`，附"重试执行"按钮。
+- 正常的"接受/拒绝"按钮**保留**（用户可选择直接拒绝而非重试）。
+- "重试执行"点击 → `DiffRetryController.retryDiff(diff.diffId, editor, options)`。
+- 重试过程中按钮显示加载态，禁止并发触发。
+
+#### 6.6.5 `DiffActionService` 侧变更
+
+`DiffActionService.acceptDiff` 中，`applyDiffReplaceInEditor` 失败路径改为：
+```
+失败 → 构造 DiffExecuteFailedEvent(code='E_APPLY_FAILED', retryable=true, retryCount=0)
+     → DiffRetryController.handleFailedEvent(event, filePath, 'apply_replace_failed')
+     → return { success: false, expireReason: 'apply_replace_failed' }
+（不再直接调用 updateDiff(expired) + markVerificationFailed + checkAndAdvanceStage）
+```
+
+`DiffRetryController.handleFailedEvent` 内部决定是入队（retryable）还是立即过期（不可重试/耗尽）。
 
 ---
 
@@ -243,8 +389,19 @@ MUST：
 2. 失败与失效有独立事件与展示。
 3. 失效处理全程静默不阻断。
 4. `diff.execute_failed` 与 `diff.expired` 两类事件字段完整且可按 `diffId` 关联追踪。
+5. `retryable=true` 的 `execute_failed` 事件在下一轮触发后可观察到重试执行行为。
+6. `retryable=false` 或重试耗尽的 diff 最终转为 `expired`，不遗留"永久 pending"状态。
+7. `execute_failed` 与 `expired` 不在同帧对同一 diffId 同时上报。
 
 ---
+
+---
+
+> **本轮修订说明（2026-04-14）**：  
+> 1. §6.4 新增：`DiffExecuteFailedEvent` 对象定义（独立业务事件，含 `retryable`/`retryCount` 字段）。  
+> 2. §6.5 新增：`DiffRetryController` 消费规则，定义重试条件、上限（MAX_RETRY=2）、与 `expired`/`invalidated` 的推进边界。  
+> 3. §8.3 新增第 5-7 条观测验收项。  
+> 关键边界：`DiffRetryController` 触发 `markVerificationFailed`，不直接触发 `markAgentInvalidated`；后者由 `AgentTaskController` 裁决。
 
 ## 九、与 `A-DE-M-D-01_对话编辑统一方案.md`/`A-DE-M-T-02_baseline状态协作.md`/`A-DE-M-P-01_对话编辑提示词.md` 的反向链接
 
@@ -256,10 +413,15 @@ MUST：
 
 ## 十、关联文档
 
+> 新增关联：
+
 1. `A-DE-M-D-01_对话编辑统一方案.md`
 2. `A-DE-M-T-02_baseline状态协作.md`
 3. `A-DE-M-P-01_对话编辑提示词.md`
-4. `R-DE-M-R-02_对话编辑-统一整合方案.md`
-5. `R-DE-M-R-01_对话编辑-主控设计文档.md`
-6. `R-DE-M-R-06_跨 Block Diff 实现方案.md`
-7. `R-DE-M-R-04_Diff效果优化方案.md`
+4. `A-CORE-C-D-02_产品术语边界.md`
+5. `A-CORE-C-D-05_状态单一真源原则.md`
+6. `A-AG-M-T-05_AgentTaskController设计.md`（`invalidated` 裁决主体；`markVerificationFailed` 与 `markAgentInvalidated` 边界）
+7. `R-DE-M-R-02_对话编辑-统一整合方案.md`（仅作历史参考）
+8. `R-DE-M-R-01_对话编辑-主控设计文档.md`（仅作历史参考）
+9. `R-DE-M-R-06_跨 Block Diff 实现方案.md`（仅作历史参考）
+10. `R-DE-M-R-04_Diff效果优化方案.md`（仅作历史参考）

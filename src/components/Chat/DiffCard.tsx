@@ -5,8 +5,9 @@
  */
 
 import React, { useState } from 'react';
-import { CheckIcon, XMarkIcon, ChevronDownIcon, ChevronUpIcon } from '@heroicons/react/24/outline';
+import { CheckIcon, XMarkIcon, ChevronDownIcon, ChevronUpIcon, ArrowPathIcon } from '@heroicons/react/24/outline';
 import type { DiffEntry } from '../../stores/diffStore';
+import { RETRYABLE_EXECUTION_CODES } from '../../stores/diffStore';
 import { ExecutionPanel } from '../Debug/ExecutionPanel';
 import { AgentShadowStateSummary } from './AgentShadowStateSummary';
 
@@ -23,6 +24,8 @@ interface DiffCardProps {
   lineEnd?: number;
   onAccept: () => void;
   onReject: () => void;
+  /** 执行失败后手动重试（A-DE-M-T-01 §6.6.4），由父组件提供编辑器上下文 */
+  onRetry?: () => Promise<void>;
   /** 点击标题栏定位：打开文件并滚动到 diff 位置 */
   onLocate?: () => void;
   disabled?: boolean;
@@ -85,13 +88,22 @@ export const DiffCard: React.FC<DiffCardProps> = ({
   lineEnd,
   onAccept,
   onReject,
+  onRetry,
   onLocate,
   disabled = false,
 }) => {
   const [expanded, setExpanded] = useState(false);
+  const [isRetrying, setIsRetrying] = useState(false);
   const isExpired = diff.status === 'expired';
   const isAccepted = diff.status === 'accepted';
   const showExecutionDebug = isExecutionDebugEnabled();
+
+  // 执行失败重试 UI（A-DE-M-T-01 §6.6.4）：pending + executionExposure + 可重试错误码
+  const showRetryBanner =
+    diff.status === 'pending' &&
+    diff.executionExposure != null &&
+    RETRYABLE_EXECUTION_CODES.has(diff.executionExposure.code as any) &&
+    onRetry != null;
 
   const relativePath = getRelativePathDisplay(filePath, workspacePath);
   const fileName = getFileName(filePath);
@@ -277,6 +289,32 @@ export const DiffCard: React.FC<DiffCardProps> = ({
         {titleBar}
         {blockLevelHint}
         {/* 已接受且未展开：不显示 diff 区和操作区 */}
+        {showRetryBanner && (
+          <div className="flex items-center justify-between gap-2 px-2 py-1.5 bg-orange-50 dark:bg-orange-900/20 border-b border-orange-200 dark:border-orange-700">
+            <span className="text-xs text-orange-700 dark:text-orange-300 truncate">
+              执行失败（{diff.executionExposure!.code}）
+              {EXECUTION_CODE_HINTS[diff.executionExposure!.code]
+                ? `：${EXECUTION_CODE_HINTS[diff.executionExposure!.code]}`
+                : ''}
+            </span>
+            <button
+              type="button"
+              disabled={isRetrying || disabled}
+              onClick={async () => {
+                setIsRetrying(true);
+                try {
+                  await onRetry!();
+                } finally {
+                  setIsRetrying(false);
+                }
+              }}
+              className="flex-shrink-0 flex items-center gap-1 px-2 py-0.5 text-xs rounded bg-orange-600 text-white hover:bg-orange-700 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <ArrowPathIcon className={`w-3 h-3 ${isRetrying ? 'animate-spin' : ''}`} />
+              {isRetrying ? '重试中…' : '重试执行'}
+            </button>
+          </div>
+        )}
         {(!isAccepted || expanded) && (
           <>
             {diffArea}

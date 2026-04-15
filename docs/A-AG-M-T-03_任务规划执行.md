@@ -15,9 +15,14 @@
 - 变更要求：`修改本文后，必须复核：上游约束、直接承接、接口耦合、汇聚影响、扩散检查文档，尤其是 A-CBT-I-P-01、A-CBT-I-T-01、A-AG-M-T-05`
 
 ---
-> 文档层级：30_capabilities / 03_ai执行系统 / 任务规划执行主控  
-> 文档角色：任务闭环与收口控制文档  
-> 上游主控：`A-AG-M-T-01_ai执行架构.md`、`A-AG-M-D-01_Binder Agent能力描述文档.md`、`A-AG-M-T-04_Binder Agent技术主控文档.md`  
+> 文档分级：`L2 / 二级规则文档`
+> 文档类型：`专项规则 / 任务闭环与收口`
+> 当前状态：`Active`
+> 受约束于：`A-CORE-C-D-02`、`A-AG-M-D-01`、`A-AG-M-T-04`
+> 可约束：`A-DE-M-D-01`、`A-CBT-I-P-01` 及所有承接 Agent 闭环的下游文档
+> 可用于：`定义任务规划、步骤验证、闭环判定、未完成处理与结束决策`
+> 不可用于：`替代 A-AG-M-T-04 重新定义 stage_state 主术语；替代模块文档定义局部业务边界`
+> 上游主控：`A-AG-M-T-01_ai执行架构.md`、`A-AG-M-D-01_Binder Agent能力描述文档.md`、`A-AG-M-T-04_Binder Agent技术主控文档.md`
 > 下游专项：`A-DE-M-D-01_对话编辑统一方案.md`、`A-CBT-I-P-01_Chat Build最小协议与状态.md`
 
 ---
@@ -44,7 +49,7 @@
 3. `A-AG-M-P-01_工具调用体系.md` 的工具运行时控制。
 4. `A-AG-M-D-01_Binder Agent能力描述文档.md` 与 `A-AG-M-T-04_Binder Agent技术主控文档.md` 的 Agent 上位完成观与技术对象。
 
-但在任务拆解、步骤验证、未完成处理、结束决策上，应以本文为准。
+但在任务拆解、步骤验证、未完成处理、结束决策流程上，应以本文为准；`stage_complete`、`verification`、`confirmation`、`invalidated` 的共享术语主定义仍以 `A-CORE-C-D-02_产品术语边界.md` 与 `A-CORE-C-D-05_状态单一真源原则.md` 为准，`A-AG-M-T-04_Binder Agent技术主控文档.md` 负责 Agent 技术承接，本文只补充其任务闭环成立条件。
 
 ---
 
@@ -307,10 +312,10 @@ interface TaskClosureRecord {
 
 结束决策只允许输出以下四类结果：
 
-1. `stage_complete`：满足闭环条件，可进入本轮结束态。
+1. `stage_complete`：对应上位业务状态中的阶段闭合结论，满足闭环条件后可进入本轮结束态。
 2. `continue_execution`：继续下一轮执行，并附下一步最小必要步骤。
 3. `blocked_waiting_human`：等待用户确认、补充信息或范围裁定。
-4. `invalidated`：当前链路失效，需要回退并重建任务边界。
+4. `invalidated`：对应上位业务状态中的失效结论，当前链路需要回退并重建任务边界。
 
 若未满足 `stage_complete` 条件，不得以自然语言总结替代正式结束决策。
 

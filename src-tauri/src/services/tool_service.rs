@@ -11,7 +11,7 @@ use crate::workspace::timeline_support::{
 use crate::workspace::workspace_db::WorkspaceDb;
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,6 +176,173 @@ fn build_failure_meta(tool_name: &str, reason: &str) -> ToolResultMeta {
   }
 }
 
+fn tool_requires_confirmation(tool_name: &str) -> bool {
+  matches!(
+    tool_name,
+    "delete_file" | "move_file" | "rename_file" | "create_folder"
+  )
+}
+
+fn gate_internal_keys() -> [&'static str; 2] {
+  ["_confirmation_id", "_confirmation_action"]
+}
+
+fn strip_internal_gate_fields(arguments: &serde_json::Value) -> serde_json::Value {
+  match arguments {
+    serde_json::Value::Object(map) => {
+      let mut next = serde_json::Map::new();
+      for (key, value) in map {
+        if gate_internal_keys().contains(&key.as_str()) {
+          continue;
+        }
+        next.insert(key.clone(), strip_internal_gate_fields(value));
+      }
+      serde_json::Value::Object(next)
+    }
+    serde_json::Value::Array(items) => {
+      serde_json::Value::Array(items.iter().map(strip_internal_gate_fields).collect())
+    }
+    other => other.clone(),
+  }
+}
+
+fn normalize_json_for_gate(value: &serde_json::Value) -> serde_json::Value {
+  match value {
+    serde_json::Value::Object(map) => {
+      let mut keys: Vec<_> = map.keys().cloned().collect();
+      keys.sort();
+      let mut next = serde_json::Map::new();
+      for key in keys {
+        if let Some(val) = map.get(&key) {
+          next.insert(key, normalize_json_for_gate(val));
+        }
+      }
+      serde_json::Value::Object(next)
+    }
+    serde_json::Value::Array(items) => {
+      serde_json::Value::Array(items.iter().map(normalize_json_for_gate).collect())
+    }
+    other => other.clone(),
+  }
+}
+
+fn confirmation_record_id(tool_call: &ToolCall) -> String {
+  let normalized_args = normalize_json_for_gate(&strip_internal_gate_fields(&tool_call.arguments));
+  let args_str = serde_json::to_string(&normalized_args).unwrap_or_else(|_| "{}".to_string());
+  format!(
+    "tool-confirm:{}:{}:{}",
+    tool_call.id, tool_call.name, args_str
+  )
+}
+
+fn build_confirmation_pending_result(tool_call: &ToolCall) -> ToolResult {
+  let record_id = confirmation_record_id(tool_call);
+  ToolResult {
+    success: true,
+    data: Some(serde_json::json!({
+      "awaiting_confirmation": true,
+      "confirmation_record_id": record_id,
+      "tool_name": tool_call.name,
+      "tool_call_id": tool_call.id,
+    })),
+    error: None,
+    message: Some(format!("工具 {} 需要用户确认后才能执行", tool_call.name)),
+    error_kind: None,
+    display_error: None,
+    meta: Some(ToolResultMeta {
+      gate: Some(ToolGateMeta {
+        status: Some("awaiting_confirmation".to_string()),
+        stage: Some("confirmation".to_string()),
+        summary: Some(format!(
+          "{} is blocked until user confirmation",
+          tool_call.name
+        )),
+      }),
+      artifact: None,
+      verification: Some(ToolVerificationMeta {
+        status: Some("passed".to_string()),
+        record_id: None,
+        summary: Some("confirmation gate matched".to_string()),
+      }),
+      confirmation: Some(ToolConfirmationMeta {
+        status: Some("pending".to_string()),
+        record_id: Some(record_id),
+        summary: Some("awaiting explicit user authorization".to_string()),
+      }),
+    }),
+  }
+}
+
+fn build_confirmation_rejected_result(tool_call: &ToolCall, record_id: String) -> ToolResult {
+  ToolResult {
+    success: false,
+    data: Some(serde_json::json!({
+      "awaiting_confirmation": false,
+      "confirmation_record_id": record_id,
+      "tool_name": tool_call.name,
+      "tool_call_id": tool_call.id,
+    })),
+    error: Some("用户拒绝了该工具操作".to_string()),
+    message: Some(format!("工具 {} 已被用户拒绝", tool_call.name)),
+    error_kind: Some(ToolErrorKind::Skippable),
+    display_error: Some("用户拒绝了该操作".to_string()),
+    meta: Some(ToolResultMeta {
+      gate: Some(ToolGateMeta {
+        status: Some("failed".to_string()),
+        stage: Some("confirmation".to_string()),
+        summary: Some("user denied the requested tool".to_string()),
+      }),
+      artifact: None,
+      verification: Some(ToolVerificationMeta {
+        status: Some("passed".to_string()),
+        record_id: None,
+        summary: Some("confirmation gate matched".to_string()),
+      }),
+      confirmation: Some(ToolConfirmationMeta {
+        status: Some("rejected".to_string()),
+        record_id: Some(record_id),
+        summary: Some("user denied this tool call".to_string()),
+      }),
+    }),
+  }
+}
+
+fn sanitize_confirmation_arguments(tool_call: &ToolCall) -> serde_json::Value {
+  strip_internal_gate_fields(&tool_call.arguments)
+}
+
+fn parse_confirmation_action(tool_call: &ToolCall) -> Option<String> {
+  tool_call
+    .arguments
+    .get("_confirmation_action")
+    .and_then(|v| v.as_str())
+    .map(|s| s.to_lowercase())
+}
+
+fn requires_reviewed_document_write(file_path: &Path) -> bool {
+  matches!(
+    file_path
+      .extension()
+      .and_then(|e| e.to_str())
+      .map(|e| e.to_lowercase())
+      .as_deref(),
+    Some("md")
+      | Some("markdown")
+      | Some("txt")
+      | Some("html")
+      | Some("htm")
+      | Some("rst")
+      | Some("docx")
+      | Some("doc")
+      | Some("odt")
+      | Some("rtf")
+  )
+}
+
+fn map_path_validation_error(err: crate::utils::path_validator::PathValidationError) -> String {
+  err.to_string()
+}
+
 impl Default for ToolResult {
   fn default() -> Self {
     Self {
@@ -276,6 +443,7 @@ pub struct ResolverInput {
 }
 
 /// Resolver 内部输出（Step 3 之前）
+#[derive(Debug)]
 struct CanonicalDiffBuilt {
   start_block_id: String,
   start_offset: usize,
@@ -300,6 +468,24 @@ impl ToolService {
     ToolService
   }
 
+  fn resolve_relative_path(
+    &self,
+    workspace_path: &Path,
+    relative_path: &str,
+  ) -> Result<PathBuf, String> {
+    PathValidator::resolve_workspace_relative_path(workspace_path, relative_path)
+      .map_err(map_path_validation_error)
+  }
+
+  fn validate_existing_path(&self, path: &Path, workspace_path: &Path) -> Result<PathBuf, String> {
+    PathValidator::validate_workspace_path(path, workspace_path).map_err(map_path_validation_error)
+  }
+
+  fn validate_write_target(&self, path: &Path, workspace_path: &Path) -> Result<PathBuf, String> {
+    PathValidator::validate_workspace_write_target(path, workspace_path)
+      .map_err(map_path_validation_error)
+  }
+
   /// 执行工具调用
   pub async fn execute_tool(
     &self,
@@ -311,19 +497,77 @@ impl ToolService {
       return Err("工作区路径不存在".to_string());
     }
 
-    match tool_call.name.as_str() {
-      "read_file" => self.read_file(tool_call, workspace_path).await,
-      "create_file" => self.create_file(tool_call, workspace_path).await,
-      "update_file" => self.update_file(tool_call, workspace_path).await,
-      "delete_file" => self.delete_file(tool_call, workspace_path).await,
-      "list_files" => self.list_files(tool_call, workspace_path).await,
-      "search_files" => self.search_files(tool_call, workspace_path).await,
-      "move_file" => self.move_file(tool_call, workspace_path).await,
-      "rename_file" => self.rename_file(tool_call, workspace_path).await,
-      "create_folder" => self.create_folder(tool_call, workspace_path).await,
-      "get_current_editor_file" => self.get_current_editor_file(tool_call).await,
-      "edit_current_editor_document" => self.edit_current_editor_document(tool_call).await,
-      "save_file_dependency" => self.save_file_dependency(tool_call, workspace_path).await,
+    if tool_requires_confirmation(&tool_call.name) {
+      let expected_record_id = confirmation_record_id(tool_call);
+      match parse_confirmation_action(tool_call).as_deref() {
+        Some("confirm") => {
+          let provided_record_id = tool_call
+            .arguments
+            .get("_confirmation_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "缺少 confirmation_id 参数".to_string())?;
+          if provided_record_id != expected_record_id {
+            return Err("确认记录与待执行工具不匹配".to_string());
+          }
+        }
+        Some("deny") => {
+          let provided_record_id = tool_call
+            .arguments
+            .get("_confirmation_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or(expected_record_id.as_str())
+            .to_string();
+          return Ok(build_confirmation_rejected_result(
+            tool_call,
+            provided_record_id,
+          ));
+        }
+        Some(other) => {
+          return Err(format!("未知的 confirmation_action: {}", other));
+        }
+        None => return Ok(build_confirmation_pending_result(tool_call)),
+      }
+    }
+
+    let sanitized_tool_call = if tool_requires_confirmation(&tool_call.name) {
+      ToolCall {
+        id: tool_call.id.clone(),
+        name: tool_call.name.clone(),
+        arguments: sanitize_confirmation_arguments(tool_call),
+      }
+    } else {
+      tool_call.clone()
+    };
+
+    match sanitized_tool_call.name.as_str() {
+      "read_file" => self.read_file(&sanitized_tool_call, workspace_path).await,
+      "create_file" => self.create_file(&sanitized_tool_call, workspace_path).await,
+      "update_file" => self.update_file(&sanitized_tool_call, workspace_path).await,
+      "delete_file" => self.delete_file(&sanitized_tool_call, workspace_path).await,
+      "list_files" => self.list_files(&sanitized_tool_call, workspace_path).await,
+      "search_files" => {
+        self
+          .search_files(&sanitized_tool_call, workspace_path)
+          .await
+      }
+      "move_file" => self.move_file(&sanitized_tool_call, workspace_path).await,
+      "rename_file" => self.rename_file(&sanitized_tool_call, workspace_path).await,
+      "create_folder" => {
+        self
+          .create_folder(&sanitized_tool_call, workspace_path)
+          .await
+      }
+      "get_current_editor_file" => self.get_current_editor_file(&sanitized_tool_call).await,
+      "edit_current_editor_document" => {
+        self
+          .edit_current_editor_document(&sanitized_tool_call)
+          .await
+      }
+      "save_file_dependency" => {
+        self
+          .save_file_dependency(&sanitized_tool_call, workspace_path)
+          .await
+      }
       _ => Err(format!("未知的工具: {}", tool_call.name)),
     }
   }
@@ -340,34 +584,7 @@ impl ToolService {
       .and_then(|v| v.as_str())
       .ok_or_else(|| "缺少 path 参数".to_string())?;
 
-    let full_path = workspace_path.join(file_path);
-
-    // 验证路径安全性
-    // 检查路径是否包含 .. 或其他不安全字符
-    if file_path.contains("..") || file_path.contains("/") && file_path.starts_with("/") {
-      return Err("路径不安全".to_string());
-    }
-
-    // 对于已存在的文件，使用 PathValidator 验证
-    if full_path.exists() {
-      if PathValidator::validate_workspace_path(&full_path, workspace_path).is_err() {
-        return Err("路径不安全".to_string());
-      }
-    } else {
-      // 对于不存在的文件，检查父目录是否在工作区内
-      if let Some(parent) = full_path.parent() {
-        if parent.exists() {
-          if PathValidator::validate_workspace_path(parent, workspace_path).is_err() {
-            return Err("路径不安全".to_string());
-          }
-        } else {
-          // 如果父目录也不存在，检查路径是否在工作区根目录下
-          if !full_path.starts_with(workspace_path) {
-            return Err("路径不安全".to_string());
-          }
-        }
-      }
-    }
+    let full_path = self.resolve_relative_path(workspace_path, file_path)?;
 
     // 检查文件是否存在
     if !full_path.exists() {
@@ -500,34 +717,8 @@ impl ToolService {
       .and_then(|v| v.as_str())
       .unwrap_or(""); // 如果 content 不存在，使用空字符串
 
-    let full_path = workspace_path.join(file_path);
-
-    // 验证路径安全性
-    // 检查路径是否包含 .. 或其他不安全字符
-    if file_path.contains("..") || file_path.contains("/") && file_path.starts_with("/") {
-      return Err("路径不安全".to_string());
-    }
-
-    // 对于已存在的文件，使用 PathValidator 验证
-    if full_path.exists() {
-      if PathValidator::validate_workspace_path(&full_path, workspace_path).is_err() {
-        return Err("路径不安全".to_string());
-      }
-    } else {
-      // 对于不存在的文件，检查父目录是否在工作区内
-      if let Some(parent) = full_path.parent() {
-        if parent.exists() {
-          if PathValidator::validate_workspace_path(parent, workspace_path).is_err() {
-            return Err("路径不安全".to_string());
-          }
-        } else {
-          // 如果父目录也不存在，检查路径是否在工作区根目录下
-          if !full_path.starts_with(workspace_path) {
-            return Err("路径不安全".to_string());
-          }
-        }
-      }
-    }
+    let full_path = self.resolve_relative_path(workspace_path, file_path)?;
+    self.validate_write_target(&full_path, workspace_path)?;
 
     // 检查文件是否已存在
     if full_path.exists() {
@@ -676,34 +867,19 @@ impl ToolService {
       .and_then(|v| v.as_str())
       .ok_or_else(|| "缺少 content 参数".to_string())?;
 
-    let full_path = workspace_path.join(file_path);
-
-    // 验证路径安全性
-    // 检查路径是否包含 .. 或其他不安全字符
-    if file_path.contains("..") || file_path.contains("/") && file_path.starts_with("/") {
-      return Err("路径不安全".to_string());
+    {
+      let content_preview: String = content.chars().take(80).collect();
+      eprintln!(
+        "[CROSS_FILE_TRACE][TOOL] {{\"tool\":\"update_file\",\"target_file\":{:?},\"tool_call_id\":{:?},\"content_len\":{},\"content_preview\":{:?}}}",
+        file_path,
+        tool_call.id,
+        content.len(),
+        content_preview,
+      );
     }
 
-    // 对于已存在的文件，使用 PathValidator 验证
-    if full_path.exists() {
-      if PathValidator::validate_workspace_path(&full_path, workspace_path).is_err() {
-        return Err("路径不安全".to_string());
-      }
-    } else {
-      // 对于不存在的文件，检查父目录是否在工作区内
-      if let Some(parent) = full_path.parent() {
-        if parent.exists() {
-          if PathValidator::validate_workspace_path(parent, workspace_path).is_err() {
-            return Err("路径不安全".to_string());
-          }
-        } else {
-          // 如果父目录也不存在，检查路径是否在工作区根目录下
-          if !full_path.starts_with(workspace_path) {
-            return Err("路径不安全".to_string());
-          }
-        }
-      }
-    }
+    let full_path = self.resolve_relative_path(workspace_path, file_path)?;
+    self.validate_write_target(&full_path, workspace_path)?;
 
     // 检查文件是否存在
     if !full_path.exists() {
@@ -785,11 +961,16 @@ impl ToolService {
     };
 
     // use_diff：生成 pending diffs，不写盘
-    let use_diff = tool_call
+    let requested_use_diff = tool_call
       .arguments
       .get("use_diff")
       .and_then(|v| v.as_bool())
       .unwrap_or(true);
+    let use_diff = if requires_reviewed_document_write(&full_path) {
+      true
+    } else {
+      requested_use_diff
+    };
 
     if use_diff {
       let diffs =
@@ -825,10 +1006,16 @@ impl ToolService {
             "pending_diffs": pending_dtos,
         })),
         error: None,
-        message: Some(format!(
-          "已生成 {} 处待确认修改，请用户确认后写盘",
-          diff_count
-        )),
+        message: Some(
+          if !requested_use_diff && requires_reviewed_document_write(&full_path) {
+            format!(
+              "文档型文件不允许 AI 直接写盘，已改为生成 {} 处待确认修改",
+              diff_count
+            )
+          } else {
+            format!("已生成 {} 处待确认修改，请用户确认后写盘", diff_count)
+          },
+        ),
         error_kind: None,
         display_error: None,
         meta: Some(build_candidate_meta("update_file", file_path, diff_count)),
@@ -886,34 +1073,8 @@ impl ToolService {
       .and_then(|v| v.as_str())
       .ok_or_else(|| "缺少 path 参数".to_string())?;
 
-    let full_path = workspace_path.join(file_path);
-
-    // 验证路径安全性
-    // 检查路径是否包含 .. 或其他不安全字符
-    if file_path.contains("..") || file_path.contains("/") && file_path.starts_with("/") {
-      return Err("路径不安全".to_string());
-    }
-
-    // 对于已存在的文件，使用 PathValidator 验证
-    if full_path.exists() {
-      if PathValidator::validate_workspace_path(&full_path, workspace_path).is_err() {
-        return Err("路径不安全".to_string());
-      }
-    } else {
-      // 对于不存在的文件，检查父目录是否在工作区内
-      if let Some(parent) = full_path.parent() {
-        if parent.exists() {
-          if PathValidator::validate_workspace_path(parent, workspace_path).is_err() {
-            return Err("路径不安全".to_string());
-          }
-        } else {
-          // 如果父目录也不存在，检查路径是否在工作区根目录下
-          if !full_path.starts_with(workspace_path) {
-            return Err("路径不安全".to_string());
-          }
-        }
-      }
-    }
+    let full_path = self.resolve_relative_path(workspace_path, file_path)?;
+    self.validate_write_target(&full_path, workspace_path)?;
 
     // 检查文件或文件夹是否存在
     if !full_path.exists() {
@@ -1018,17 +1179,13 @@ impl ToolService {
       .and_then(|v| v.as_str())
       .unwrap_or(".");
 
-    let full_path = workspace_path.join(dir_path);
-
-    // 验证路径安全性
-    if dir_path.contains("..") {
-      return Err("路径不安全".to_string());
-    }
-
+    let full_path = if dir_path == "." || dir_path.is_empty() {
+      self.validate_existing_path(workspace_path, workspace_path)?
+    } else {
+      self.resolve_relative_path(workspace_path, dir_path)?
+    };
     if full_path.exists() {
-      if PathValidator::validate_workspace_path(&full_path, workspace_path).is_err() {
-        return Err("路径不安全".to_string());
-      }
+      self.validate_existing_path(&full_path, workspace_path)?;
     }
 
     // 检查目录是否存在
@@ -1169,18 +1326,11 @@ impl ToolService {
       .and_then(|v| v.as_str())
       .ok_or_else(|| "缺少 destination 参数".to_string())?;
 
-    let source_full = workspace_path.join(source_path);
-    let dest_full = workspace_path.join(dest_path);
-
-    // 验证路径安全性
-    if source_path.contains("..") || dest_path.contains("..") {
-      return Err("路径不安全".to_string());
-    }
-
+    let source_full = self.resolve_relative_path(workspace_path, source_path)?;
+    let dest_full = self.resolve_relative_path(workspace_path, dest_path)?;
+    self.validate_write_target(&dest_full, workspace_path)?;
     if source_full.exists() {
-      if PathValidator::validate_workspace_path(&source_full, workspace_path).is_err() {
-        return Err("源路径不安全".to_string());
-      }
+      self.validate_existing_path(&source_full, workspace_path)?;
     }
 
     // 检查源文件是否存在
@@ -1202,6 +1352,18 @@ impl ToolService {
         success: false,
         data: None,
         error: Some(format!("目标文件已存在: {}", dest_path)),
+        message: None,
+        error_kind: None,
+        display_error: None,
+        meta: None,
+      });
+    }
+
+    if dest_full.starts_with(&source_full) {
+      return Ok(ToolResult {
+        success: false,
+        data: None,
+        error: Some("不能将资源移动到其自身子路径内".to_string()),
         message: None,
         error_kind: None,
         display_error: None,
@@ -1280,21 +1442,14 @@ impl ToolService {
       .and_then(|v| v.as_str())
       .ok_or_else(|| "缺少 new_name 参数".to_string())?;
 
-    let full_path = workspace_path.join(file_path);
+    let full_path = self.resolve_relative_path(workspace_path, file_path)?;
 
-    // 验证路径安全性
-    if file_path.contains("..")
-      || new_name.contains("..")
-      || new_name.contains("/")
-      || new_name.contains("\\")
-    {
+    if new_name.contains("..") || new_name.contains("/") || new_name.contains("\\") {
       return Err("路径不安全".to_string());
     }
 
     if full_path.exists() {
-      if PathValidator::validate_workspace_path(&full_path, workspace_path).is_err() {
-        return Err("路径不安全".to_string());
-      }
+      self.validate_existing_path(&full_path, workspace_path)?;
     }
 
     // 检查文件是否存在
@@ -1315,6 +1470,7 @@ impl ToolService {
       .parent()
       .ok_or_else(|| "无法获取父目录".to_string())?;
     let new_path = parent.join(new_name);
+    self.validate_write_target(&new_path, workspace_path)?;
 
     // 检查新名称是否已存在
     if new_path.exists() {
@@ -1400,14 +1556,10 @@ impl ToolService {
         "缺少 path 参数".to_string()
       })?;
 
-    let full_path = workspace_path.join(folder_path);
+    let full_path = self.resolve_relative_path(workspace_path, folder_path)?;
     eprintln!("🔧 完整路径: {:?}", full_path);
 
-    // 验证路径安全性
-    if folder_path.contains("..") {
-      eprintln!("❌ 路径不安全，包含 ..");
-      return Err("路径不安全".to_string());
-    }
+    self.validate_write_target(&full_path, workspace_path)?;
 
     let existed_before = full_path.exists();
 
@@ -1693,13 +1845,17 @@ impl ToolService {
   }
 
   fn should_reject_rewrite_document(input: &ResolverInput) -> bool {
+    // Reject rewrite_document only when there are explicit local-edit signals
+    // (block_index or non-empty target). The selection_start_block_id check
+    // has been removed: inherited _sel_* fields from a prior turn must not
+    // block a legitimate rewrite_document request (P0-1/P0-2 guard handles
+    // the selection/block separation upstream).
     input.block_index.is_some()
       || input
         .target
         .as_ref()
         .map(|t| !t.trim().is_empty())
         .unwrap_or(false)
-      || input.selection_start_block_id.is_some()
   }
 
   fn is_no_op_diff(cd: &CanonicalDiffBuilt) -> bool {
@@ -1912,70 +2068,85 @@ impl ToolService {
     let mode = input.edit_mode.as_str();
 
     // Step 2a：零搜索路径（有选区坐标）
-    if let Some(ref sbid) = input.selection_start_block_id {
-      let so = input.selection_start_offset.unwrap_or(0);
-      let ebid = input
-        .selection_end_block_id
-        .as_ref()
-        .unwrap_or(sbid)
-        .clone();
-      let eo = input.selection_end_offset.unwrap_or(so);
-      let route_source = Self::resolve_zero_search_route_source(input.selected_text.as_ref());
+    //
+    // P0-1/P0-2 硬性守卫：block 级模式（rewrite_block / rewrite_document）
+    // 不允许走 selection 路径，即使上下文中残留了 _sel_* 字段（来自前一轮选区编辑）。
+    // 这些模式必须 fall-through 到各自专属的 block 路径（Step 2d / Step 2e）。
+    // selection 只服务于"当前选区编辑"，不得污染独立的 block 改写请求。
+    let is_block_scoped_mode = matches!(mode, "rewrite_block" | "rewrite_document");
 
-      return match mode {
-        "delete" => {
-          let original_text = input.selected_text.clone().unwrap_or_else(|| {
-            Self::extract_block_range(&input.current_editor_content, sbid, so, &ebid, eo)
-              .unwrap_or_default()
-          });
-          Ok(CanonicalDiffBuilt {
-            start_block_id: sbid.clone(),
-            start_offset: so,
-            end_block_id: ebid,
-            end_offset: eo,
-            original_text,
-            new_text: String::new(),
-            diff_type: "precise".to_string(),
-            edit_type: "delete".to_string(),
-            route_source: route_source.clone(),
-            resolver_error_codes: resolver_error_codes.clone(),
-          })
-        }
-        "insert" => {
-          // 在选区结束位置插入（0 长度 range）
-          Ok(CanonicalDiffBuilt {
-            start_block_id: ebid.clone(),
-            start_offset: eo,
-            end_block_id: ebid,
-            end_offset: eo,
-            original_text: String::new(),
-            new_text: input.content.clone().unwrap_or_default(),
-            diff_type: "precise".to_string(),
-            edit_type: "insert".to_string(),
-            route_source: route_source.clone(),
-            resolver_error_codes: resolver_error_codes.clone(),
-          })
-        }
-        _ => {
-          // replace / rewrite_block / rewrite_document → 以选区为 anchor，replace
-          let original_text = input.selected_text.clone().unwrap_or_else(|| {
-            Self::extract_block_range(&input.current_editor_content, sbid, so, &ebid, eo)
-              .unwrap_or_default()
-          });
-          Ok(CanonicalDiffBuilt {
-            start_block_id: sbid.clone(),
-            start_offset: so,
-            end_block_id: ebid,
-            end_offset: eo,
-            original_text,
-            new_text: input.content.clone().unwrap_or_default(),
-            diff_type: "precise".to_string(),
-            edit_type: "replace".to_string(),
-            route_source: route_source.clone(),
-            resolver_error_codes: resolver_error_codes.clone(),
-          })
-        }
-      };
+    if let Some(ref sbid) = input.selection_start_block_id {
+      if is_block_scoped_mode {
+        // 明确跳过 selection 路径，fall-through 到 Step 2d/2e。
+        eprintln!(
+          "[positioning] SELECTION_GUARD: mode={} has _sel_* fields but is block-scoped; skipping selection route",
+          mode
+        );
+      } else {
+        let so = input.selection_start_offset.unwrap_or(0);
+        let ebid = input
+          .selection_end_block_id
+          .as_ref()
+          .unwrap_or(sbid)
+          .clone();
+        let eo = input.selection_end_offset.unwrap_or(so);
+        let route_source = Self::resolve_zero_search_route_source(input.selected_text.as_ref());
+
+        return match mode {
+          "delete" => {
+            let original_text = input.selected_text.clone().unwrap_or_else(|| {
+              Self::extract_block_range(&input.current_editor_content, sbid, so, &ebid, eo)
+                .unwrap_or_default()
+            });
+            Ok(CanonicalDiffBuilt {
+              start_block_id: sbid.clone(),
+              start_offset: so,
+              end_block_id: ebid,
+              end_offset: eo,
+              original_text,
+              new_text: String::new(),
+              diff_type: "precise".to_string(),
+              edit_type: "delete".to_string(),
+              route_source: route_source.clone(),
+              resolver_error_codes: resolver_error_codes.clone(),
+            })
+          }
+          "insert" => {
+            // 在选区结束位置插入（0 长度 range）
+            Ok(CanonicalDiffBuilt {
+              start_block_id: ebid.clone(),
+              start_offset: eo,
+              end_block_id: ebid,
+              end_offset: eo,
+              original_text: String::new(),
+              new_text: input.content.clone().unwrap_or_default(),
+              diff_type: "precise".to_string(),
+              edit_type: "insert".to_string(),
+              route_source: route_source.clone(),
+              resolver_error_codes: resolver_error_codes.clone(),
+            })
+          }
+          _ => {
+            // replace → 以选区为 anchor
+            let original_text = input.selected_text.clone().unwrap_or_else(|| {
+              Self::extract_block_range(&input.current_editor_content, sbid, so, &ebid, eo)
+                .unwrap_or_default()
+            });
+            Ok(CanonicalDiffBuilt {
+              start_block_id: sbid.clone(),
+              start_offset: so,
+              end_block_id: ebid,
+              end_offset: eo,
+              original_text,
+              new_text: input.content.clone().unwrap_or_default(),
+              diff_type: "precise".to_string(),
+              edit_type: "replace".to_string(),
+              route_source: route_source.clone(),
+              resolver_error_codes: resolver_error_codes.clone(),
+            })
+          }
+        };
+      }
     }
 
     // Step 2e：rewrite_document
@@ -2332,7 +2503,6 @@ impl ToolService {
       "📝 [edit_current_editor_document] 工具调用参数: {:?}",
       tool_call.arguments
     );
-
     // 前置参数校验（冻结协议）
     if let Err(mut validation_error) = Self::validate_edit_params(&tool_call.arguments) {
       let target_file = tool_call
@@ -2544,6 +2714,28 @@ impl ToolService {
             "[positioning] path=Resolver2 file={} diff_type={} route_source={} edit_mode={} document_revision={:?} resolver_error_codes={:?}",
             current_file_new, diff_type, route_source, edit_mode, doc_rev, resolver_error_codes
           );
+          {
+            let orig_preview: String = cd.original_text.chars().take(80).collect();
+            let new_preview: String = cd.new_text.chars().take(80).collect();
+            let target_type = if diff_type == "block_level" || diff_type == "document_level" {
+              "block"
+            } else if route_source == "selection" {
+              "selection"
+            } else {
+              "reference"
+            };
+            eprintln!(
+              "[CROSS_FILE_TRACE][TOOL] {{\"tool\":\"edit_current_editor_document\",\"target_file\":{:?},\"tool_call_id\":{:?},\"route_source\":{:?},\"resolved_target_type\":{:?},\"original_text_len\":{},\"original_text_preview\":{:?},\"new_text_len\":{},\"new_text_preview\":{:?}}}",
+              current_file_new,
+              tool_call.id,
+              route_source,
+              target_type,
+              cd.original_text.len(),
+              orig_preview,
+              cd.new_text.len(),
+              new_preview,
+            );
+          }
           let mut data_obj = serde_json::Map::new();
           data_obj.insert("diff_area_id".to_string(), serde_json::json!(diff_area_id));
           data_obj.insert("file_path".to_string(), serde_json::json!(current_file_new));
@@ -2666,5 +2858,159 @@ impl ToolService {
     std::fs::rename(&temp_path, path).map_err(|e| format!("原子重命名失败: {}", e))?;
 
     Ok(())
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{ResolverInput, ToolService};
+
+  /// 构造一个最小 4-段 HTML 文档，带 data-block-id。
+  fn make_html() -> String {
+    r#"<p data-block-id="b0"># 项目说明</p><p data-block-id="b1">第一段：这是当前测试文档，用于验证对话编辑功能。</p><p data-block-id="b2">第二段：此处文字需要调整，agent将仅修改此句。</p><p data-block-id="b3">第三段：这里保留一段不应被改动的内容，用于观察误改。</p>"#.to_string()
+  }
+
+  /// 构造带 _sel_* 污染字段的 ResolverInput，模拟前一轮选区编辑遗留上下文。
+  fn input_with_selection_ctx(edit_mode: &str, block_index: Option<usize>, content: &str) -> ResolverInput {
+    ResolverInput {
+      block_index,
+      edit_mode: edit_mode.to_string(),
+      target: None,
+      content: Some(content.to_string()),
+      occurrence_index: 0,
+      // 前一轮选区上下文 — 污染字段
+      selection_start_block_id: Some("b1".to_string()),
+      selection_start_offset: Some(8),
+      selection_end_block_id: Some("b1".to_string()),
+      selection_end_offset: Some(10),
+      selected_text: Some("测试".to_string()),
+      target_file: "/test/test-a.md".to_string(),
+      current_editor_content: make_html(),
+      baseline_id: None,
+    }
+  }
+
+  /// 测试 1：rewrite_block 不得继承旧 selection 上下文。
+  /// originalText 必须来自目标 block，route_source 不得为 selection。
+  #[test]
+  fn test_rewrite_block_does_not_inherit_selection_context() {
+    // block_index=1 → 第一段
+    let input = input_with_selection_ctx("rewrite_block", Some(1), "第一段（润色后）。");
+    let result = ToolService::resolve(input);
+    assert!(result.is_ok(), "rewrite_block should succeed, got: {:?}", result.err());
+    let cd = result.unwrap();
+    assert_ne!(
+      cd.original_text, "测试",
+      "originalText must NOT be the old selection text '测试'"
+    );
+    assert!(
+      cd.original_text.contains("第一段"),
+      "originalText must be the full block 1 text, got: {:?}",
+      cd.original_text
+    );
+    assert_ne!(
+      cd.route_source, "selection",
+      "route_source must not be 'selection' for rewrite_block"
+    );
+    assert_eq!(cd.route_source, "block_search");
+    assert_eq!(cd.diff_type, "block_level");
+    assert_eq!(cd.new_text, "第一段（润色后）。");
+  }
+
+  /// 测试 2：两个 block 分别 rewrite，两张 diff 的 originalText 分别对应各自 block 旧文本。
+  #[test]
+  fn test_two_rewrite_blocks_each_get_correct_original_text() {
+    let input1 = input_with_selection_ctx("rewrite_block", Some(1), "润色后第一段。");
+    let input2 = input_with_selection_ctx("rewrite_block", Some(2), "润色后第二段。");
+
+    let cd1 = ToolService::resolve(input1).expect("block 1 rewrite should succeed");
+    let cd2 = ToolService::resolve(input2).expect("block 2 rewrite should succeed");
+
+    // 两张 diff 的 originalText 都不能是旧选区文本
+    assert_ne!(cd1.original_text, "测试");
+    assert_ne!(cd2.original_text, "测试");
+
+    // 各自应对应正确 block
+    assert!(
+      cd1.original_text.contains("第一段"),
+      "diff 1 originalText should be block 1 content, got: {:?}",
+      cd1.original_text
+    );
+    assert!(
+      cd2.original_text.contains("第二段"),
+      "diff 2 originalText should be block 2 content, got: {:?}",
+      cd2.original_text
+    );
+
+    // route_source 均应为 block_search
+    assert_eq!(cd1.route_source, "block_search");
+    assert_eq!(cd2.route_source, "block_search");
+  }
+
+  /// 测试 3：无 selection 污染时，rewrite_block 同样正常工作。
+  #[test]
+  fn test_rewrite_block_without_selection_context() {
+    let input = ResolverInput {
+      block_index: Some(1),
+      edit_mode: "rewrite_block".to_string(),
+      target: None,
+      content: Some("新第一段。".to_string()),
+      occurrence_index: 0,
+      selection_start_block_id: None,
+      selection_start_offset: None,
+      selection_end_block_id: None,
+      selection_end_offset: None,
+      selected_text: None,
+      target_file: "/test/test-a.md".to_string(),
+      current_editor_content: make_html(),
+      baseline_id: None,
+    };
+    let result = ToolService::resolve(input);
+    assert!(result.is_ok());
+    let cd = result.unwrap();
+    assert!(cd.original_text.contains("第一段"));
+    assert_eq!(cd.route_source, "block_search");
+    assert_eq!(cd.diff_type, "block_level");
+  }
+
+  /// 测试 4：block_index 越界时受控失败，不生成脏 diff，不 fallback 到 selection diff。
+  #[test]
+  fn test_rewrite_block_out_of_range_controlled_failure() {
+    let input = input_with_selection_ctx("rewrite_block", Some(99), "内容");
+    let result = ToolService::resolve(input);
+    assert!(result.is_err(), "out-of-range block_index should fail, not produce a diff");
+    let tool_result = result.unwrap_err();
+    assert_eq!(tool_result.success, false);
+    // 必须返回结构化错误，不能是空
+    assert!(
+      tool_result.error.is_some(),
+      "controlled failure must include an error message"
+    );
+  }
+
+  /// 测试 5：纯 selection 路径（replace 模式带选区）不受影响，仍正常工作。
+  #[test]
+  fn test_selection_replace_still_works() {
+    let input = ResolverInput {
+      block_index: None,
+      edit_mode: "replace".to_string(),
+      target: None,
+      content: Some("替换后文本".to_string()),
+      occurrence_index: 0,
+      selection_start_block_id: Some("b1".to_string()),
+      selection_start_offset: Some(8),
+      selection_end_block_id: Some("b1".to_string()),
+      selection_end_offset: Some(10),
+      selected_text: Some("测试".to_string()),
+      target_file: "/test/test-a.md".to_string(),
+      current_editor_content: make_html(),
+      baseline_id: None,
+    };
+    let result = ToolService::resolve(input);
+    assert!(result.is_ok());
+    let cd = result.unwrap();
+    assert_eq!(cd.original_text, "测试", "selection replace should use the selected text");
+    assert_eq!(cd.new_text, "替换后文本");
+    assert_eq!(cd.route_source, "selection");
   }
 }

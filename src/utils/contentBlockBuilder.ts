@@ -1,7 +1,7 @@
 // 内容块构建工具函数
 
 import { MessageContentBlock, ToolCall } from '../types/tool';
-import { needsAuthorization } from './toolDescription';
+import { isAwaitingAuthorization } from './toolDescription';
 
 /**
  * 构建内容块列表
@@ -65,7 +65,7 @@ export function buildContentBlocks(
             
             // 添加工具调用块
             const toolCall = item.data as ToolCall;
-            const needsAuth = needsAuthorization(toolCall.name, toolCall.arguments, workspacePath);
+            const needsAuth = isAwaitingAuthorization(toolCall, workspacePath);
             
             if (needsAuth) {
                 // 需要授权的操作
@@ -126,4 +126,3 @@ export function buildContentBlocksFromMessage(
     
     return buildContentBlocks(textChunks, toolCalls || [], workspacePath);
 }
-

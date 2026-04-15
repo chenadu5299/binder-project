@@ -18,7 +18,7 @@ import { useDiffStore } from '../../stores/diffStore';
 import { convertLegacyDiffsToEntriesWithFallback } from '../../utils/diffFormatAdapter';
 import { resolveEditorTabForEditResultWithRequestContext, inferPositioningPath } from '../../utils/editToolTabResolve';
 import { sha256HexUtf8, blockOrderSnapshotHashFromHtml } from '../../utils/contentSnapshotHash';
-import { needsAuthorization } from '../../utils/toolDescription';
+import { isAwaitingAuthorization } from '../../utils/toolDescription';
 import { useAgentStore } from '../../stores/agentStore';
 import type { KnowledgeInjectionSlice, KnowledgeQueryMetadata, KnowledgeQueryWarning } from '../../types/knowledge';
 import {
@@ -433,8 +433,16 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                                             (b.type === 'tool' || b.type === 'authorization') && b.toolCall?.id === toolCallObj.id
                                         );
                                         if (blockIndex >= 0) {
+                                            const needsAuth = isAwaitingAuthorization(toolCallObj, currentWorkspace || undefined);
                                             updateContentBlock(tabId, messageId, currentMessage.contentBlocks[blockIndex].id, {
+                                                type: needsAuth ? 'authorization' : 'tool',
                                                 toolCall: toolCallObj,
+                                                authorization: needsAuth ? {
+                                                    id: toolCallObj.id,
+                                                    type: 'file_system',
+                                                    operation: toolCallObj.name,
+                                                    details: toolCallObj.arguments,
+                                                } : undefined,
                                             });
                                         }
                                     }
@@ -448,7 +456,7 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                                     toolCallsRef.current.set(cacheKey, toolCalls);
                                     
                                     // 实时添加工具调用内容块
-                                    const needsAuth = needsAuthorization(toolCallObj.name, toolCallObj.arguments, currentWorkspace || undefined);
+                                    const needsAuth = isAwaitingAuthorization(toolCallObj, currentWorkspace || undefined);
                                     
                                     const contentBlock: MessageContentBlock = {
                                         id: toolCallObj.id,
@@ -481,13 +489,14 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                                 // ⚠️ 关键修复：如果有结果或错误，更新工具调用状态
                                 // 注意：updateToolCall 现在会同时更新 toolCalls 和 contentBlocks
                                 if (toolCall.result) {
+                                    const awaitingAuthorization = toolCall.result.meta?.gate?.status === 'awaiting_confirmation';
                                     console.log('✅ [前端] 更新工具调用结果:', {
                                         toolCallId: toolCallObj.id,
                                         hasResult: !!toolCall.result,
                                         result: toolCall.result,
                                     });
                                     updateToolCall(payload.tab_id, lastMessage.id, toolCallObj.id, {
-                                        status: 'completed',
+                                        status: awaitingAuthorization ? 'pending' : toolCallStatus === 'failed' ? 'failed' : 'completed',
                                         result: toolCall.result,
                                     });
                                     if (hasCandidatePayload(toolCallObj.name, toolCall.result)) {

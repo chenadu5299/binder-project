@@ -23,7 +23,7 @@ interface FileTreeContextMenuProps {
 const FileTreeContextMenu: React.FC<FileTreeContextMenuProps> = ({
   x,
   y,
-  filePath,
+  filePath: _filePath,
   isDirectory,
   onRename,
   onDelete,
@@ -89,8 +89,6 @@ const FileTreeContextMenu: React.FC<FileTreeContextMenuProps> = ({
     }
   }, [x, y]);
 
-  const fileName = filePath.split('/').pop() || filePath;
-
   return (
     <div
       ref={menuRef}
@@ -100,8 +98,8 @@ const FileTreeContextMenu: React.FC<FileTreeContextMenuProps> = ({
     >
       <button
         onClick={() => {
-          onRename();
           onClose();
+          onRename();
         }}
         className="w-full text-left px-4 py-2 hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300"
       >
@@ -155,10 +153,8 @@ const FileTreeContextMenu: React.FC<FileTreeContextMenuProps> = ({
 
       <button
         onClick={() => {
-          if (confirm(`确定要删除 "${fileName}" 吗？\n此操作不可撤销。`)) {
-            onDelete();
-            onClose();
-          }
+          onClose();
+          onDelete();
         }}
         className="w-full text-left px-4 py-2 hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2 text-sm text-red-600 dark:text-red-400"
       >

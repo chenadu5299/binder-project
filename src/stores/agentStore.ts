@@ -8,6 +8,7 @@ import type {
   AgentVerificationRecord,
 } from '../types/agent';
 import type { WorkflowExecutionRuntime } from '../types/template';
+import { createFailedVerificationRecord, createShadowStageState, markShadowTaskLifecycle } from '../types/agent_state';
 
 type AgentChatModeBoundary = 'agent' | 'chat';
 
@@ -52,6 +53,7 @@ interface AgentState {
   upsertArtifact: (chatTabId: string, artifact: AgentArtifactRecord) => void;
   clearArtifacts: (chatTabId: string) => void;
   setWorkflowExecution: (chatTabId: string, workflowExecution: WorkflowExecutionRuntime | null) => void;
+  resetRuntimeAfterRestore: (chatTabId: string, reason: string) => void;
   /** Phase 8: 从 workspace.db 恢复指定 chat tab 的活跃任务 */
   loadTasksFromDb: (chatTabId: string) => Promise<void>;
 }
@@ -215,6 +217,39 @@ export const useAgentStore = create<AgentState>((set, get) => ({
             ...runtime,
             runtimeMode: workflowExecution ? 'active' : runtime.runtimeMode,
             workflowExecution,
+          },
+        },
+      };
+    });
+  },
+
+  resetRuntimeAfterRestore: (chatTabId, reason) => {
+    set((state) => {
+      const runtime = state.runtimesByTab[chatTabId];
+      if (!runtime) {
+        return state;
+      }
+
+      const invalidatedTask = runtime.currentTask
+        ? markShadowTaskLifecycle(runtime.currentTask, 'invalidated')
+        : null;
+      const stageState = invalidatedTask
+        ? createShadowStageState(invalidatedTask.id, 'invalidated', reason)
+        : createEmptyStageState();
+
+      return {
+        runtimesByTab: {
+          ...state.runtimesByTab,
+          [chatTabId]: {
+            ...runtime,
+            currentTask: invalidatedTask,
+            stageState,
+            verification: invalidatedTask
+              ? createFailedVerificationRecord(invalidatedTask.id, reason)
+              : null,
+            confirmation: null,
+            artifacts: [],
+            workflowExecution: null,
           },
         },
       };

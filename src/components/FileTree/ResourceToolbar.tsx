@@ -2,7 +2,6 @@ import React, { useState, useRef, useEffect } from 'react';
 import { 
   FolderPlusIcon, 
   DocumentPlusIcon, 
-  ChevronDownIcon,
   MagnifyingGlassIcon,
   CloudIcon,
   EllipsisHorizontalIcon
@@ -23,7 +22,6 @@ const ResourceToolbar: React.FC<ResourceToolbarProps> = ({ onSearch, onRefresh }
   const [showMoreMenu, setShowMoreMenu] = useState(false);
   const [showInputDialog, setShowInputDialog] = useState(false);
   const [pendingFileType, setPendingFileType] = useState<string | null>(null);
-  const [lastClickTime, setLastClickTime] = useState<number>(0);
   const fileMenuRef = useRef<HTMLDivElement>(null);
   const moreMenuRef = useRef<HTMLDivElement>(null);
 
@@ -63,33 +61,13 @@ const ResourceToolbar: React.FC<ResourceToolbarProps> = ({ onSearch, onRefresh }
     setShowInputDialog(true);
   };
 
-  // 处理新建文件（单击）
+  // 处理新建文件：单一入口只负责展开类型菜单
   const handleCreateFileClick = () => {
     if (!currentWorkspace) {
       toast.warning('请先选择工作区');
       return;
     }
-
-    // 检查是否是双击（300ms内）
-    const now = Date.now();
-    if (now - lastClickTime < 300) {
-      // 双击：快速创建默认文件
-      handleQuickCreateFile();
-      setLastClickTime(0);
-    } else {
-      // 单击：显示菜单
-      setShowFileMenu(!showFileMenu);
-      setLastClickTime(now);
-    }
-  };
-
-  // 快速创建默认文件（.txt）
-  const handleQuickCreateFile = async () => {
-    if (!currentWorkspace) return;
-
-    setPendingFileType('txt');
-    setShowInputDialog(true);
-    setShowFileMenu(false);
+    setShowFileMenu((prev) => !prev);
   };
 
   // 选择文件类型
@@ -128,8 +106,8 @@ const ResourceToolbar: React.FC<ResourceToolbarProps> = ({ onSearch, onRefresh }
         } catch (err) {
           console.warn('[ResourceToolbar] 记录文件元数据失败:', err);
         }
-        // DOCX/MD/HTML/TXT 创建后自动打开并标记为新建
-        if (['docx', 'md', 'html', 'txt'].includes(fileType)) {
+        // 所有新建文件都立即打开；可编辑文件进入编辑链，只读文件进入预览链
+        if (['docx', 'md', 'html', 'txt', 'xlsx', 'pptx'].includes(fileType)) {
           const { documentService } = await import('../../services/documentService');
           await documentService.openFile(normalizedFilePath, { source: 'new' });
         }
@@ -172,27 +150,15 @@ const ResourceToolbar: React.FC<ResourceToolbarProps> = ({ onSearch, onRefresh }
           <FolderPlusIcon className="w-5 h-5" />
         </button>
 
-        {/* 新建文件按钮（复合图标） */}
+        {/* 新建文件按钮 */}
         <div className="relative" ref={fileMenuRef}>
-          <div className="flex items-center">
-            <button
-              onClick={handleCreateFileClick}
-              className="p-2 text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700 rounded-l transition-colors"
-              title="新建文件"
-            >
-              <DocumentPlusIcon className="w-5 h-5" />
-            </button>
-            <button
-              onClick={() => {
-                setShowFileMenu(!showFileMenu);
-                setLastClickTime(0); // 重置双击计时
-              }}
-              className="p-2 text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700 rounded-r border-l border-gray-300 dark:border-gray-600 transition-colors"
-              title="选择文件类型"
-            >
-              <ChevronDownIcon className="w-4 h-4" />
-            </button>
-          </div>
+          <button
+            onClick={handleCreateFileClick}
+            className="p-2 text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700 rounded transition-colors"
+            title="新建文件"
+          >
+            <DocumentPlusIcon className="w-5 h-5" />
+          </button>
 
           {/* 文件类型下拉菜单 */}
           {showFileMenu && (

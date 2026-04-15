@@ -1,5 +1,8 @@
 import { invoke } from '@tauri-apps/api/core';
 import { useEditorStore } from '../stores/editorStore';
+import { useChatStore } from '../stores/chatStore';
+import { useDiffStore } from '../stores/diffStore';
+import { useAgentStore } from '../stores/agentStore';
 import { getAbsolutePath, getRelativePath } from '../utils/pathUtils';
 import type { TimelineNode, TimelineRestorePreview, TimelineRestoreResult } from '../types/timeline';
 
@@ -46,6 +49,19 @@ async function reloadOpenTabsForPaths(workspacePath: string, relativePaths: stri
     } catch (error) {
       console.warn('[timelineService] 刷新已打开标签失败:', { relativePath, error });
     }
+  }
+}
+
+function invalidateRestoreScope(workspacePath: string, relativePaths: string[]): void {
+  const absolutePaths = relativePaths.map((relativePath) => getAbsolutePath(relativePath, workspacePath));
+  useDiffStore.getState().invalidateForFilePaths(absolutePaths, 'timeline_restore_scope_reset');
+
+  const chatTabs = useChatStore
+    .getState()
+    .tabs.filter((tab) => tab.workspacePath === workspacePath);
+  const agentStore = useAgentStore.getState();
+  for (const tab of chatTabs) {
+    agentStore.resetRuntimeAfterRestore(tab.id, 'timeline_restore_scope_reset');
   }
 }
 
@@ -96,7 +112,7 @@ export const timelineService = {
         `影响范围：${preview.node.impactScope.join('、') || '当前作用对象'}`,
         '',
         '该操作会覆盖当前项目逻辑状态。',
-        '不会恢复聊天、AI 过程、pending diff 或 task 现场。',
+        '与受影响文件关联的 pending diff / candidate / task 现场会被失效清理。',
       ].join('\n')
     );
 
@@ -105,6 +121,7 @@ export const timelineService = {
     }
 
     const result = await invoke<TimelineRestoreResult>('restore_timeline_node', { workspacePath, nodeId });
+    invalidateRestoreScope(workspacePath, result.impactedPaths);
     await reloadOpenTabsForPaths(workspacePath, result.impactedPaths);
     return result;
   },

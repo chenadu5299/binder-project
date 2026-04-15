@@ -123,7 +123,7 @@ pub fn build_tool_matrix() -> Vec<ToolMatrixEntry> {
             visibility: ToolVisibility::Always,
             definition: ToolDefinition {
                 name: "update_file".to_string(),
-                description: "Updates the content of an existing file on disk. Returns an error if the file does not exist.\n\n⚠️ IMPORTANT: Do NOT use this tool if the file is currently open in the editor. Use 'edit_current_editor_document' instead.\n\nImportant: Arguments must be in strict JSON format.".to_string(),
+                description: "Updates the content of an existing file on disk. Returns an error if the file does not exist.\n\n⚠️ IMPORTANT: Do NOT use this tool if the file is currently open in the editor. Use 'edit_current_editor_document' instead.\nFor document-like files (.md/.txt/.html/.docx/.rtf/.odt), Binder always routes AI edits into pending diffs for review before disk write. Direct write is reserved for non-document resources.\n\nImportant: Arguments must be in strict JSON format.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -137,7 +137,7 @@ pub fn build_tool_matrix() -> Vec<ToolMatrixEntry> {
                         },
                         "use_diff": {
                             "type": "boolean",
-                            "description": "If true, generate pending diffs instead of writing directly."
+                            "description": "If true, generate pending diffs instead of writing directly. For document-like files this review path is mandatory; false only bypasses review for non-document resources."
                         }
                     },
                     "required": ["path", "content"]
@@ -167,7 +167,7 @@ pub fn build_tool_matrix() -> Vec<ToolMatrixEntry> {
             visibility: ToolVisibility::Always,
             definition: ToolDefinition {
                 name: "move_file".to_string(),
-                description: "Moves a file or folder to a new location.".to_string(),
+                description: "Moves a file or folder to a new location. This operation requires user confirmation.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -183,7 +183,7 @@ pub fn build_tool_matrix() -> Vec<ToolMatrixEntry> {
             visibility: ToolVisibility::Always,
             definition: ToolDefinition {
                 name: "rename_file".to_string(),
-                description: "Renames a file or folder.".to_string(),
+                description: "Renames a file or folder. This operation requires user confirmation.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -199,7 +199,7 @@ pub fn build_tool_matrix() -> Vec<ToolMatrixEntry> {
             visibility: ToolVisibility::Always,
             definition: ToolDefinition {
                 name: "create_folder".to_string(),
-                description: "Creates a new folder. Supports creating multi-level directories.".to_string(),
+                description: "Creates a new folder. Supports creating multi-level directories. This operation requires user confirmation.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {

@@ -102,16 +102,16 @@ export const MessageContextMenu: React.FC<MessageContextMenuProps> = ({
     };
 
     const handleReference = () => {
-        // 添加文本引用（addReference 会自动生成 id 和 createdAt）
+        const preview = message.content.slice(0, 50) + (message.content.length > 50 ? '...' : '');
         const textRef: TextReference = {
             id: `ref-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
             type: ReferenceType.TEXT,
             content: message.content,
-            sourceFile: '',
-            fileName: '',
-            lineRange: { start: 1, end: 1 },
+            sourceFile: `chat:${tabId}`,
+            fileName: `聊天消息`,
+            lineRange: { start: 0, end: 0 },
             charRange: { start: 0, end: message.content.length },
-            displayText: message.content.slice(0, 50) + (message.content.length > 50 ? '...' : ''),
+            displayText: preview,
             createdAt: Date.now(),
         };
 

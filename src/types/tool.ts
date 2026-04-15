@@ -35,7 +35,7 @@ export interface ToolResultMeta {
 }
 
 export interface ToolGateMeta {
-    status?: 'pending' | 'passed' | 'failed' | 'not_required' | 'candidate_ready' | 'no_op';
+    status?: 'pending' | 'passed' | 'failed' | 'not_required' | 'candidate_ready' | 'no_op' | 'awaiting_confirmation';
     stage?: string;
     summary?: string;
 }

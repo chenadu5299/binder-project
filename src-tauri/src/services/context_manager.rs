@@ -12,6 +12,7 @@ use std::path::PathBuf;
 pub enum ContentInjectionStrategy {
   MetaOnly,
   SelectionContext,
+  FocusedCurrentDocument,
   Summary,
   Full,
 }
@@ -224,13 +225,179 @@ fn contains_current_doc_focus_intent(msg: &str) -> bool {
   keywords.iter().any(|k| msg_lower.contains(k))
 }
 
+fn contains_workspace_project_scope_intent(msg: &str) -> bool {
+  let msg_lower = msg.to_lowercase();
+  let keywords = [
+    "项目里",
+    "项目内",
+    "工作区里",
+    "工作区内",
+    "仓库里",
+    "仓库内",
+    "当前项目",
+    "当前工作区",
+    "其他文档",
+    "其它文档",
+    "别的文档",
+    "相关文档",
+    "相关文件",
+    "其他文件",
+    "其它文件",
+    "workspace",
+    "project docs",
+    "other documents",
+    "other files",
+    "rest of the project",
+    "repository",
+    "repo",
+  ];
+  keywords.iter().any(|k| msg_lower.contains(k))
+}
+
+fn contains_knowledge_expansion_intent(msg: &str) -> bool {
+  let msg_lower = msg.to_lowercase();
+  let keywords = [
+    "知识库",
+    "外部资料",
+    "参考资料",
+    "外部来源",
+    "联网",
+    "查资料",
+    "搜索资料",
+    "knowledge base",
+    "external sources",
+    "external material",
+    "research",
+    "look up",
+  ];
+  keywords.iter().any(|k| msg_lower.contains(k))
+}
+
+fn is_cjk(ch: char) -> bool {
+  matches!(
+    ch as u32,
+    0x4E00..=0x9FFF | 0x3400..=0x4DBF | 0x3040..=0x30FF | 0xAC00..=0xD7AF
+  )
+}
+
+fn push_focus_term(token: &str, out: &mut Vec<String>) {
+  let trimmed = token.trim();
+  if trimmed.is_empty() {
+    return;
+  }
+  let lower = trimmed.to_lowercase();
+  let stopwords = [
+    "请",
+    "帮我",
+    "一下",
+    "一个",
+    "目前",
+    "当前",
+    "当前文档",
+    "当前文件",
+    "本文件",
+    "文档",
+    "文件",
+    "内容",
+    "关于",
+    "基于",
+    "看看",
+    "说明",
+    "解释",
+    "分析",
+    "总结",
+    "概括",
+    "哪些",
+    "什么",
+    "是否",
+    "还有",
+    "没有",
+    "以及",
+    "帮忙",
+    "please",
+    "summarize",
+    "summary",
+    "explain",
+    "analyze",
+    "current",
+    "document",
+    "file",
+    "this",
+  ];
+  if stopwords.contains(&lower.as_str()) {
+    return;
+  }
+  if trimmed.chars().all(|ch| ch.is_ascii_digit()) {
+    return;
+  }
+  let char_count = trimmed.chars().count();
+  let has_ascii = trimmed.chars().any(|ch| ch.is_ascii_alphanumeric());
+  let has_cjk = trimmed.chars().any(is_cjk);
+  if (has_ascii && char_count < 3) || (has_cjk && char_count < 2) {
+    return;
+  }
+  if !out.iter().any(|existing| existing == trimmed) {
+    out.push(trimmed.to_string());
+  }
+}
+
+fn extract_focus_terms(text: &str) -> Vec<String> {
+  let mut terms = Vec::new();
+  let mut current = String::new();
+  for ch in text.chars() {
+    if ch.is_ascii_alphanumeric() || is_cjk(ch) {
+      current.push(ch);
+    } else if !current.is_empty() {
+      push_focus_term(&current, &mut terms);
+      current.clear();
+    }
+  }
+  if !current.is_empty() {
+    push_focus_term(&current, &mut terms);
+  }
+  let existing_terms = terms.clone();
+  for term in existing_terms {
+    let chars: Vec<char> = term.chars().collect();
+    let has_cjk = chars.iter().copied().any(is_cjk);
+    if !has_cjk || chars.len() <= 4 {
+      continue;
+    }
+    for window in chars.windows(4) {
+      let slice: String = window.iter().collect();
+      push_focus_term(&slice, &mut terms);
+    }
+  }
+  terms
+}
+
+fn message_mentions_current_file(msg: &str, current_file: Option<&str>) -> bool {
+  let Some(file) = current_file else {
+    return false;
+  };
+  let Some(stem) = std::path::Path::new(file)
+    .file_stem()
+    .and_then(|value| value.to_str())
+  else {
+    return false;
+  };
+  let stem = stem.trim().to_lowercase();
+  if stem.is_empty() {
+    return false;
+  }
+  msg.to_lowercase().contains(&stem)
+}
+
 pub fn determine_injection_strategy(
   user_message: &str,
   has_edit_target: bool,
   content_char_count: usize,
+  prioritize_current_document: bool,
 ) -> ContentInjectionStrategy {
   if has_edit_target {
     return ContentInjectionStrategy::SelectionContext;
+  }
+  if prioritize_current_document && content_char_count >= 800 {
+    return ContentInjectionStrategy::FocusedCurrentDocument;
   }
   if content_char_count < 800 {
     return ContentInjectionStrategy::Full;
@@ -342,6 +509,9 @@ pub struct ContextInfo {
   /// 当前用户消息，用于意图判断
   pub user_message: String,
 
+  /// 当前打开文档是否在本轮被用户显式引用
+  pub current_file_explicitly_referenced: bool,
+
   /// 本轮定位基线标识（RequestContext.baselineId）
   pub baseline_id: Option<String>,
 
@@ -367,7 +537,9 @@ pub enum KnowledgeRetrievalTriggerReason {
   FileOperationIntent,
   QueryTooShort,
   CurrentDocumentSufficient,
+  CurrentDocumentPriority,
   CurrentScopeOnly,
+  WorkspaceProjectScope,
   AutomaticPolicyBlocked,
   NoAutomaticCandidates,
 }
@@ -419,20 +591,39 @@ pub struct EditorState {
   pub is_saved: bool,
 }
 
-/// 引用信息
+/// 引用信息（RichReferenceInfo：保留 IPC 传入的全部结构化字段）
+/// 依据：A-CORE-C-D-02 §3.3 RichReferenceInfo / 引用结构保真
 #[derive(Debug, Clone)]
 pub struct ReferenceInfo {
   /// 引用类型
   pub ref_type: ReferenceType,
 
-  /// 引用来源
+  /// 引用来源（路径 / ID / URL）
   pub source: String,
 
   /// 引用内容
   pub content: String,
+
+  /// 精确引用四元组（仅 Text 类型，可选）
+  pub text_reference: Option<TextReferenceAnchorInfo>,
+
+  /// 知识库细粒度 ID（仅 KnowledgeBase 类型，可选）
+  pub knowledge_base_id: Option<String>,
+  pub knowledge_entry_id: Option<String>,
+  pub knowledge_document_id: Option<String>,
+  pub knowledge_citation_key: Option<String>,
 }
 
-/// 引用类型（与前端 protocol 6.1 一一对应）
+/// 精确引用四元组（后端内部表示）
+#[derive(Debug, Clone)]
+pub struct TextReferenceAnchorInfo {
+  pub start_block_id: String,
+  pub start_offset: u32,
+  pub end_block_id: String,
+  pub end_offset: u32,
+}
+
+/// 引用类型（与前端 ReferenceType 一一对应，A-CORE-C-D-02 §3.3）
 #[derive(Debug, Clone)]
 pub enum ReferenceType {
   Text,          // 文本引用
@@ -535,6 +726,17 @@ impl ContextManager {
       };
     }
 
+    let current_document_priority = context.current_file.is_some()
+      && (context.current_file_explicitly_referenced
+        || context.edit_target_present
+        || context
+          .selected_text
+          .as_ref()
+          .map(|s| !s.trim().is_empty())
+          .unwrap_or(false)
+        || contains_current_doc_focus_intent(msg)
+        || message_mentions_current_file(msg, context.current_file.as_deref()));
+
     if retrieval_context.granular_explicit_reference_count > 0 {
       return KnowledgeRetrievalDecision {
         should_trigger: false,
@@ -546,6 +748,20 @@ impl ContextManager {
       return KnowledgeRetrievalDecision {
         should_trigger: false,
         reason: KnowledgeRetrievalTriggerReason::CurrentScopeOnly,
+      };
+    }
+
+    if current_document_priority && !contains_knowledge_expansion_intent(msg) {
+      return KnowledgeRetrievalDecision {
+        should_trigger: false,
+        reason: KnowledgeRetrievalTriggerReason::CurrentDocumentPriority,
+      };
+    }
+
+    if contains_workspace_project_scope_intent(msg) && !contains_knowledge_expansion_intent(msg) {
+      return KnowledgeRetrievalDecision {
+        should_trigger: false,
+        reason: KnowledgeRetrievalTriggerReason::WorkspaceProjectScope,
       };
     }
 
@@ -694,6 +910,16 @@ Use `edit_current_editor_document` for ALL edits to the currently open file.
 
 **Editing files NOT open in the editor**: Use `update_file` with `use_diff: true`.
 
+## Fact Priority
+
+Treat facts in this order:
+1. Current open document in the editor
+2. Other files inside the current workspace
+3. Knowledge augmentation / external materials
+
+For questions about the current document, stay inside the current document first.
+If the current document is insufficient, expand to other workspace files before relying on knowledge augmentation.
+
 **Edit modes** (use edit_mode field, do NOT set scope):
 - Replace text in a block: edit_mode=replace, block_index=<N>, target=<exact text>, content=<new text>
 - Delete text: edit_mode=delete, block_index=<N>, target=<exact text>
@@ -738,11 +964,15 @@ Only act on the LAST user message. Previous messages are completed history.
         .as_deref()
         .map(|c| strip_html_tags(c).chars().count())
         .unwrap_or(0);
+      let prioritize_current_document = context.current_file_explicitly_referenced
+        || contains_current_doc_focus_intent(&context.user_message)
+        || message_mentions_current_file(&context.user_message, Some(file_path));
 
       let strategy = determine_injection_strategy(
         &context.user_message,
         context.edit_target_present,
         plain_text_len,
+        prioritize_current_document,
       );
 
       match strategy {
@@ -788,6 +1018,88 @@ Only act on the LAST user message. Previous messages are completed history.
           }
         }
 
+        ContentInjectionStrategy::FocusedCurrentDocument => {
+          prompt.push_str(&format!(
+                        "Current file open in editor: {}\n\n\
+                         This current document is the highest-priority editable fact source for this turn.\n\
+                         The user is asking about the current document itself. Stay inside this document first.\n\
+                         If the first-pass summary is insufficient, deepen within this document before expanding to workspace files.\n\
+                         Only use knowledge augmentation after current-document facts and workspace files are both insufficient.\n\n\
+                         ⚠️ For any edits to this file: use `edit_current_editor_document` directly.\n\
+                            Use block_index from [文档块列表] below to specify the target block.\n\n",
+                        file_path
+                    ));
+
+          if context.current_file_explicitly_referenced {
+            prompt.push_str(
+              "User explicitly referenced the current file in this turn. Preserve that anchor in reasoning and routing.\n\n",
+            );
+          }
+
+          if let Some(ref content) = context.current_content {
+            let blocks = extract_blocks(content);
+            if !blocks.is_empty() {
+              let mut idx_set = std::collections::BTreeSet::new();
+
+              if let Some(cursor_block_id) = context.cursor_block_id.as_deref() {
+                if let Some(cursor_idx) = blocks.iter().position(|b| b.block_id == cursor_block_id) {
+                  let start = cursor_idx.saturating_sub(3);
+                  let end = (cursor_idx + 4).min(blocks.len());
+                  for i in start..end {
+                    idx_set.insert(i);
+                  }
+                }
+              }
+
+              if let Some(sel_block_id) = context.selection_start_block_id.as_deref() {
+                if let Some(sel_idx) = blocks.iter().position(|b| b.block_id == sel_block_id) {
+                  let start = sel_idx.saturating_sub(2);
+                  let end = (sel_idx + 3).min(blocks.len());
+                  for i in start..end {
+                    idx_set.insert(i);
+                  }
+                }
+              }
+
+              let query_terms = extract_focus_terms(&context.user_message);
+              for (idx, block) in blocks.iter().enumerate() {
+                let block_text_lower = block.text.to_lowercase();
+                if query_terms
+                  .iter()
+                  .any(|term| block_text_lower.contains(&term.to_lowercase()))
+                {
+                  let start = idx.saturating_sub(1);
+                  let end = (idx + 2).min(blocks.len());
+                  for i in start..end {
+                    idx_set.insert(i);
+                  }
+                }
+              }
+
+              if idx_set.is_empty() {
+                for (idx, block) in blocks.iter().enumerate() {
+                  if block.block_type == "标题" {
+                    idx_set.insert(idx);
+                  }
+                  if idx_set.len() >= 8 {
+                    break;
+                  }
+                }
+                for i in 0..blocks.len().min(12) {
+                  idx_set.insert(i);
+                }
+              }
+
+              let indices: Vec<usize> = idx_set.into_iter().collect();
+              prompt.push_str(&format_blocks_as_list(
+                &blocks,
+                &indices,
+                context.cursor_block_id.as_deref(),
+              ));
+            }
+          }
+        }
+
         ContentInjectionStrategy::Summary => {
           prompt.push_str(&format!(
                         "Current file open in editor: {}\n\n\
@@ -795,6 +1107,12 @@ Only act on the LAST user message. Previous messages are completed history.
                             Use block_index from [文档块列表] below to specify the target block.\n\n",
                         file_path
                     ));
+
+          if context.current_file_explicitly_referenced {
+            prompt.push_str(
+              "User explicitly referenced the current file in this turn. Treat the current document as the primary source before any broader retrieval.\n\n",
+            );
+          }
 
           if let Some(ref content) = context.current_content {
             let blocks = extract_blocks(content);
@@ -915,7 +1233,9 @@ Only act on the LAST user message. Previous messages are completed history.
     prompt
   }
 
-  /// 构建引用提示词（英文版，中文注释）
+  /// 构建引用提示词（英文版）
+  /// 依据：A-CORE-C-D-02 §3.3 build_reference_prompt / A-DE-M-D-01 §5.8
+  /// 每条引用输出：类型标题 + Source 路径 + Position（若有四元组）+ Content
   pub fn build_reference_prompt(
     &self,
     references: &[ReferenceInfo],
@@ -924,11 +1244,9 @@ Only act on the LAST user message. Previous messages are completed history.
     if references.is_empty() {
       return String::new();
     }
-    // 引用内容说明：这些内容已经完整包含在消息中，无需再读取
     let mut prompt = String::from("The user has referenced the following content:\n\n");
 
     for (idx, ref_info) in references.iter().enumerate() {
-      // 引用类型名称（英文）
       let ref_type_name = match ref_info.ref_type {
         ReferenceType::Text => "Text reference",
         ReferenceType::File => "File reference",
@@ -942,7 +1260,6 @@ Only act on the LAST user message. Previous messages are completed history.
         ReferenceType::Template => "Compiled workflow constraint reference",
       };
 
-      // 引用格式：Reference N: Type (Source: source)
       prompt.push_str(&format!(
         "Reference {}: {} (Source: {})\n",
         idx + 1,
@@ -950,42 +1267,44 @@ Only act on the LAST user message. Previous messages are completed history.
         ref_info.source
       ));
 
-      // ⚠️ 关键：检查是否是当前编辑器打开的文件
+      // 输出精确位置（若有 text_reference 四元组）
+      if let Some(tr) = &ref_info.text_reference {
+        prompt.push_str(&format!(
+          "Position: block[{}] offset {} — block[{}] offset {}\n",
+          tr.start_block_id, tr.start_offset, tr.end_block_id, tr.end_offset
+        ));
+      } else if matches!(ref_info.ref_type, ReferenceType::Text) {
+        prompt.push_str("Precision: line-level (no character-level anchor). The referenced text is fully included below. Use the document block list to locate the exact block. Do NOT ask the user for confirmation — apply your best judgment.\n");
+      }
+
       let is_current_file = current_file
         .map(|cf| {
-          // 检查路径是否匹配（支持绝对路径和相对路径）
           ref_info.source == *cf || ref_info.source.ends_with(cf) || cf.ends_with(&ref_info.source)
         })
         .unwrap_or(false);
 
-      // 显示内容
       if !ref_info.content.is_empty() {
         prompt.push_str(&format!("Content:\n{}\n\n", ref_info.content));
-      } else {
-        // 对于文件引用，如果没有内容，提示AI可以使用工具读取
-        if matches!(ref_info.ref_type, ReferenceType::File) {
-          if is_current_file {
-            prompt.push_str("⚠️ IMPORTANT: This file is currently open in the editor. This is the document the user is viewing/editing right now. You should be aware of this file's content and can use the read_file tool to access it if needed.\n\n");
-          } else {
-            prompt.push_str(
-              "Note: You can use the read_file tool to access this file's content if needed.\n\n",
-            );
-          }
+      } else if matches!(ref_info.ref_type, ReferenceType::File) {
+        if is_current_file {
+          prompt.push_str("This file is currently open in the editor. You can use the read_file tool to access it if needed.\n\n");
         } else {
-          prompt
-            .push_str("Note: Content not provided. Use appropriate tools to access if needed.\n\n");
+          prompt.push_str(
+            "Note: You can use the read_file tool to access this file's content if needed.\n\n",
+          );
         }
+      } else {
+        prompt
+          .push_str("Note: Content not provided. Use appropriate tools to access if needed.\n\n");
       }
     }
 
-    // 设计文档 6.2：含 File 时统一追加 path 可信声明
     let has_file = references
       .iter()
       .any(|r| matches!(r.ref_type, ReferenceType::File));
     if has_file {
       prompt.push_str("The above file paths have been resolved and can be used directly. No need to call list_files or search_files.\n\n");
     }
-    // 末尾统一
     prompt.push_str("The above content has been fully provided. No need to read again.\n");
 
     prompt
@@ -1198,6 +1517,11 @@ mod tests {
         ref_type: ReferenceType::File,
         source: "docs/spec.md".to_string(),
         content: String::new(),
+        text_reference: None,
+        knowledge_base_id: None,
+        knowledge_entry_id: None,
+        knowledge_document_id: None,
+        knowledge_citation_key: None,
       }],
       current_content: Some("<p data-block-id=\"b1\">Binder context</p>".to_string()),
       edit_target_present,
@@ -1208,6 +1532,7 @@ mod tests {
       cursor_block_id: None,
       cursor_offset: None,
       user_message: user_message.to_string(),
+      current_file_explicitly_referenced: false,
       baseline_id: None,
       document_revision: None,
       agent_task_summary: None,
@@ -1317,6 +1642,71 @@ mod tests {
       decision.reason,
       KnowledgeRetrievalTriggerReason::CurrentDocumentSufficient
     );
+  }
+
+  #[test]
+  fn p1_should_block_knowledge_retrieval_when_current_file_is_explicitly_referenced() {
+    let manager = ContextManager::new(4000);
+    let mut context = build_context("请回答这份文件里的关键约束", false);
+    context.current_file_explicitly_referenced = true;
+
+    let decision = manager.should_trigger_knowledge_retrieval(
+      &context,
+      &KnowledgeRetrievalContext {
+        automatic_candidate_count: 2,
+        ..KnowledgeRetrievalContext::default()
+      },
+    );
+
+    assert!(!decision.should_trigger);
+    assert_eq!(
+      decision.reason,
+      KnowledgeRetrievalTriggerReason::CurrentDocumentPriority
+    );
+  }
+
+  #[test]
+  fn p1_should_block_knowledge_retrieval_for_workspace_project_scope_before_knowledge() {
+    let manager = ContextManager::new(4000);
+    let context = build_context("项目里还有没有别的相关文档可以参考", false);
+
+    let decision = manager.should_trigger_knowledge_retrieval(
+      &context,
+      &KnowledgeRetrievalContext {
+        automatic_candidate_count: 3,
+        ..KnowledgeRetrievalContext::default()
+      },
+    );
+
+    assert!(!decision.should_trigger);
+    assert_eq!(
+      decision.reason,
+      KnowledgeRetrievalTriggerReason::WorkspaceProjectScope
+    );
+  }
+
+  #[test]
+  fn p1_build_context_prompt_should_deepen_inside_current_document_for_focus_queries() {
+    let manager = ContextManager::new(4000);
+    let mut context = build_context("请说明交付边界这一段的限制", false);
+    let mut blocks = Vec::new();
+    for idx in 1..=16 {
+      let text = if idx == 12 {
+        "这里说明交付边界与限制条件，并强调不能直接滑向知识检索。".to_string()
+      } else {
+        format!("第{}段背景说明。{}", idx, "常规背景描述。".repeat(12))
+      };
+      blocks.push(format!("<p data-block-id=\"b{idx}\">{text}</p>"));
+    }
+    context.current_content = Some(blocks.join(""));
+    context.current_file_explicitly_referenced = true;
+
+    let prompt = manager.build_context_prompt(&context);
+    assert!(prompt.contains("highest-priority"));
+    assert!(prompt.contains("交付边界"));
+    assert!(prompt.contains("Block 10"));
+    assert!(prompt.contains("Block 11"));
+    assert!(prompt.contains("Block 12"));
   }
 }
 

@@ -182,20 +182,56 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId, pendingMode = 'agen
             files: e.dataTransfer.files.length,
         });
         
-        // 优先检查是否是从文件树拖拽的文件路径
-        // 尝试多种方式获取数据（兼容性）
-        let filePath = e.dataTransfer.getData('application/file-path');
-        if (!filePath) {
-            filePath = e.dataTransfer.getData('text/plain');
-        }
-        
+        // 1. 文件树拖拽：application/file-path 明确标记
+        const filePath = e.dataTransfer.getData('application/file-path');
         const isDirectory = e.dataTransfer.getData('application/is-directory') === 'true';
-        
-        console.log('📥 拖拽数据:', { filePath, isDirectory });
-        
+
         if (filePath && !isDirectory) {
             console.log('✅ 检测到文件树拖拽，创建文件引用:', filePath);
             await handleFileTreeReference(filePath);
+            return;
+        }
+
+        // 2. 编辑器文本拖拽：application/x-binder-source 由 CopyReferenceExtension dragstart 写入
+        const binderSourceStr = e.dataTransfer.getData('application/x-binder-source') || (() => {
+            const gs = (window as any).__binderDragSource;
+            const gt = (window as any).__binderDragTimestamp;
+            if (gs && gt && Date.now() - gt < 10000) {
+                delete (window as any).__binderDragSource;
+                delete (window as any).__binderDragTimestamp;
+                return gs;
+            }
+            return '';
+        })();
+        const droppedText = e.dataTransfer.getData('text/plain');
+
+        if (droppedText && binderSourceStr) {
+            try {
+                const source = JSON.parse(binderSourceStr);
+                const { createTextReferenceFromClipboard } = await import('../../utils/referenceHelpers');
+                const textRefBase = createTextReferenceFromClipboard(
+                    {
+                        filePath: source.filePath,
+                        fileName: source.fileName,
+                        lineRange: source.lineRange,
+                        charRange: source.charRange,
+                        startBlockId: source.startBlockId,
+                        endBlockId: source.endBlockId,
+                        blockId: source.blockId,
+                        startOffset: source.startOffset,
+                        endOffset: source.endOffset,
+                    },
+                    droppedText,
+                );
+                const textRef = {
+                    ...textRefBase,
+                    id: `ref-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+                    createdAt: Date.now(),
+                };
+                addReference(currentTabId, textRef);
+            } catch (err) {
+                console.error('❌ 创建文本引用失败:', err);
+            }
             return;
         }
 

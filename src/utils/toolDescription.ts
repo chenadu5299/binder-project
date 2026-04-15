@@ -2,6 +2,21 @@
 
 import { ToolCall } from '../types/tool';
 
+const CONFIRMATION_REQUIRED_TOOLS = new Set([
+    'delete_file',
+    'move_file',
+    'rename_file',
+    'create_folder',
+]);
+
+export function isAwaitingAuthorization(toolCall?: Pick<ToolCall, 'name' | 'arguments' | 'result' | 'status'> | null, workspacePath?: string): boolean {
+    if (!toolCall) return false;
+    if (toolCall.result?.meta?.gate?.status === 'awaiting_confirmation') {
+        return true;
+    }
+    return needsAuthorization(toolCall.name, toolCall.arguments, workspacePath);
+}
+
 /**
  * 生成工具调用的友好描述
  */
@@ -38,6 +53,10 @@ export function generateToolDescription(toolCall: ToolCall): string {
  * 判断工具调用是否需要授权
  */
 export function needsAuthorization(toolName: string, args: any, workspacePath?: string): boolean {
+    if (CONFIRMATION_REQUIRED_TOOLS.has(toolName)) {
+        return true;
+    }
+
     switch (toolName) {
         case 'read_file':
             // 如果路径在工作区外，需要授权
@@ -71,6 +90,14 @@ export function generateAuthorizationDescription(toolCall: ToolCall): string {
     const { name, arguments: args } = toolCall;
     
     switch (name) {
+        case 'delete_file':
+            return `删除资源需要显式确认。\n\n目标：${args.path || ''}\n该操作会直接移除现有文件或文件夹。`;
+        case 'move_file':
+            return `移动资源需要显式确认。\n\n源路径：${args.source || ''}\n目标路径：${args.destination || ''}`;
+        case 'rename_file':
+            return `重命名资源需要显式确认。\n\n目标：${args.path || ''}\n新名称：${args.new_name || ''}`;
+        case 'create_folder':
+            return `创建文件夹需要显式确认。\n\n目标路径：${args.path || ''}\n该操作会修改当前 workspace 结构。`;
         case 'read_file':
             return `我需要访问系统文件：${args.path}\n\n这将允许我读取工作区外的文件内容。`;
         case 'write_file':
@@ -86,4 +113,3 @@ export function generateAuthorizationDescription(toolCall: ToolCall): string {
             return `需要授权执行: ${name}`;
     }
 }
-

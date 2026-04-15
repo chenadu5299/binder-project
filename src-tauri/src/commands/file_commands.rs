@@ -4,11 +4,11 @@ use crate::services::file_watcher::FileWatcherService;
 use crate::services::libreoffice_service::LibreOfficeService;
 use crate::services::pandoc_service::PandocService;
 use crate::services::workspace::{Workspace, WorkspaceService};
+use crate::utils::path_validator::PathValidator;
 use crate::workspace::timeline_support::record_resource_structure_timeline_node;
 use crate::workspace::workspace_db::WorkspaceDb;
 use dirs;
 use once_cell::sync::Lazy;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -25,6 +25,165 @@ type FileWatcherState = Mutex<FileWatcherService>;
 type PreviewRequestMap = Arc<Mutex<HashMap<String, oneshot::Sender<Result<String, String>>>>>;
 static PREVIEW_REQUESTS: Lazy<PreviewRequestMap> =
   Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
+
+fn write_zip_entries(path: &Path, entries: Vec<(&str, String)>) -> Result<(), String> {
+  use std::fs::File;
+  use std::io::Write;
+  use zip::write::FileOptions;
+  use zip::{CompressionMethod, ZipWriter};
+
+  let file = File::create(path).map_err(|e| format!("创建文件失败: {}", e))?;
+  let mut zip = ZipWriter::new(file);
+  let options = FileOptions::default().compression_method(CompressionMethod::Stored);
+
+  for (entry_path, content) in entries {
+    zip
+      .start_file(entry_path, options)
+      .map_err(|e| format!("写入 {} 失败: {}", entry_path, e))?;
+    zip
+      .write_all(content.as_bytes())
+      .map_err(|e| format!("写入 {} 失败: {}", entry_path, e))?;
+  }
+
+  zip
+    .finish()
+    .map_err(|e| format!("完成压缩文件写入失败: {}", e))?;
+  Ok(())
+}
+
+fn build_core_properties_xml() -> String {
+  let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+  format!(
+    concat!(
+      r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+      r#"<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:dcmitype="http://purl.org/dc/dcmitype/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">"#,
+      r#"<dc:title></dc:title>"#,
+      r#"<dc:creator>Binder</dc:creator>"#,
+      r#"<cp:lastModifiedBy>Binder</cp:lastModifiedBy>"#,
+      r#"<dcterms:created xsi:type="dcterms:W3CDTF">{now}</dcterms:created>"#,
+      r#"<dcterms:modified xsi:type="dcterms:W3CDTF">{now}</dcterms:modified>"#,
+      r#"</cp:coreProperties>"#
+    ),
+    now = now
+  )
+}
+
+fn create_empty_docx(path: &Path) -> Result<(), String> {
+  let pandoc_service = PandocService::new();
+  if !pandoc_service.is_available() {
+    return Err("Pandoc 不可用，无法创建 DOCX 文件。请安装 Pandoc 或使用其他格式。".to_string());
+  }
+
+  let empty_html =
+    "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"></head><body></body></html>";
+  pandoc_service
+    .convert_html_to_docx(empty_html, path)
+    .map_err(|e| format!("创建 DOCX 文件失败: {}", e))
+}
+
+fn create_empty_xlsx(path: &Path) -> Result<(), String> {
+  let entries = vec![
+    (
+      "[Content_Types].xml",
+      r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/><Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>"#.to_string(),
+    ),
+    (
+      "_rels/.rels",
+      r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/></Relationships>"#.to_string(),
+    ),
+    (
+      "docProps/app.xml",
+      r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><Application>Binder</Application></Properties>"#.to_string(),
+    ),
+    ("docProps/core.xml", build_core_properties_xml()),
+    (
+      "xl/workbook.xml",
+      r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>"#.to_string(),
+    ),
+    (
+      "xl/_rels/workbook.xml.rels",
+      r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>"#.to_string(),
+    ),
+    (
+      "xl/worksheets/sheet1.xml",
+      r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData/></worksheet>"#.to_string(),
+    ),
+    (
+      "xl/styles.xml",
+      r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#.to_string(),
+    ),
+  ];
+
+  write_zip_entries(path, entries)
+}
+
+fn create_empty_pptx(path: &Path) -> Result<(), String> {
+  let entries = vec![
+    (
+      "[Content_Types].xml",
+      r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/><Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/><Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/><Override PartName="/ppt/presProps.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presProps+xml"/><Override PartName="/ppt/viewProps.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.viewProps+xml"/><Override PartName="/ppt/tableStyles.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.tableStyles+xml"/><Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/><Override PartName="/ppt/slideLayouts/slideLayout1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml"/><Override PartName="/ppt/slideMasters/slideMaster1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml"/><Override PartName="/ppt/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/></Types>"#.to_string(),
+    ),
+    (
+      "_rels/.rels",
+      r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/></Relationships>"#.to_string(),
+    ),
+    (
+      "docProps/app.xml",
+      r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><Application>Binder</Application><PresentationFormat>On-screen Show</PresentationFormat><Slides>1</Slides><Notes>0</Notes><HiddenSlides>0</HiddenSlides><MMClips>0</MMClips><ScaleCrop>false</ScaleCrop><HeadingPairs><vt:vector size="2" baseType="variant"><vt:variant><vt:lpstr>Slides</vt:lpstr></vt:variant><vt:variant><vt:i4>1</vt:i4></vt:variant></vt:vector></HeadingPairs><TitlesOfParts><vt:vector size="1" baseType="lpstr"><vt:lpstr>Slide 1</vt:lpstr></vt:vector></TitlesOfParts><Company></Company><LinksUpToDate>false</LinksUpToDate><SharedDoc>false</SharedDoc><HyperlinksChanged>false</HyperlinksChanged><AppVersion>16.0000</AppVersion></Properties>"#.to_string(),
+    ),
+    ("docProps/core.xml", build_core_properties_xml()),
+    (
+      "ppt/presentation.xml",
+      r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:presentation xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:sldMasterIdLst><p:sldMasterId id="2147483648" r:id="rId2"/></p:sldMasterIdLst><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst><p:sldSz cx="9144000" cy="6858000"/><p:notesSz cx="6858000" cy="9144000"/><p:defaultTextStyle/></p:presentation>"#.to_string(),
+    ),
+    (
+      "ppt/_rels/presentation.xml.rels",
+      r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster" Target="slideMasters/slideMaster1.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/presProps" Target="presProps.xml"/><Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/viewProps" Target="viewProps.xml"/><Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/tableStyles" Target="tableStyles.xml"/></Relationships>"#.to_string(),
+    ),
+    (
+      "ppt/presProps.xml",
+      r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:presentationPr xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"/>"#.to_string(),
+    ),
+    (
+      "ppt/viewProps.xml",
+      r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:viewPr xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" lastView="sldView"><p:normalViewPr><p:restoredLeft sz="15620"/><p:restoredTop sz="94660"/></p:normalViewPr><p:slideViewPr/><p:notesTextViewPr/></p:viewPr>"#.to_string(),
+    ),
+    (
+      "ppt/tableStyles.xml",
+      r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><a:tblStyleLst xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" def="{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}"/>"#.to_string(),
+    ),
+    (
+      "ppt/slides/slide1.xml",
+      r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr></p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sld>"#.to_string(),
+    ),
+    (
+      "ppt/slides/_rels/slide1.xml.rels",
+      r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/></Relationships>"#.to_string(),
+    ),
+    (
+      "ppt/slideLayouts/slideLayout1.xml",
+      r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:sldLayout xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" type="blank" preserve="1"><p:cSld name="Blank"><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr></p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sldLayout>"#.to_string(),
+    ),
+    (
+      "ppt/slideLayouts/_rels/slideLayout1.xml.rels",
+      r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster" Target="../slideMasters/slideMaster1.xml"/></Relationships>"#.to_string(),
+    ),
+    (
+      "ppt/slideMasters/slideMaster1.xml",
+      r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:sldMaster xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr></p:spTree></p:cSld><p:clrMap bg1="lt1" tx1="dk1" bg2="lt2" tx2="dk2" accent1="accent1" accent2="accent2" accent3="accent3" accent4="accent4" accent5="accent5" accent6="accent6" hlink="hlink" folHlink="folHlink"/><p:sldLayoutIdLst><p:sldLayoutId id="2147483649" r:id="rId1"/></p:sldLayoutIdLst><p:txStyles><p:titleStyle/><p:bodyStyle/><p:otherStyle/></p:txStyles></p:sldMaster>"#.to_string(),
+    ),
+    (
+      "ppt/slideMasters/_rels/slideMaster1.xml.rels",
+      r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="../theme/theme1.xml"/></Relationships>"#.to_string(),
+    ),
+    (
+      "ppt/theme/theme1.xml",
+      r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="Binder"><a:themeElements><a:clrScheme name="Binder"><a:dk1><a:sysClr val="windowText" lastClr="000000"/></a:dk1><a:lt1><a:sysClr val="window" lastClr="FFFFFF"/></a:lt1><a:dk2><a:srgbClr val="1F2937"/></a:dk2><a:lt2><a:srgbClr val="F9FAFB"/></a:lt2><a:accent1><a:srgbClr val="2563EB"/></a:accent1><a:accent2><a:srgbClr val="059669"/></a:accent2><a:accent3><a:srgbClr val="D97706"/></a:accent3><a:accent4><a:srgbClr val="DC2626"/></a:accent4><a:accent5><a:srgbClr val="7C3AED"/></a:accent5><a:accent6><a:srgbClr val="0891B2"/></a:accent6><a:hlink><a:srgbClr val="2563EB"/></a:hlink><a:folHlink><a:srgbClr val="7C3AED"/></a:folHlink></a:clrScheme><a:fontScheme name="Binder"><a:majorFont><a:latin typeface="Arial"/><a:ea typeface=""/><a:cs typeface=""/></a:majorFont><a:minorFont><a:latin typeface="Arial"/><a:ea typeface=""/><a:cs typeface=""/></a:minorFont></a:fontScheme><a:fmtScheme name="Binder"><a:fillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:fillStyleLst><a:lnStyleLst><a:ln w="9525" cap="flat" cmpd="sng" algn="ctr"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:prstDash val="solid"/></a:ln></a:lnStyleLst><a:effectStyleLst><a:effectStyle/></a:effectStyleLst><a:bgFillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:bgFillStyleLst></a:fmtScheme></a:themeElements><a:objectDefaults/><a:extraClrSchemeLst/></a:theme>"#.to_string(),
+    ),
+  ];
+
+  write_zip_entries(path, entries)
+}
 
 #[tauri::command]
 pub async fn build_file_tree(root_path: String, max_depth: usize) -> Result<FileTreeNode, String> {
@@ -77,12 +236,19 @@ pub async fn read_file_as_base64(path: String) -> Result<String, String> {
 
 #[tauri::command]
 pub async fn write_file(path: String, content: String) -> Result<(), String> {
-  std::fs::write(&path, content).map_err(|e| format!("写入文件失败: {}", e))
+  let path_buf = PathBuf::from(&path);
+  let workspace_root = require_workspace_root_for_path(&path_buf)?;
+  let target = PathValidator::validate_workspace_write_target(&path_buf, &workspace_root)
+    .map_err(|e| format!("写入路径非法: {}", e))?;
+  std::fs::write(&target, content).map_err(|e| format!("写入文件失败: {}", e))
 }
 
 #[tauri::command]
 pub async fn create_file(path: String, file_type: String) -> Result<(), String> {
   let path_buf = PathBuf::from(&path);
+  let workspace_root = require_workspace_root_for_path(&path_buf)?;
+  let safe_path = PathValidator::validate_workspace_write_target(&path_buf, &workspace_root)
+    .map_err(|e| format!("创建路径非法: {}", e))?;
 
   eprintln!(
     "[create_file] 开始创建文件: path={}, type={}",
@@ -90,13 +256,13 @@ pub async fn create_file(path: String, file_type: String) -> Result<(), String> 
   );
 
   // 检查文件是否已存在
-  if path_buf.exists() {
+  if safe_path.exists() {
     eprintln!("[create_file] 文件已存在: {}", path);
     return Err(format!("文件已存在: {}", path));
   }
 
   // 确保父目录存在
-  if let Some(parent) = path_buf.parent() {
+  if let Some(parent) = safe_path.parent() {
     eprintln!("[create_file] 创建父目录: {:?}", parent);
     std::fs::create_dir_all(parent).map_err(|e| {
       eprintln!("[create_file] 创建父目录失败: {}", e);
@@ -104,103 +270,66 @@ pub async fn create_file(path: String, file_type: String) -> Result<(), String> 
     })?;
   }
 
-  // 检查文件扩展名，如果是 DOCX，需要特殊处理
+  // 检查文件扩展名，Office 文件需要生成合法空白文件
   let ext = path_buf
     .extension()
     .and_then(|s| s.to_str())
     .map(|s| s.to_lowercase());
 
-  if ext.as_deref() == Some("docx") {
-    // DOCX 文件：使用 Pandoc 创建空 DOCX 文件
-    use crate::services::pandoc_service::PandocService;
-    let pandoc_service = PandocService::new();
+  match ext.as_deref() {
+    Some("docx") => create_empty_docx(&safe_path)?,
+    Some("xlsx") => create_empty_xlsx(&safe_path)?,
+    Some("pptx") => create_empty_pptx(&safe_path)?,
+    _ => {
+      let content = match file_type.as_str() {
+        "md" | "html" | "txt" => "",
+        _ => "",
+      };
 
-    if !pandoc_service.is_available() {
-      return Err("Pandoc 不可用，无法创建 DOCX 文件。请安装 Pandoc 或使用其他格式。".to_string());
+      eprintln!("[create_file] 写入文件内容: path={}", path);
+      std::fs::write(&safe_path, content).map_err(|e| {
+        eprintln!("[create_file] 写入文件失败: {}", e);
+        format!("创建文件失败: {}", e)
+      })?;
     }
-
-    // 创建空 HTML 内容
-    let empty_html = "<!DOCTYPE html>\n<html>\n<head>\n  <meta charset=\"UTF-8\">\n  <title>新文档</title>\n</head>\n<body>\n  <h1>新文档</h1>\n</body>\n</html>";
-
-    // 使用 Pandoc 转换为 DOCX
-    match pandoc_service.convert_html_to_docx(empty_html, &path_buf) {
-      Ok(_) => {
-        eprintln!("[create_file] DOCX 文件创建成功: {}", path);
-        if let Some(ws) = infer_workspace_root_from_path(&path_buf) {
-          let db = WorkspaceDb::new(&ws)?;
-          let _ = record_resource_structure_timeline_node(
-            &db,
-            &ws,
-            "create_file",
-            &format!(
-              "创建文件：{}",
-              path_buf
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or(&path)
-            ),
-            "user",
-            &[path_buf.clone()],
-          )?;
-        }
-        Ok(())
-      }
-      Err(e) => {
-        eprintln!("[create_file] DOCX 文件创建失败: {}", e);
-        Err(format!("创建 DOCX 文件失败: {}", e))
-      }
-    }
-  } else {
-    // 其他文件：直接写入文本内容
-    let content = match file_type.as_str() {
-            "md" => "# 新文档\n\n",
-            "html" => "<!DOCTYPE html>\n<html>\n<head>\n  <meta charset=\"UTF-8\">\n  <title>新文档</title>\n</head>\n<body>\n  <h1>新文档</h1>\n</body>\n</html>\n",
-            "txt" => "新文档\n\n",
-            _ => "",
-        };
-
-    eprintln!("[create_file] 写入文件内容: path={}", path);
-    std::fs::write(&path_buf, content).map_err(|e| {
-      eprintln!("[create_file] 写入文件失败: {}", e);
-      format!("创建文件失败: {}", e)
-    })?;
-
-    eprintln!("[create_file] 文件创建成功: {}", path);
-    if let Some(ws) = infer_workspace_root_from_path(&path_buf) {
-      let db = WorkspaceDb::new(&ws)?;
-      let _ = record_resource_structure_timeline_node(
-        &db,
-        &ws,
-        "create_file",
-        &format!(
-          "创建文件：{}",
-          path_buf
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(&path)
-        ),
-        "user",
-        &[path_buf.clone()],
-      )?;
-    }
-    Ok(())
   }
+
+  eprintln!("[create_file] 文件创建成功: {}", path);
+  let db = WorkspaceDb::new(&workspace_root)?;
+  let _ = record_resource_structure_timeline_node(
+    &db,
+    &workspace_root,
+    "create_file",
+    &format!(
+      "创建文件：{}",
+      safe_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&path)
+    ),
+    "user",
+    &[safe_path.clone()],
+  )?;
+  Ok(())
 }
 
 #[tauri::command]
 pub async fn create_folder(path: String) -> Result<(), String> {
   let path_buf = PathBuf::from(&path);
+  let workspace_root = require_workspace_root_for_path(&path_buf)?;
+  let safe_path = PathValidator::validate_workspace_write_target(&path_buf, &workspace_root)
+    .map_err(|e| format!("创建路径非法: {}", e))?;
 
   eprintln!("[create_folder] 开始创建文件夹: path={}", path);
 
   // 检查文件夹是否已存在
-  if path_buf.exists() {
+  if safe_path.exists() {
     eprintln!("[create_folder] 文件夹已存在: {}", path);
     return Err(format!("文件夹已存在: {}", path));
   }
 
   // 确保父目录存在
-  if let Some(parent) = path_buf.parent() {
+  if let Some(parent) = safe_path.parent() {
     eprintln!("[create_folder] 创建父目录: {:?}", parent);
     std::fs::create_dir_all(parent).map_err(|e| {
       eprintln!("[create_folder] 创建父目录失败: {}", e);
@@ -209,29 +338,27 @@ pub async fn create_folder(path: String) -> Result<(), String> {
   }
 
   eprintln!("[create_folder] 创建文件夹: path={}", path);
-  std::fs::create_dir_all(&path_buf).map_err(|e| {
+  std::fs::create_dir_all(&safe_path).map_err(|e| {
     eprintln!("[create_folder] 创建文件夹失败: {}", e);
     format!("创建文件夹失败: {}", e)
   })?;
 
   eprintln!("[create_folder] 文件夹创建成功: {}", path);
-  if let Some(ws) = infer_workspace_root_from_path(&path_buf) {
-    let db = WorkspaceDb::new(&ws)?;
-    let _ = record_resource_structure_timeline_node(
-      &db,
-      &ws,
-      "create_folder",
-      &format!(
-        "创建文件夹：{}",
-        path_buf
-          .file_name()
-          .and_then(|s| s.to_str())
-          .unwrap_or(&path)
-      ),
-      "user",
-      &[path_buf.clone()],
-    )?;
-  }
+  let db = WorkspaceDb::new(&workspace_root)?;
+  let _ = record_resource_structure_timeline_node(
+    &db,
+    &workspace_root,
+    "create_folder",
+    &format!(
+      "创建文件夹：{}",
+      safe_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&path)
+    ),
+    "user",
+    &[safe_path.clone()],
+  )?;
   Ok(())
 }
 
@@ -413,6 +540,8 @@ pub async fn move_file_to_workspace(
 ) -> Result<String, String> {
   let source = PathBuf::from(&source_path);
   let dest_dir = PathBuf::from(&workspace_path);
+  let workspace_root = PathValidator::validate_workspace_path(&dest_dir, &dest_dir)
+    .map_err(|e| format!("目标工作区非法: {}", e))?;
 
   // 检查源文件是否存在
   if !source.exists() {
@@ -431,7 +560,11 @@ pub async fn move_file_to_workspace(
     .to_string_lossy()
     .to_string();
 
-  let dest = dest_dir.join(&file_name);
+  let dest = PathValidator::validate_workspace_write_target(
+    &workspace_root.join(&file_name),
+    &workspace_root,
+  )
+  .map_err(|e| format!("目标写入路径非法: {}", e))?;
 
   // 检查目标文件是否已存在
   if dest.exists() {
@@ -452,7 +585,11 @@ pub async fn move_file_to_workspace(
       .as_secs();
 
     let new_name = format!("{}_{}{}", stem, timestamp, ext);
-    let dest = dest_dir.join(&new_name);
+    let dest = PathValidator::validate_workspace_write_target(
+      &workspace_root.join(&new_name),
+      &workspace_root,
+    )
+    .map_err(|e| format!("目标写入路径非法: {}", e))?;
 
     // 复制文件（跨分区时）
     std::fs::copy(&source, &dest).map_err(|e| format!("复制文件失败: {}", e))?;
@@ -479,54 +616,57 @@ pub async fn move_file_to_workspace(
 #[tauri::command]
 pub async fn rename_file(path: String, new_name: String) -> Result<(), String> {
   let source = PathBuf::from(&path);
-  let workspace_root = infer_workspace_root_from_path(&source);
+  let workspace_root = require_workspace_root_for_path(&source)?;
+  let safe_source = PathValidator::validate_workspace_path(&source, &workspace_root)
+    .map_err(|e| format!("源路径非法: {}", e))?;
   let is_dir_rename = source.is_dir();
-  let parent = source
+  let parent = safe_source
     .parent()
     .ok_or_else(|| format!("无法获取父目录: {}", path))?;
   let dest = parent.join(&new_name);
+  let safe_dest = PathValidator::validate_workspace_write_target(&dest, &workspace_root)
+    .map_err(|e| format!("目标路径非法: {}", e))?;
 
-  if dest.exists() {
+  if safe_dest.exists() {
     return Err(format!("文件已存在: {}", new_name));
   }
 
-  std::fs::rename(&source, &dest).map_err(|e| format!("重命名失败: {}", e))?;
+  std::fs::rename(&safe_source, &safe_dest).map_err(|e| format!("重命名失败: {}", e))?;
 
-  if let Some(ws) = &workspace_root {
-    let db = WorkspaceDb::new(ws)?;
-    let _ = record_resource_structure_timeline_node(
-      &db,
-      ws,
-      "rename_file",
-      &format!(
-        "重命名资源：{} -> {}",
-        source.file_name().and_then(|s| s.to_str()).unwrap_or(&path),
-        new_name
-      ),
-      "user",
-      &[source.clone(), dest.clone()],
-    )?;
-  }
+  let db = WorkspaceDb::new(&workspace_root)?;
+  let _ = record_resource_structure_timeline_node(
+    &db,
+    &workspace_root,
+    "rename_file",
+    &format!(
+      "重命名资源：{} -> {}",
+      safe_source
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&path),
+      new_name
+    ),
+    "user",
+    &[safe_source.clone(), safe_dest.clone()],
+  )?;
 
-  if let Some(ws) = workspace_root {
-    match crate::services::memory_service::MemoryService::new(&ws) {
-      Ok(svc) => {
-        if let Err(e) = svc
-          .rebind_content_memories_for_path(
-            &source.to_string_lossy(),
-            &dest.to_string_lossy(),
-            is_dir_rename,
-          )
-          .await
-        {
-          eprintln!(
-            "[memory] rename_file: rebind content memories failed: {:?}",
-            e
-          );
-        }
+  match crate::services::memory_service::MemoryService::new(&workspace_root) {
+    Ok(svc) => {
+      if let Err(e) = svc
+        .rebind_content_memories_for_path(
+          &safe_source.to_string_lossy(),
+          &safe_dest.to_string_lossy(),
+          is_dir_rename,
+        )
+        .await
+      {
+        eprintln!(
+          "[memory] rename_file: rebind content memories failed: {:?}",
+          e
+        );
       }
-      Err(e) => eprintln!("[memory] rename_file: MemoryService init failed: {}", e),
     }
+    Err(e) => eprintln!("[memory] rename_file: MemoryService init failed: {}", e),
   }
 
   Ok(())
@@ -536,52 +676,50 @@ pub async fn rename_file(path: String, new_name: String) -> Result<(), String> {
 #[tauri::command]
 pub async fn delete_file(path: String) -> Result<(), String> {
   let path_buf = PathBuf::from(&path);
-  let workspace_root = infer_workspace_root_from_path(&path_buf);
+  let workspace_root = require_workspace_root_for_path(&path_buf)?;
+  let safe_path = PathValidator::validate_workspace_path(&path_buf, &workspace_root)
+    .map_err(|e| format!("删除路径非法: {}", e))?;
   let is_dir_delete = path_buf.is_dir();
 
-  if !path_buf.exists() {
+  if !safe_path.exists() {
     return Err(format!("文件不存在: {}", path));
   }
 
-  if path_buf.is_dir() {
-    std::fs::remove_dir_all(&path_buf).map_err(|e| format!("删除文件夹失败: {}", e))?;
+  if safe_path.is_dir() {
+    std::fs::remove_dir_all(&safe_path).map_err(|e| format!("删除文件夹失败: {}", e))?;
   } else {
-    std::fs::remove_file(&path_buf).map_err(|e| format!("删除文件失败: {}", e))?;
+    std::fs::remove_file(&safe_path).map_err(|e| format!("删除文件失败: {}", e))?;
   }
 
-  if let Some(ws) = &workspace_root {
-    let db = WorkspaceDb::new(ws)?;
-    let _ = record_resource_structure_timeline_node(
-      &db,
-      ws,
-      "delete_file",
-      &format!(
-        "删除资源：{}",
-        path_buf
-          .file_name()
-          .and_then(|s| s.to_str())
-          .unwrap_or(&path)
-      ),
-      "user",
-      &[path_buf.clone()],
-    )?;
-  }
+  let db = WorkspaceDb::new(&workspace_root)?;
+  let _ = record_resource_structure_timeline_node(
+    &db,
+    &workspace_root,
+    "delete_file",
+    &format!(
+      "删除资源：{}",
+      safe_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&path)
+    ),
+    "user",
+    &[safe_path.clone()],
+  )?;
 
-  if let Some(ws) = workspace_root {
-    match crate::services::memory_service::MemoryService::new(&ws) {
-      Ok(svc) => {
-        if let Err(e) = svc
-          .expire_content_memories_for_path(&path_buf.to_string_lossy(), is_dir_delete)
-          .await
-        {
-          eprintln!(
-            "[memory] delete_file: expire content memories failed: {:?}",
-            e
-          );
-        }
+  match crate::services::memory_service::MemoryService::new(&workspace_root) {
+    Ok(svc) => {
+      if let Err(e) = svc
+        .expire_content_memories_for_path(&safe_path.to_string_lossy(), is_dir_delete)
+        .await
+      {
+        eprintln!(
+          "[memory] delete_file: expire content memories failed: {:?}",
+          e
+        );
       }
-      Err(e) => eprintln!("[memory] delete_file: MemoryService init failed: {}", e),
     }
+    Err(e) => eprintln!("[memory] delete_file: MemoryService init failed: {}", e),
   }
 
   Ok(())
@@ -605,28 +743,40 @@ fn infer_workspace_root_from_path(path: &Path) -> Option<PathBuf> {
   None
 }
 
+fn require_workspace_root_for_path(path: &Path) -> Result<PathBuf, String> {
+  infer_workspace_root_from_path(path).ok_or_else(|| {
+    format!(
+      "无法识别工作区根目录，拒绝工作区外写入: {}",
+      path.to_string_lossy()
+    )
+  })
+}
+
 // ⚠️ Week 18.2：复制文件
 #[tauri::command]
 pub async fn duplicate_file(path: String) -> Result<String, String> {
   let source = PathBuf::from(&path);
+  let workspace_root = require_workspace_root_for_path(&source)?;
+  let safe_source = PathValidator::validate_workspace_path(&source, &workspace_root)
+    .map_err(|e| format!("复制路径非法: {}", e))?;
 
-  if !source.exists() {
+  if !safe_source.exists() {
     return Err(format!("文件不存在: {}", path));
   }
 
-  if source.is_dir() {
+  if safe_source.is_dir() {
     return Err("暂不支持复制文件夹".to_string());
   }
 
-  let parent = source
+  let parent = safe_source
     .parent()
     .ok_or_else(|| format!("无法获取父目录: {}", path))?;
 
-  let file_stem = source
+  let file_stem = safe_source
     .file_stem()
     .and_then(|s| s.to_str())
     .unwrap_or("file");
-  let extension = source
+  let extension = safe_source
     .extension()
     .and_then(|e| e.to_str())
     .map(|e| format!(".{}", e))
@@ -643,26 +793,29 @@ pub async fn duplicate_file(path: String) -> Result<String, String> {
     dest = parent.join(&copy_name);
     counter += 1;
   }
+  let safe_dest = PathValidator::validate_workspace_write_target(&dest, &workspace_root)
+    .map_err(|e| format!("复制目标路径非法: {}", e))?;
 
-  std::fs::copy(&source, &dest).map_err(|e| format!("复制文件失败: {}", e))?;
+  std::fs::copy(&safe_source, &safe_dest).map_err(|e| format!("复制文件失败: {}", e))?;
 
-  if let Some(ws) = infer_workspace_root_from_path(&source) {
-    let db = WorkspaceDb::new(&ws)?;
-    let _ = record_resource_structure_timeline_node(
-      &db,
-      &ws,
-      "duplicate_file",
-      &format!(
-        "复制文件：{} -> {}",
-        source.file_name().and_then(|s| s.to_str()).unwrap_or(&path),
-        dest.file_name().and_then(|s| s.to_str()).unwrap_or("")
-      ),
-      "user",
-      &[source.clone(), dest.clone()],
-    )?;
-  }
+  let db = WorkspaceDb::new(&workspace_root)?;
+  let _ = record_resource_structure_timeline_node(
+    &db,
+    &workspace_root,
+    "duplicate_file",
+    &format!(
+      "复制文件：{} -> {}",
+      safe_source
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&path),
+      safe_dest.file_name().and_then(|s| s.to_str()).unwrap_or("")
+    ),
+    "user",
+    &[safe_source.clone(), safe_dest.clone()],
+  )?;
 
-  Ok(dest.to_string_lossy().to_string())
+  Ok(safe_dest.to_string_lossy().to_string())
 }
 
 // 工作区内移动文件或文件夹
@@ -675,8 +828,7 @@ pub async fn move_file(
 ) -> Result<(), String> {
   let source = PathBuf::from(&source_path);
   let dest = PathBuf::from(&destination_path);
-  let is_dir_move = source.is_dir();
-  let memory_workspace_root = workspace_path
+  let workspace_root = workspace_path
     .as_ref()
     .and_then(|ws| {
       if ws.trim().is_empty() {
@@ -685,99 +837,101 @@ pub async fn move_file(
         Some(PathBuf::from(ws))
       }
     })
-    .or_else(|| infer_workspace_root_from_path(&source));
+    .or_else(|| infer_workspace_root_from_path(&source))
+    .ok_or_else(|| "无法识别工作区根目录，拒绝工作区外移动".to_string())?;
+  let safe_source = PathValidator::validate_workspace_path(&source, &workspace_root)
+    .map_err(|e| format!("源路径非法: {}", e))?;
+  let safe_dest = PathValidator::validate_workspace_write_target(&dest, &workspace_root)
+    .map_err(|e| format!("目标路径非法: {}", e))?;
+  let is_dir_move = safe_source.is_dir();
 
   // 检查源文件是否存在
-  if !source.exists() {
+  if !safe_source.exists() {
     return Err(format!("源文件不存在: {}", source_path));
   }
 
   // 检查目标文件是否已存在
-  if dest.exists() {
+  if safe_dest.exists() {
     return Err(format!("目标文件已存在: {}", destination_path));
   }
 
   // 检查是否尝试移动到自己的子目录
-  if dest.starts_with(&source) {
+  if safe_dest.starts_with(&safe_source) {
     return Err("不能将文件移动到自己的子目录中".to_string());
   }
 
   // 创建目标目录的父目录（如果不存在）
-  if let Some(parent) = dest.parent() {
+  if let Some(parent) = safe_dest.parent() {
     std::fs::create_dir_all(parent).map_err(|e| format!("创建目标目录失败: {}", e))?;
   }
 
   // 移动文件或文件夹
-  if source.is_dir() {
+  if safe_source.is_dir() {
     // 移动文件夹
-    match std::fs::rename(&source, &dest) {
+    match std::fs::rename(&safe_source, &safe_dest) {
       Ok(_) => {}
       Err(_) => {
         // 如果 rename 失败（可能是跨分区），尝试复制后删除
-        copy_dir_all(&source, &dest).map_err(|e| format!("移动文件夹失败: {}", e))?;
-        std::fs::remove_dir_all(&source).map_err(|e| format!("删除源文件夹失败: {}", e))?;
+        copy_dir_all(&safe_source, &safe_dest).map_err(|e| format!("移动文件夹失败: {}", e))?;
+        std::fs::remove_dir_all(&safe_source).map_err(|e| format!("删除源文件夹失败: {}", e))?;
       }
     }
   } else {
     // 移动文件
-    match std::fs::rename(&source, &dest) {
+    match std::fs::rename(&safe_source, &safe_dest) {
       Ok(_) => {}
       Err(_) => {
         // 如果 rename 失败（可能是跨分区），尝试复制后删除
-        std::fs::copy(&source, &dest).map_err(|e| format!("复制文件失败: {}", e))?;
-        std::fs::remove_file(&source).map_err(|e| format!("删除源文件失败: {}", e))?;
+        std::fs::copy(&safe_source, &safe_dest).map_err(|e| format!("复制文件失败: {}", e))?;
+        std::fs::remove_file(&safe_source).map_err(|e| format!("删除源文件失败: {}", e))?;
       }
     }
   }
 
-  if let Some(ws) = &memory_workspace_root {
-    match crate::services::memory_service::MemoryService::new(ws) {
-      Ok(svc) => {
-        if let Err(e) = svc
-          .rebind_content_memories_for_path(
-            &source.to_string_lossy(),
-            &dest.to_string_lossy(),
-            is_dir_move,
-          )
-          .await
-        {
-          eprintln!(
-            "[memory] move_file: rebind content memories failed: {:?}",
-            e
-          );
-        }
+  match crate::services::memory_service::MemoryService::new(&workspace_root) {
+    Ok(svc) => {
+      if let Err(e) = svc
+        .rebind_content_memories_for_path(
+          &safe_source.to_string_lossy(),
+          &safe_dest.to_string_lossy(),
+          is_dir_move,
+        )
+        .await
+      {
+        eprintln!(
+          "[memory] move_file: rebind content memories failed: {:?}",
+          e
+        );
       }
-      Err(e) => eprintln!("[memory] move_file: MemoryService init failed: {}", e),
     }
+    Err(e) => eprintln!("[memory] move_file: MemoryService init failed: {}", e),
   }
 
   // 触发文件树变化事件
   if let Some(ws_path) = workspace_path {
     let _ = app.emit("file-tree-changed", ws_path);
-  } else if let Some(parent) = source.parent() {
+  } else if let Some(parent) = safe_source.parent() {
     // 如果没有提供工作区路径，尝试从源路径推断（使用父目录作为工作区）
     let workspace_str = parent.to_string_lossy().to_string();
     let _ = app.emit("file-tree-changed", workspace_str);
   }
 
-  if let Some(ws) = memory_workspace_root {
-    let db = WorkspaceDb::new(&ws)?;
-    let _ = record_resource_structure_timeline_node(
-      &db,
-      &ws,
-      "move_file",
-      &format!(
-        "移动资源：{} -> {}",
-        source
-          .file_name()
-          .and_then(|s| s.to_str())
-          .unwrap_or(&source_path),
-        dest.to_string_lossy()
-      ),
-      "user",
-      &[source.clone(), dest.clone()],
-    )?;
-  }
+  let db = WorkspaceDb::new(&workspace_root)?;
+  let _ = record_resource_structure_timeline_node(
+    &db,
+    &workspace_root,
+    "move_file",
+    &format!(
+      "移动资源：{} -> {}",
+      safe_source
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&source_path),
+      safe_dest.to_string_lossy()
+    ),
+    "user",
+    &[safe_source.clone(), safe_dest.clone()],
+  )?;
 
   Ok(())
 }
@@ -1681,6 +1835,12 @@ pub async fn preview_excel_as_pdf(path: String, app: AppHandle) -> Result<String
   if !excel_path.exists() {
     return Err(format!("文件不存在: {}", path));
   }
+  if std::fs::metadata(&excel_path)
+    .map(|meta| meta.len() == 0)
+    .unwrap_or(false)
+  {
+    return Err("Excel 文件为空，可能是旧版本创建的无效空白文件，请重新创建该文件。".to_string());
+  }
 
   eprintln!("🔍 [preview_excel_as_pdf] 开始预览: {:?}", excel_path);
 
@@ -1831,6 +1991,12 @@ pub async fn preview_presentation_as_pdf(path: String, app: AppHandle) -> Result
   // 检查文件是否存在
   if !presentation_path.exists() {
     return Err(format!("文件不存在: {}", path));
+  }
+  if std::fs::metadata(&presentation_path)
+    .map(|meta| meta.len() == 0)
+    .unwrap_or(false)
+  {
+    return Err("演示文稿文件为空，可能是旧版本创建的无效空白文件，请重新创建该文件。".to_string());
   }
 
   // 规范化路径（与 preview_docx_as_pdf 共用 PREVIEW_REQUESTS，按路径去重，避免同一文件并发转换导致 temp 争用与字体不一致）
@@ -2369,7 +2535,7 @@ pub async fn remove_binder_file_record(file_path: String) -> Result<(), String> 
 
 #[cfg(test)]
 mod tests {
-  use super::{delete_file, rename_file};
+  use super::{create_empty_pptx, create_empty_xlsx, delete_file, rename_file};
   use crate::services::memory_service::{
     MemoryItemInput, MemoryLayer, MemoryScopeType, MemorySearchScope, MemoryService,
     MemorySourceKind, SearchMemoriesParams,
@@ -2455,6 +2621,61 @@ mod tests {
       .expect("execute source ref query")
       .map(|row| row.expect("row"))
       .collect()
+  }
+
+  fn zip_contains_entries(path: &Path, required_entries: &[&str]) {
+    let file = std::fs::File::open(path).expect("open zip file");
+    let mut archive = zip::ZipArchive::new(file).expect("read zip archive");
+    for entry in required_entries {
+      archive
+        .by_name(entry)
+        .unwrap_or_else(|_| panic!("missing zip entry: {}", entry));
+    }
+  }
+
+  #[test]
+  fn create_empty_xlsx_writes_valid_workbook_package() {
+    let workspace = TestWorkspace::new("empty-xlsx");
+    let file_path = workspace.path().join("blank.xlsx");
+
+    create_empty_xlsx(&file_path).expect("create empty xlsx");
+
+    let metadata = std::fs::metadata(&file_path).expect("xlsx metadata");
+    assert!(metadata.len() > 0, "xlsx should not be zero-byte");
+    zip_contains_entries(
+      &file_path,
+      &[
+        "[Content_Types].xml",
+        "_rels/.rels",
+        "docProps/core.xml",
+        "xl/workbook.xml",
+        "xl/worksheets/sheet1.xml",
+      ],
+    );
+  }
+
+  #[test]
+  fn create_empty_pptx_writes_valid_presentation_package() {
+    let workspace = TestWorkspace::new("empty-pptx");
+    let file_path = workspace.path().join("blank.pptx");
+
+    create_empty_pptx(&file_path).expect("create empty pptx");
+
+    let metadata = std::fs::metadata(&file_path).expect("pptx metadata");
+    assert!(metadata.len() > 0, "pptx should not be zero-byte");
+    zip_contains_entries(
+      &file_path,
+      &[
+        "[Content_Types].xml",
+        "_rels/.rels",
+        "docProps/core.xml",
+        "ppt/presentation.xml",
+        "ppt/slides/slide1.xml",
+        "ppt/slideLayouts/slideLayout1.xml",
+        "ppt/slideMasters/slideMaster1.xml",
+        "ppt/theme/theme1.xml",
+      ],
+    );
   }
 
   #[tokio::test]

@@ -1,16 +1,36 @@
 use crate::services::tool_service::{ToolCall, ToolResult, ToolService};
 use std::path::PathBuf;
-use tauri::State;
+use tauri::{AppHandle, Emitter};
+
+fn should_emit_file_tree_refresh(tool_call: &ToolCall, result: &ToolResult) -> bool {
+  let awaiting_confirmation = result
+    .meta
+    .as_ref()
+    .and_then(|meta| meta.gate.as_ref())
+    .and_then(|gate| gate.status.as_deref())
+    == Some("awaiting_confirmation");
+  result.success
+    && !awaiting_confirmation
+    && matches!(
+      tool_call.name.as_str(),
+      "create_file" | "create_folder" | "delete_file" | "rename_file" | "move_file" | "update_file"
+    )
+}
 
 #[tauri::command]
 pub async fn execute_tool(
   tool_call: ToolCall,
   workspace_path: String,
+  app: AppHandle,
 ) -> Result<ToolResult, String> {
   let service = ToolService::new();
   let ws_path = PathBuf::from(workspace_path);
 
-  service.execute_tool(&tool_call, &ws_path).await
+  let result = service.execute_tool(&tool_call, &ws_path).await?;
+  if should_emit_file_tree_refresh(&tool_call, &result) {
+    let _ = app.emit("file-tree-changed", ws_path.to_string_lossy().to_string());
+  }
+  Ok(result)
 }
 
 #[tauri::command]
@@ -18,6 +38,7 @@ pub async fn execute_tool_with_retry(
   tool_call: ToolCall,
   workspace_path: String,
   max_retries: Option<u32>,
+  app: AppHandle,
 ) -> Result<ToolResult, String> {
   let service = ToolService::new();
   let ws_path = PathBuf::from(workspace_path);
@@ -28,6 +49,9 @@ pub async fn execute_tool_with_retry(
   for attempt in 0..=max_retries {
     match service.execute_tool(&tool_call, &ws_path).await {
       Ok(result) => {
+        if should_emit_file_tree_refresh(&tool_call, &result) {
+          let _ = app.emit("file-tree-changed", ws_path.to_string_lossy().to_string());
+        }
         if result.success {
           return Ok(result);
         }

@@ -557,6 +557,24 @@ impl WorkspaceDb {
     for row in rows {
       result.push(row.map_err(|e| format!("row 失败: {}", e))?);
     }
+
+    {
+      let diffs_summary: Vec<_> = result.iter().map(|d| {
+        let orig_preview: String = d.original_text.chars().take(60).collect();
+        let new_preview: String = d.new_text.chars().take(60).collect();
+        format!(
+          "{{\"id\":{},\"file_path\":{:?},\"diff_index\":{},\"para_index\":{},\"diff_type\":{:?},\"original_text\":{:?},\"new_text\":{:?}}}",
+          d.id, d.file_path, d.diff_index, d.para_index, d.diff_type, orig_preview, new_preview
+        )
+      }).collect();
+      eprintln!(
+        "[CROSS_FILE_TRACE][DB] {{\"op\":\"get_pending_diffs\",\"queried_file_path\":{:?},\"returned_count\":{},\"records\":[{}]}}",
+        file_path,
+        result.len(),
+        diffs_summary.join(","),
+      );
+    }
+
     Ok(result)
   }
 
@@ -570,6 +588,24 @@ impl WorkspaceDb {
       )
       .map_err(|e| format!("delete pending_diffs 失败: {}", e))?;
     Ok(n)
+  }
+
+  pub fn delete_pending_diffs_for_paths(&self, file_paths: &[String]) -> Result<usize, String> {
+    if file_paths.is_empty() {
+      return Ok(0);
+    }
+
+    let conn = self.conn.lock().map_err(|e| format!("锁失败: {}", e))?;
+    let mut deleted = 0usize;
+    for file_path in file_paths {
+      deleted += conn
+        .execute(
+          "DELETE FROM pending_diffs WHERE file_path = ?1 AND status = 'pending'",
+          params![file_path],
+        )
+        .map_err(|e| format!("批量删除 pending_diffs 失败: {}", e))?;
+    }
+    Ok(deleted)
   }
 
   /// 获取 workspace 下所有有 pending diff 的文件路径
@@ -1311,6 +1347,22 @@ impl WorkspaceDb {
       result.push(row.map_err(|e| format!("row 失败: {}", e))?);
     }
     Ok(result)
+  }
+
+  pub fn invalidate_active_agent_tasks(&self, reason: &str) -> Result<usize, String> {
+    let conn = self.conn.lock().map_err(|e| format!("锁失败: {}", e))?;
+    let now = chrono::Utc::now().timestamp_millis();
+    conn
+      .execute(
+        "UPDATE agent_tasks
+             SET lifecycle = 'invalidated',
+                 stage = 'invalidated',
+                 stage_reason = ?1,
+                 updated_at = ?2
+           WHERE lifecycle = 'active'",
+        params![reason, now],
+      )
+      .map_err(|e| format!("invalidate_active_agent_tasks 失败: {}", e))
   }
 
   // ── agent_artifacts CRUD ──

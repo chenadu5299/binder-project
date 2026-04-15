@@ -44,11 +44,11 @@ export interface TextReference extends BaseReference {
     preview?: string;          // 预览文本（前 100 字符，用于显示）
     sourceFile: string;        // 来源文件路径（必需）
     fileName: string;          // 文件名（用于显示）
-    lineRange: {               // 行号范围（必需）
+    lineRange?: {              // 行号范围（可选；精确引用场景可省略）
         start: number;
         end: number;
     };
-    charRange: {               // 字符范围（必需）
+    charRange?: {              // 字符范围（可选；精确引用场景可省略）
         start: number;
         end: number;
     };

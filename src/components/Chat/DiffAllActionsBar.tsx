@@ -13,19 +13,7 @@ import { useEditorStore } from '../../stores/editorStore';
 import { useFileStore } from '../../stores/fileStore';
 import { useChatStore } from '../../stores/chatStore';
 import { toast } from '../Common/Toast';
-import { markAgentStageComplete, markAgentUserConfirmed } from '../../utils/agentShadowLifecycle';
-
-function completeAgentPairs(pairs: Array<{ chatTabId?: string; agentTaskId?: string }>, reason: string) {
-  const seen = new Set<string>();
-  for (const pair of pairs) {
-    if (!pair.chatTabId || !pair.agentTaskId) continue;
-    const key = `${pair.chatTabId}:${pair.agentTaskId}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    markAgentUserConfirmed(pair.chatTabId, pair.agentTaskId, 'bulk_accept_confirmed');
-    markAgentStageComplete(pair.chatTabId, pair.agentTaskId, reason);
-  }
-}
+import { DiffActionService } from '../../services/DiffActionService';
 
 const SCOPE_LABELS: Record<DiffBulkScope, string> = {
   current_chat_tab: '本对话',
@@ -38,10 +26,6 @@ export const DiffAllActionsBar: React.FC = () => {
   const byTab = useDiffStore((s) => s.byTab);
   const byFilePath = useDiffStore((s) => s.byFilePath);
   const getPendingForBulk = useDiffStore((s) => s.getPendingForBulk);
-  const acceptAllByDiffIds = useDiffStore((s) => s.acceptAllByDiffIds);
-  const rejectAll = useDiffStore((s) => s.rejectAll);
-  const acceptFileDiffs = useDiffStore((s) => s.acceptFileDiffs);
-  const rejectFileDiffs = useDiffStore((s) => s.rejectFileDiffs);
   const updateTabContent = useEditorStore((s) => s.updateTabContent);
   const editorTabs = useEditorStore((s) => s.tabs);
   const editorActiveTabId = useEditorStore((s) => s.activeTabId);
@@ -108,6 +92,39 @@ export const DiffAllActionsBar: React.FC = () => {
 
   const handleAcceptAll = async () => {
     if (scope === 'global' && !confirmGlobal('accept')) return;
+    {
+      const storeState = useDiffStore.getState();
+      console.log('[CROSS_FILE_TRACE][ACCEPT_ALL]', JSON.stringify({
+        op: 'handleAcceptAll:start',
+        scope,
+        byTab: Object.fromEntries(
+          Object.entries(storeState.byTab).map(([fp, tab]) => [
+            fp,
+            [...(tab?.diffs.values() ?? [])].filter((e) => e.status === 'pending').map((e) => ({
+              diffId: e.diffId,
+              status: e.status,
+              agentTaskId: e.agentTaskId,
+              chatTabId: e.chatTabId,
+              toolCallId: e.toolCallId,
+              originalText: e.originalText?.slice(0, 60),
+              newText: e.newText?.slice(0, 60),
+            })),
+          ])
+        ),
+        byFilePath: Object.fromEntries(
+          Object.entries(storeState.byFilePath).map(([fp, diffs]) => [
+            fp,
+            diffs.map((d) => ({
+              diff_index: d.diff_index,
+              agentTaskId: d.agentTaskId,
+              chatTabId: d.chatTabId,
+              originalText: d.original_text?.slice(0, 60),
+              newText: d.new_text?.slice(0, 60),
+            })),
+          ])
+        ),
+      }));
+    }
     try {
       let applied = 0;
       let expired = 0;
@@ -122,22 +139,22 @@ export const DiffAllActionsBar: React.FC = () => {
         }
         // 关键：同文件同次批量必须一次事务执行，不能按 toolCallId 分批执行。
         const scopedDiffIds = [...new Set(entries.map((e) => e.diffId).filter(Boolean))];
-        const result = await acceptAllByDiffIds(
+        // 取首个有效的 chatTabId/agentTaskId 作为代表（同批 diff 通常属同一 task）
+        const rep = entries.find((e) => e.chatTabId && e.agentTaskId);
+        const result = await DiffActionService.acceptAll(
           tabFp,
           tab.editor,
           scopedDiffIds,
-          tab.documentRevision ?? 1
+          {
+            tabDocumentRevision: tab.documentRevision ?? 1,
+            chatTabId: rep?.chatTabId,
+            agentTaskId: rep?.agentTaskId,
+          },
         );
         applied += result.applied;
         expired += result.expired;
         if (result.anyApplied) refreshFilePaths.add(tabFp);
         updateTabContent(tab.id, tab.editor.getHTML());
-        if (result.anyApplied) {
-          completeAgentPairs(entries.map((entry) => ({
-            chatTabId: entry.chatTabId,
-            agentTaskId: entry.agentTaskId,
-          })), 'editor_revision_advanced');
-        }
         tab.editor.view.dispatch(tab.editor.state.tr);
       }
       // 所有文件批量处理完成后统一刷新一次，避免中途刷新导致后续同轮批量误判。
@@ -152,12 +169,13 @@ export const DiffAllActionsBar: React.FC = () => {
           continue;
         }
         const indices = entries.map((e) => e.diff_index);
-        await acceptFileDiffs(filePath, currentWorkspace, indices);
+        const rep = entries.find((e) => e.chatTabId && e.agentTaskId);
+        await DiffActionService.acceptFileDiffs(filePath, currentWorkspace, {
+          chatTabId: rep?.chatTabId,
+          agentTaskId: rep?.agentTaskId,
+          diffIndices: indices,
+        });
         applied += entries.length;
-        completeAgentPairs(entries.map((entry) => ({
-          chatTabId: entry.chatTabId,
-          agentTaskId: entry.agentTaskId,
-        })), 'workspace_file_written');
       }
       if (skippedFiles > 0) {
         toast.info(
@@ -186,11 +204,11 @@ export const DiffAllActionsBar: React.FC = () => {
       let skippedFiles = 0;
       for (const { filePath: tabFp, entries } of pending.byTab) {
         const tab = editorTabs.find((t) => t.filePath === tabFp);
-        const toolCallIds = [
-          ...new Set(entries.map((e) => e.toolCallId).filter((id): id is string => !!id)),
-        ];
-        for (const tcId of toolCallIds) {
-          rejectAll(tabFp, tcId);
+        for (const entry of entries) {
+          DiffActionService.rejectDiff(tabFp, entry.diffId, {
+            chatTabId: entry.chatTabId,
+            agentTaskId: entry.agentTaskId,
+          });
         }
         if (tab?.editor) {
           tab.editor.view.dispatch(tab.editor.state.tr);
@@ -202,7 +220,11 @@ export const DiffAllActionsBar: React.FC = () => {
           skippedFiles++;
           continue;
         }
-        await rejectFileDiffs(filePath, currentWorkspace);
+        const rep = entries.find((e) => e.chatTabId && e.agentTaskId);
+        await DiffActionService.rejectFileDiffs(filePath, currentWorkspace, {
+          chatTabId: rep?.chatTabId,
+          agentTaskId: rep?.agentTaskId,
+        });
       }
       if (skippedFiles > 0) {
         toast.info(

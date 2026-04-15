@@ -60,8 +60,8 @@
 7. [A-AST-M-T-09_Binder知识库结构型资产技术承接文档.md](/Users/chenzhenqiang/Desktop/test/binder-project/docs/A-AST-M-T-09_Binder知识库结构型资产技术承接文档.md)
 8. [A-AST-M-D-02_Binder Agent知识库协同主控文档.md](/Users/chenzhenqiang/Desktop/test/binder-project/docs/A-AST-M-D-02_Binder%20Agent知识库协同主控文档.md)
 9. [A-AST-M-D-03_Binder知识库模块描述文档.md](/Users/chenzhenqiang/Desktop/test/binder-project/docs/A-AST-M-D-03_Binder知识库模块描述文档.md)
-10. [R-BLD-I-P-02_构建模式与模板库接口.md](/Users/chenzhenqiang/Desktop/test/binder-project/docs/R-BLD-I-P-02_构建模式与模板库接口.md)
-11. [R-BLD-M-D-01_构建模式主控设计文档.md](/Users/chenzhenqiang/Desktop/test/binder-project/docs/R-BLD-M-D-01_构建模式主控设计文档.md)
+10. 旧 `R-BLD-*` 文档（已清理出仓库，仅可通过 Git 历史追溯）
+11. `A-CBT-I-T-02_Chat Build执行链与运行控制.md`
 12. [A-WS-M-D-01_workspace工作台协同主控文档.md](/Users/chenzhenqiang/Desktop/test/binder-project/docs/A-WS-M-D-01_workspace工作台协同主控文档.md)
 13. [A-AG-M-D-01_Binder Agent能力描述文档.md](/Users/chenzhenqiang/Desktop/test/binder-project/docs/A-AG-M-D-01_Binder%20Agent能力描述文档.md)
 
@@ -111,7 +111,7 @@
 
 1. [A-AG-M-T-05_文档生成流程.md#L102](/Users/chenzhenqiang/Desktop/test/binder-project/docs/A-AG-M-T-05_文档生成流程.md#L102) 明确：工作流模板作为过程约束输入，不作为最终内容替代。
 2. [A-AST-M-P-01_上下文注入.md#L44](/Users/chenzhenqiang/Desktop/test/binder-project/docs/A-AST-M-P-01_上下文注入.md#L44) 与 [A-AST-M-P-01_上下文注入.md#L70](/Users/chenzhenqiang/Desktop/test/binder-project/docs/A-AST-M-P-01_上下文注入.md#L70) 明确：已选模板资产是工作流模板，并以过程约束层进入上下文。
-3. [R-BLD-I-P-02_构建模式与模板库接口.md#L31](/Users/chenzhenqiang/Desktop/test/binder-project/docs/R-BLD-I-P-02_构建模式与模板库接口.md#L31) 与 [R-BLD-I-P-02_构建模式与模板库接口.md#L49](/Users/chenzhenqiang/Desktop/test/binder-project/docs/R-BLD-I-P-02_构建模式与模板库接口.md#L49) 明确：构建模式引用模板库资源，是为了在 Build Outline 阶段提供 SOP 与过程约束。
+3. 当前 `A-CBT-I-T-02_Chat Build执行链与运行控制.md` 已明确：Chat Build 引用模板资源，是为了在大纲生成与正式构建前提供过程约束输入。
 
 因此，工作流模板当前不是独立执行器，而是：
 
@@ -1633,8 +1633,8 @@ MVP 不应做到：
 7. [A-AST-M-T-09_Binder知识库结构型资产技术承接文档.md](/Users/chenzhenqiang/Desktop/test/binder-project/docs/A-AST-M-T-09_Binder知识库结构型资产技术承接文档.md)
 8. [A-AST-M-D-02_Binder Agent知识库协同主控文档.md](/Users/chenzhenqiang/Desktop/test/binder-project/docs/A-AST-M-D-02_Binder%20Agent知识库协同主控文档.md)
 9. [A-AST-M-D-03_Binder知识库模块描述文档.md](/Users/chenzhenqiang/Desktop/test/binder-project/docs/A-AST-M-D-03_Binder知识库模块描述文档.md)
-10. [R-BLD-I-P-02_构建模式与模板库接口.md](/Users/chenzhenqiang/Desktop/test/binder-project/docs/R-BLD-I-P-02_构建模式与模板库接口.md)
-11. [R-BLD-M-D-01_构建模式主控设计文档.md](/Users/chenzhenqiang/Desktop/test/binder-project/docs/R-BLD-M-D-01_构建模式主控设计文档.md)
+10. 旧 `R-BLD-*` 文档（已清理出仓库，仅可通过 Git 历史追溯）
+11. `A-CBT-I-T-02_Chat Build执行链与运行控制.md`
 12. [A-WS-M-D-01_workspace工作台协同主控文档.md](/Users/chenzhenqiang/Desktop/test/binder-project/docs/A-WS-M-D-01_workspace工作台协同主控文档.md)
 13. [A-AG-M-D-01_Binder Agent能力描述文档.md](/Users/chenzhenqiang/Desktop/test/binder-project/docs/A-AG-M-D-01_Binder%20Agent能力描述文档.md)
 

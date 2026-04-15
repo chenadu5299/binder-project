@@ -3,6 +3,7 @@
 //! open_file_with_cache、open_docx_with_cache、ai_edit_file_with_diff、accept_file_diffs、reject_file_diffs
 
 use crate::commands::file_commands::{open_docx_for_edit, read_file_content};
+use crate::utils::path_validator::PathValidator;
 use crate::workspace::canonical_html::{
   canonical_html_for_workspace_cache, inject_blockids_for_plain_text, inspect_block_id_map,
   materialize_cached_body_if_stale_hash, should_inject_block_ids_for_plain_text,
@@ -453,9 +454,29 @@ pub async fn accept_file_diffs(
   diff_indices: Option<Vec<i32>>,
 ) -> Result<(), String> {
   let db = WorkspaceDb::new(Path::new(&workspace_path))?;
-  let full_path = Path::new(&workspace_path).join(&file_path);
+  let full_path =
+    PathValidator::resolve_workspace_relative_path(Path::new(&workspace_path), &file_path)
+      .map_err(|e| format!("文件路径非法: {}", e))?;
 
   let mut diffs = db.get_pending_diffs(&file_path)?;
+  {
+    let diffs_summary: Vec<_> = diffs.iter().map(|d| {
+      let orig_preview: String = d.original_text.chars().take(60).collect();
+      let new_preview: String = d.new_text.chars().take(60).collect();
+      format!(
+        "{{\"diff_index\":{},\"para_index\":{},\"diff_type\":{:?},\"original_text\":{:?},\"new_text\":{:?}}}",
+        d.diff_index, d.para_index, d.diff_type, orig_preview, new_preview
+      )
+    }).collect();
+    eprintln!(
+      "[CROSS_FILE_TRACE][WRITE] {{\"op\":\"accept_file_diffs:pre-apply\",\"file_path\":{:?},\"workspace_path\":{:?},\"diff_count\":{},\"diff_indices\":{:?},\"diffs\":[{}]}}",
+      file_path,
+      workspace_path,
+      diffs.len(),
+      diff_indices,
+      diffs_summary.join(","),
+    );
+  }
   if diffs.is_empty() {
     return Err("没有待确认的修改".to_string());
   }
@@ -528,6 +549,16 @@ pub async fn accept_file_diffs(
     std::fs::write(&full_path, &body_to_store).map_err(|e| format!("写入文件失败: {}", e))?;
   }
 
+  {
+    let final_preview: String = body_to_store.chars().take(80).collect();
+    eprintln!(
+      "[CROSS_FILE_TRACE][WRITE] {{\"op\":\"accept_file_diffs:post-write\",\"file_path\":{:?},\"full_path\":{:?},\"final_content_len\":{},\"final_content_preview\":{:?}}}",
+      file_path,
+      full_path.to_string_lossy(),
+      body_to_store.len(),
+      final_preview,
+    );
+  }
   db.delete_pending_diffs(&file_path)?;
   let mtime = std::fs::metadata(&full_path)
     .and_then(|m| m.modified())
@@ -782,6 +813,9 @@ pub async fn restore_timeline_node(
 
   let state_changed = payload_differs_from_current(Path::new(&workspace_path), &node, &payload)?;
   let impacted_paths = restore_payload(Path::new(&workspace_path), &payload)?;
+  let restore_reason = format!("timeline_restore:{}", node.node_id);
+  let _ = db.delete_pending_diffs_for_paths(&impacted_paths)?;
+  let _ = db.invalidate_active_agent_tasks(&restore_reason)?;
   let mut created_node = false;
 
   if state_changed {

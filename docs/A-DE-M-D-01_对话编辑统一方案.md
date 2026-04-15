@@ -15,24 +15,31 @@
 - 变更要求：`修改本文后，必须复核：上游约束、直接承接、接口耦合、汇聚影响、扩散检查文档`
 
 ---
-> 文档层级：30_capabilities / 01_对话编辑系统 / 核心入口  
-> 文档状态：执行标准（用于开发、联调、验收）  
-> 规则主源：`R-DE-M-R-02_对话编辑-统一整合方案.md`（DE 规则ID唯一来源）
+> 文档分级：`L1 / 一级权威文档`
+> 文档类型：`统一方案 / 模块主控`
+> 当前状态：`Active`
+> 受约束于：`A-CORE-C-D-02`、`A-CORE-C-D-04`、`A-CORE-C-D-05`、`A-AG-M-D-01`、`A-AG-M-T-03`、`A-AG-M-T-04`、`A-AST-M-P-01`、`A-AST-M-T-07`、`A-WS-M-D-01`
+> 可约束：`A-DE-M-T-01`、`A-DE-M-T-02`、`A-DE-M-P-01`、`A-DE-X-L-01` 及 DE 相关实现/验收文档
+> 可用于：`定义对话编辑的功能边界、执行主链、当前文档优先级、Diff 主链和与 Agent/Workspace/知识补强的协同边界`
+> 不可用于：`替代术语主文档重定义共享概念；替代 Agent 上位文档重定义 verification/confirmation/stage_state 主语义；替代计划文档做排期`
 
 ---
 
 ## 一、文档定位与生效原则
 
-本文件是“对话编辑系统”的工程执行入口，目标是把规则主源转成可开发、可联调、可验收的落地标准。
+本文件是“对话编辑系统”的工程执行入口，也是 DE 模块当前唯一 Active 主控口径。
 
 生效原则（按优先级）：
-1. `R-DE-M-R-02_对话编辑-统一整合方案.md`：业务规则与 DE 规则ID 主源。
-2. `R-DE-M-R-01_对话编辑-主控设计文档.md`：主控链路实现口径。
-3. 本文：跨模块执行索引、落地分工、验收门槛。
-4. ``A-DE-M-T-01_diff系统规则.md`/`A-DE-M-T-02_baseline状态协作.md`/`A-DE-M-P-01_对话编辑提示词.md``：专项规则细化（Diff/状态/提示词）。
+1. `A-CORE-C-D-02_产品术语边界.md`：共享概念与字段主定义。
+2. `A-CORE-C-D-04_系统设计原则总纲.md` / `A-CORE-C-D-05_状态单一真源原则.md`：全局原则与状态真源约束。
+3. `A-AG-M-D-01_Binder Agent能力描述文档.md` / `A-AG-M-T-03_任务规划执行.md` / `A-AG-M-T-04_Binder Agent技术主控文档.md`：Agent 闭环、verification、confirmation、stage_state 上位口径。
+4. `A-AST-M-P-01_上下文注入.md` / `A-AST-M-T-07_Binder知识库自动检索协同规范.md`：上下文注入顺序与知识检索边界。
+5. 本文：对话编辑模块主链与模块边界主定义。
+6. `A-DE-M-T-01_diff系统规则.md` / `A-DE-M-T-02_baseline状态协作.md` / `A-DE-M-P-01_对话编辑提示词.md`：对本文的专项细化与承接。
+7. `R-DE-*` 文档只可作为历史参考，不再构成当前规则主源。
 
 约束：
-1. 本文不得新增与 DE 规则冲突的新语义。
+1. `当前文档事实层`、`项目文档层`、`显式当前文件锚点` 的项目级主定义以 `A-CORE-C-D-02_产品术语边界.md` 为准；本文只负责它们在 DE 主链中的执行语义，其他 DE 文档提及时不得重定义。
 2. 本文所有“必须”条款使用 `MUST` 标记，未满足视为未完成。
 3. 任一规则变更，必须同步更新本文“规则落地索引”和“验收矩阵”。
 
@@ -100,6 +107,19 @@ MUST：
 2. 块类型推断固定：`h1/h2/h3 -> 标题`，`p -> 正文`，`li -> 列表`，其余标签归并为 `正文`。
 3. 状态 C（仅光标）允许在块行尾标记 `"[光标位置]"`，但不得附带 `blockId`。
 
+当前文档事实层定型（MUST）：
+0. 术语归属：`当前文档`、`当前文档事实层`、`当前文件锚点`、`项目文档层` 的项目级主定义见 `A-CORE-C-D-02_产品术语边界.md`；本文只定义它们在 DE 主链中的执行含义，不改变主定义边界。
+1. 当前打开文档属于“编辑事实层”，来源至少覆盖 `currentFile/currentEditorContent/selection/当前块结构`，不得依赖知识库入库后才可被 agent 理解。
+2. 当前文档相关问题的默认优先级必须固定为：`当前文档事实层 -> 当前 workspace 项目文档层 -> 知识库/外部资料层`。
+3. 若用户显式引用当前文件，系统可以避免重复注入正文，但不得吞掉该引用语义；后续路由必须能感知“当前文档被显式点名”。
+4. 长文档仅注入摘要块不等于“当前文档已充分可见”；摘要不足时，必须先在当前文档内继续定位、抽取、补充注入，再决定是否扩大范围。
+5. 旧口径中任何把“当前文档问题”直接滑向知识检索补偿链的实现，均视为过时实现，不再允许继续沿用。
+
+验收补充：
+1. 当前文档问题在未出现显式外扩意图前，不得直接触发知识检索。
+2. 当前文档被显式引用后，请求上下文中必须保留“显式当前文件锚点”信号。
+3. 长文档定位问题在摘要不足时，必须优先出现“文档内二次求解”行为，而不是直接外扩。
+
 场景到路由对照（执行定型）：
 
 | 场景 | 输入特征 | Resolver 路由 | 门禁 |
@@ -126,18 +146,20 @@ MUST：
 MUST：
 1. 路由判定权只在 Resolver，不允许前端/提示词层提前分流（`DE-ROUTE-002`）。
 2. 每条 diff 必须携带 `route_source`（`DE-ROUTE-003`）。
-3. 降级顺序必须“精确定位 -> 块内搜索 -> 整块替换”，且仅降 `block_level`（`DE-DEG-001`）。
+3. 降级顺序必须“精确定位 -> 块内搜索 -> 整块替换”，且仅降 `block_level`（`DE-DEG-001`）；该降级是受控执行策略，不是兜底式 fallback，不得跳过前置定位失败判定。
 4. 全文扫描多块任务禁止以 `rewrite_document` 替代逐块编辑（`DE-DEG-002`）。
 5. 树索引与 `baselineId` 强绑定；索引不可用时允许线性回退并跳过失败条目（`DE-TREE-001/002/003`）。
 
 验收：
 1. 同一请求中可追踪完整路由链与降级轨迹。
 2. 树索引故障时能继续处理其余条目并输出失败明细。
+3. 当前文档相关问题在扩大到 workspace 文档层或知识库层前，必须能观察到“当前文档优先/文档内继续求解”的路由意图。
 
 实现定型（来源：主控 §6.2）：
 1. 路由分支固定为：`零搜索 -> 块内搜索 -> 整块替换降级`，并保留 `rewrite_block / rewrite_document` 两个显式模式。
 2. `block_index` 缺失或越界走错误分支；块内多次命中依赖 `occurrence_index`。
 3. `rewrite_document` 仅允许全文任务；多块局部任务必须逐块调用。
+4. `整块替换降级` 只允许在块内搜索 miss 且目标块已明确时触发；不得作为“无法定位时默认补全”或跨块任务的模糊替代路径。
 
 分支失败用例矩阵（MUST）：
 
@@ -360,6 +382,21 @@ MUST：
 2. 同文档跨块复制粘贴引用，执行链输出 `route_source=reference` 且区间为跨块闭区间。
 3. 引用元数据失效时，链路可观测到降级，不得误报为 `reference`。
 
+### 5.8 引用结构保真与传输约束（MUST）
+
+来源：`A-CORE-C-D-02` §3.3 引用结构保真、§五 第 8–11 条。  
+MUST：
+1. 后端 IPC 接收层必须将前端 `ReferenceFromFrontend` 转换为 `RichReferenceInfo`（含 `ref_type`/`source`/`content`/`text_reference`/`knowledge_*`），不得丢弃 `text_reference` 四元组和知识库细粒度 ID。
+2. `build_reference_prompt` 输出每条引用必须包含：类型标题（如 `Text reference`）、`Source: {path}`、位置信息（若有 `text_reference`）和 `Content:`；无 text_reference 时必须附加明确提示，告知模型该引用为行级或文件级精度。
+3. 引用正文仅通过 `references` 协议单通道注入后端；前端用户消息 `content` 中不得展开引用正文。引用标签在 `content` 中以 `@{label}` 占位形式出现，不展开。
+4. 行级 `@` 引用（`createTextReference`）创建时，若目标文件已在编辑器中打开且有 block 结构，必须尝试从编辑器 DOM 解析对应行的 `data-block-id` 并填入 `textReference` 四元组。若解析失败或文件未打开，允许不填四元组，但 `build_reference_prompt` 必须明确标注该引用为行级精度。
+5. `agent_task_summary` 和 `agent_artifacts_summary` 在以下任一条件满足时不得注入：(a) 存在精确选区坐标（`_sel_*` 完整）；(b) 存在同文件 TextReference 引用且用户消息长度 < 100 字符。
+
+验收：
+1. 行级 TextReference 在编辑器已打开时，`RichReferenceInfo.text_reference` 字段非空。
+2. prompt 中每条引用可见 `Source:` 行。
+3. 局部编辑场景（有精确引用 + 短消息）不出现旧任务摘要。
+
 ---
 
 ## 六、状态模型与一致性约束
@@ -416,6 +453,7 @@ MUST：
 **DE-AGT-002**（承接 BA-STATE-001/003，BA-RUN-001）：stage_complete 闭合判定
 
 MUST：
+0. `stage_complete`、`verification`、`confirmation`、`invalidated` 的术语主定义以 `A-AG-M-T-04_Binder Agent技术主控文档.md` 与 `A-AG-M-T-03_任务规划执行.md` 为准；本文仅定义对话编辑链如何满足这些上位条件。
 1. 一轮对话编辑完成后，stage_complete 判定必须同时满足：(a) 本轮 revision 已成功推进；(b) 当前 diff 池中无 `constraint_failed` 或 `apply_failed` 的悬置条目。
 2. 仅 revision 推进不等于 stage_complete；系统不得将"diff 池清空"或"模型输出结束"等同于阶段闭合。
 3. stage_complete 判定结果必须输出可观测事件（ExecutionExposure 中含 `stageEvent: stage_complete`），不得仅以 UI 静默表达。
@@ -554,7 +592,7 @@ MUST：
 
 | 废弃项 | 替代路径 | 清理状态 |
 |---|---|---|
-| `scope` / `anchor` 协议字段 | `TextReference` 四元组 + `_sel_*` | 已禁用，保留兼容读取 |
+| `scope` / `anchor` 协议字段 | `TextReference` 四元组 + `_sel_*` | 已禁用；仅在历史协议读取窗口中临时兼容读取，不得写回、不得作为新请求输出，待旧记录迁移后删除 |
 | 通过提示词决定路由分支 | Resolver 路由层（`A-DE-M-D-01_对话编辑统一方案.md`§4.2） | 已替换 |
 | 局部多块任务走 `rewrite_document` | 逐块 `edit_current_editor_document` | 已替换 |
 | 失败事件直接映射 `expired` | `ExecutionExposure` 独立事件流 | 已替换 |
@@ -591,13 +629,17 @@ MUST：
 
 ## 十一、关联文档（执行时必读）
 
-1. `R-DE-M-R-02_对话编辑-统一整合方案.md`
-2. `R-DE-M-R-01_对话编辑-主控设计文档.md`
-3. `A-DE-M-T-01_diff系统规则.md`
-4. `A-DE-M-T-02_baseline状态协作.md`
-5. `A-DE-M-P-01_对话编辑提示词.md`
-6. `A-SYS-C-T-01_系统总体架构.md`
-7. `A-WS-M-T-01_workspace架构.md`
+1. `A-DE-M-T-01_diff系统规则.md`
+2. `A-DE-M-T-02_baseline状态协作.md`
+3. `A-DE-M-P-01_对话编辑提示词.md`
+4. `A-AG-M-T-03_任务规划执行.md`
+5. `A-AG-M-T-04_Binder Agent技术主控文档.md`
+6. `A-AST-M-P-01_上下文注入.md`
+7. `A-AST-M-T-07_Binder知识库自动检索协同规范.md`
+8. `A-SYS-C-T-01_系统总体架构.md`
+9. `A-WS-M-T-01_workspace架构.md`
+10. `R-DE-M-R-02_对话编辑-统一整合方案.md`（仅作历史参考）
+11. `R-DE-M-R-01_对话编辑-主控设计文档.md`（仅作历史参考）
 8. `A-SYS-M-T-01_数据流状态流.md`
 9. `A-AG-M-T-01_ai执行架构.md`
 10. `A-WS-M-T-02_多文档资源系统.md`

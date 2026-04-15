@@ -65,7 +65,7 @@ fn get_tool_definitions_legacy() -> Vec<ToolDefinition> {
                     },
                     "use_diff": {
                         "type": "boolean",
-                        "description": "If true, generate pending diffs instead of writing directly. User must confirm before disk write. Use for files NOT currently open in editor."
+                        "description": "If true, generate pending diffs instead of writing directly. User must confirm before disk write. For document-like files (.md/.txt/.html/.docx/.rtf/.odt), Binder forces this review path even if false is requested; direct write is only for non-document resources."
                     }
                 },
                 "required": ["path", "content"]
@@ -119,7 +119,7 @@ fn get_tool_definitions_legacy() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "move_file".to_string(),
             // 移动文件或文件夹到新位置
-            description: "Moves a file or folder to a new location.".to_string(),
+            description: "Moves a file or folder to a new location. This operation requires user confirmation.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -138,7 +138,7 @@ fn get_tool_definitions_legacy() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "rename_file".to_string(),
             // 重命名文件或文件夹
-            description: "Renames a file or folder.".to_string(),
+            description: "Renames a file or folder. This operation requires user confirmation.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -157,7 +157,7 @@ fn get_tool_definitions_legacy() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "create_folder".to_string(),
             // 创建新文件夹（支持多级目录）
-            description: "Creates a new folder. Returns an error if the folder already exists. Supports creating multi-level directories.".to_string(),
+            description: "Creates a new folder. Returns an error if the folder already exists. Supports creating multi-level directories. This operation requires user confirmation.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

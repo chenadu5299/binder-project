@@ -45,6 +45,9 @@
 3. 状态、验证、确认、artifact 的技术落模。
 4. 专项文档承接与实现分工。
 
+本文引用 `A-CORE-C-D-02_产品术语边界.md` 与 `A-CORE-C-D-05_状态单一真源原则.md` 中的共享术语和状态边界。  
+对 `stage_complete`、`verification`、`confirmation`、`invalidated`、`candidate`、`shadow runtime` 等概念，本文只说明 Agent 技术如何承接和满足这些规则，不重新定义其项目级主语义。
+
 ### 1.3 本文不负责什么
 
 本文不负责：
@@ -186,6 +189,9 @@ interface ResponsibilityTag {
 
 ### 5.3.1 状态对象
 
+以下结构是 Agent 的技术承接对象。  
+状态名的共享术语语义仍以 `A-CORE-C-D-02_产品术语边界.md` 与 `A-CORE-C-D-05_状态单一真源原则.md` 为准；本文不把这些对象重新定义为 Agent 独占状态主源。
+
 ```ts
 type AgentStageState =
   | 'draft'
@@ -218,14 +224,33 @@ interface AgentStageSnapshot {
 2. 阶段状态必须可追踪变更来源。
 3. 阶段状态必须可以被 UI、context 注入、验证器、确认器共同消费。
 
-### 5.3.3 运行状态与阶段状态的区别
+### 5.3.3 运行状态、`shadow runtime` 与阶段状态的区别
 
 | 类型 | 示例 | 作用 |
 |---|---|---|
 | 运行状态 | running、waiting_tool、streaming、failed | 描述执行过程 |
+| `shadow runtime` | runtime projection、临时 gate 投影、局部 UI completion | 描述运行时镜像与辅助观测，不构成业务真源 |
 | 阶段状态 | structured、review_ready、stage_complete | 描述任务语义所处阶段 |
 
 技术实现上，禁止用运行状态替代阶段状态。
+技术实现上，禁止把 `shadow runtime` 当作阶段状态或业务状态真源使用。
+
+### 5.3.4 `shadow runtime` 的 Agent 承接边界
+
+1. Agent 可以消费 `shadow runtime` 提供的运行时镜像、调试信息和局部 gate 提示。
+2. Agent 不得把 `shadow runtime` 单独写成 `stage_complete`、`verification`、`confirmation`、`invalidated` 的最终业务结论。
+3. Agent runtime gate 可以读取运行时投影，但正式状态迁移仍必须回到结构化业务对象、验证记录和确认结果。
+4. 若 `shadow runtime` 与业务主状态冲突，Agent 必须服从主链状态，不得以本地投影覆盖业务真源。
+
+### 5.3.5 `shadow runtime` 持久化禁止边界
+
+本节补充 `A-CORE-C-D-05_状态单一真源原则.md` §6.5 的 Agent 侧具体承接：
+
+1. **禁止写入持久化存储**：`shadow runtime` 内存状态（`agentStore.runtimesByTab`）不得写入 `workspace.db` 或任何磁盘存储，用于跨会话业务恢复。
+2. **禁止作为跨会话恢复依据**：应用重启后，`shadow runtime` 状态归零；不得依赖 DB 中的 shadow 记录重建业务状态结论。
+3. **允许的持久化用途**：`shadow runtime` 状态可以出于**观测/排障**目的写入观测日志（与 `ExecutionExposure` 同级），但这些记录不得在读取时转化为正式业务状态。
+4. **`agentStore.runtimeMode`**：当前固定为 `'shadow'`，不演进为 `'active'`；`'active'` 模式保留为未来正式主链替换时的扩展点，当前不生效。
+5. **`stage_complete` 与 `invalidated` 的推进责任**：在 Agent 侧，这两个状态由 `AgentTaskController`（见 `A-AG-M-T-05_AgentTaskController设计.md`）裁决推进，不由 `agentStore` 自身或 UI 组件直接写入。
 
 ## 5.4 分层验证与确认的技术承接
 
@@ -634,7 +659,8 @@ Binder 原始需求明确要求三层 AI 交互系统保持独立设计。
 | `A-AST-M-D-02_Binder Agent知识库协同主控文档.md` | 知识库作为用户主导知识资产时，如何与当前轮上下文、显式引用、自动检索协同 |
 | `A-AST-M-T-02_知识库机制.md` | 知识库双库结构、导入替换删除、检索结果对象与状态 |
 | `A-TMP-M-T-01_模板机制.md` | 工作流模板对象、调用机制、权限与涌现机制 |
-| `A-AG-M-T-05_文档生成流程.md` | Agent 文档生成七步主链：输入归一、计划构建、上下文注入、内容生成、审阅修订、写入、导出与回流 |
+| `A-AG-M-T-05_AgentTaskController设计.md` | `stage_complete` / `invalidated` 唯一推进主体；`DiffActionService` 入口设计；`verification failed` 与 `invalidated` 解耦规则 |
+| `A-AG-M-T-06_文档生成流程.md` | Agent 文档生成七步主链：输入归一、计划构建、上下文注入、内容生成、审阅修订、写入、导出与回流 |
 | `A-TMP-M-D-01_Binder Agent模板协同主控文档.md` | 模板作为用户主导约束资产时，如何与 Agent 协同而不越权启用 |
 
 ### 10.3 与工程模块的承接落位
@@ -739,6 +765,7 @@ interface AgentContextPackage {
 5. gate 只存在于 prompt 中，不存在于系统层。
 6. `stage_complete` 可以在无确认、无验证的情况下产生。
 7. 系统对象无法表达作用范围。
+8. `shadow runtime`、UI 完成态或局部 runtime 投影可以越权推进业务完成态。
 
 ---
 
@@ -751,6 +778,14 @@ interface AgentContextPackage {
 5. 任何实现若违背本文否决条件，都能被明确指出并驳回。
 
 ---
+
+---
+
+> **本轮修订说明（2026-04-14）**：  
+> 1. §5.3.5 新增：`shadow runtime` 持久化禁止边界（禁止写 DB、生命周期仅限会话内存、`runtimeMode` 固定为 `'shadow'`）。  
+> 2. §5.3.5 新增：`stage_complete` 与 `invalidated` 推进责任归属 `AgentTaskController`。  
+> 3. §10.2 扩展承接文档表：新增 `A-AG-M-T-05_AgentTaskController设计.md`。  
+> 新增文档：`A-AG-M-T-05_AgentTaskController设计.md`（`stage_complete`/`invalidated` 推进主体完整设计）。
 
 ## 十三、来源与背景
 

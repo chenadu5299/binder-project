@@ -460,7 +460,7 @@ const ExcelTablePreview: React.FC<ExcelTablePreviewProps> = ({ filePath }) => {
         });
 
         if (!base64) {
-          setError('文件内容为空');
+          setError('Excel 文件为空，可能是旧版本创建的无效空白文件，请重新创建该文件。');
           setLoading(false);
           return;
         }
@@ -876,4 +876,3 @@ const ExcelTablePreview: React.FC<ExcelTablePreviewProps> = ({ filePath }) => {
 };
 
 export default ExcelTablePreview;
-
