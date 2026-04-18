@@ -12,18 +12,17 @@ import type { Editor } from '@tiptap/react';
 import {
   useDiffStore,
   buildAcceptReadRow,
-  compareAcceptWriteOrder,
-  collectIllegalPartialOverlapDiffIds,
   userVisibleMessageForSnapshotGate,
   type DiffExpireReason,
-  type AcceptReadFailRow,
-  type AcceptReadOkRow,
 } from '../stores/diffStore';
+import { runAcceptAllOrchestrator } from '../machines/acceptAllOrchestrator';
+import { useAgentStore } from '../stores/agentStore';
 import { useEditorStore } from '../stores/editorStore';
 import { applyDiffReplaceInEditor } from '../utils/applyDiffReplaceInEditor';
 import { markVerificationFailed } from '../utils/agentShadowLifecycle';
 import { AgentTaskController } from './AgentTaskController';
 import { DiffRetryController } from './DiffRetryController';
+import { createPassedVerificationRecord } from '../types/agent_state';
 
 export type DiffActionResult =
   | { success: true; from: number; to: number }
@@ -34,6 +33,12 @@ export type AcceptAllResult = {
   expired: number;
   anyApplied: boolean;
 };
+
+function resolveEditorBoundFilePath(editor: Editor): string | null {
+  const tabs = useEditorStore.getState().tabs;
+  const matched = tabs.find((tab) => tab.editor === editor);
+  return matched?.filePath ?? null;
+}
 
 export const DiffActionService = {
   /**
@@ -53,12 +58,24 @@ export const DiffActionService = {
     },
   ): Promise<DiffActionResult> {
     const { chatTabId = '', agentTaskId } = options;
+    const editorBoundFilePath = resolveEditorBoundFilePath(editor);
     console.log('[CROSS_FILE_TRACE][ACTION]', JSON.stringify({
       op: 'acceptDiff',
       filePath,
       diffId,
       chatTabId,
       agentTaskId,
+    }));
+    console.log('[CROSS_FILE_TRACE][ACCEPT_ROUTE]', JSON.stringify({
+      method: 'acceptDiff',
+      filePath,
+      chatTabId,
+      agentTaskId: agentTaskId ?? null,
+      sourceDiffPool: 'byTab',
+      hasEditorInstance: !!editor,
+      editorBoundFilePath,
+      downstream: ['buildAcceptReadRow', 'applyDiffReplaceInEditor', 'diffStore.acceptDiff'],
+      backendApplyTargetFilePath: null,
     }));
     const entry = useDiffStore.getState().byTab[filePath]?.diffs.get(diffId);
     if (!entry) {
@@ -97,7 +114,7 @@ export const DiffActionService = {
           diffId,
           code: 'E_APPLY_FAILED',
           retryable: true,
-          route_source: entry.positioningPath === 'Anchor' ? 'reference' : 'block_search',
+          route_source: entry.routeSource ?? (entry.positioningPath === 'Anchor' ? 'selection' : 'block_search'),
           agentTaskId,
           chatTabId,
           timestamp: Date.now(),
@@ -117,13 +134,14 @@ export const DiffActionService = {
       to: ins.insertTo,
     });
 
-    // 推进 revision，触发 expirePendingForStaleRevision
+    // 推进 tab 内容与 documentRevision（不再用于批量接受时同文件其它 diff 的过期闸门，见 diffPendingContentSync）
     const tab = useEditorStore.getState().tabs.find((t) => t.filePath === filePath);
     if (tab) {
       useEditorStore.getState().updateTabContent(tab.id, editor.getHTML());
     }
 
     AgentTaskController.checkAndAdvanceStage(agentTaskId, chatTabId, filePath);
+    DiffActionService.reconcileVerificationAfterSuccess(chatTabId, agentTaskId);
 
     return { success: true, from: ins.insertFrom, to: ins.insertTo };
   },
@@ -150,9 +168,7 @@ export const DiffActionService = {
   },
 
   /**
-   * 批量接受（稳定排序，先读后写）。
-   * 内部：逐条 buildAcceptReadRow → 过滤非法重叠 → 逆序 apply
-   *       → 统一 checkAndAdvanceStage
+   * 批量接受：编排器 preparing（重叠预检）+ processing（createdAt 倒序串行 runDiffCardAccept）。
    */
   async acceptAll(
     filePath: string,
@@ -165,6 +181,7 @@ export const DiffActionService = {
     },
   ): Promise<AcceptAllResult> {
     const { chatTabId = '', agentTaskId } = options;
+    const editorBoundFilePath = resolveEditorBoundFilePath(editor);
     console.log('[CROSS_FILE_TRACE][ACTION]', JSON.stringify({
       op: 'acceptAll',
       filePath,
@@ -173,91 +190,127 @@ export const DiffActionService = {
       agentTaskId,
       tabDocumentRevision: options.tabDocumentRevision,
     }));
-    const store = useDiffStore.getState();
+    console.log('[CROSS_FILE_TRACE][ACCEPT_ROUTE]', JSON.stringify({
+      method: 'acceptAll',
+      filePath,
+      chatTabId,
+      agentTaskId: agentTaskId ?? null,
+      sourceDiffPool: 'byTab',
+      hasEditorInstance: !!editor,
+      editorBoundFilePath,
+      downstream: ['runAcceptAllOrchestrator', 'diffCardMachine'],
+      backendApplyTargetFilePath: null,
+    }));
 
-    const pending = diffIds
-      .map((id) => store.byTab[filePath]?.diffs.get(id))
-      .filter((e): e is NonNullable<typeof e> => e != null && e.status === 'pending');
-
-    if (pending.length === 0) return { applied: 0, expired: 0, anyApplied: false };
-
-    // 读阶段
-    const phaseRead = await Promise.all(
-      pending.map((d) =>
-        buildAcceptReadRow(d, editor, {
-          tabDocumentRevision: options.tabDocumentRevision,
-          filePath,
-        }),
-      ),
-    );
-
-    const failed = phaseRead.filter((x): x is AcceptReadFailRow => x.kind === 'fail');
-    const okRows = phaseRead.filter((x): x is AcceptReadOkRow => x.kind === 'ok');
-    const illegalOverlapIds = collectIllegalPartialOverlapDiffIds(okRows);
-    const overlapExpired = okRows.filter((row) => illegalOverlapIds.has(row.diff.diffId));
-    const executable = okRows.filter((row) => !illegalOverlapIds.has(row.diff.diffId));
-
-    // 过期失败条目，写 verification
-    for (const f of failed) {
-      store.updateDiff(filePath, f.diff.diffId, { status: 'expired', expireReason: f.reason });
-      markVerificationFailed(
-        f.diff.chatTabId ?? chatTabId,
-        f.diff.agentTaskId ?? agentTaskId,
-        `accept_all_${f.reason}`,
-      );
-    }
-    for (const row of overlapExpired) {
-      store.updateDiff(filePath, row.diff.diffId, {
-        status: 'expired',
-        expireReason: 'overlapping_range',
-      });
-      markVerificationFailed(
-        row.diff.chatTabId ?? chatTabId,
-        row.diff.agentTaskId ?? agentTaskId,
-        'accept_all_overlapping_range',
-      );
-    }
-
-    // 写阶段：稳定排序（from desc → to desc → createdAt asc → diffId asc）
-    const sortedApply = [...executable].sort(compareAcceptWriteOrder);
-    let applied = 0;
-    let expired = failed.length + overlapExpired.length;
-
-    for (const row of sortedApply) {
-      const ins = applyDiffReplaceInEditor(
-        editor,
-        { from: row.from, to: row.to },
-        row.diff.newText,
-        { focus: false, scrollIntoView: false },
-      );
-      if (!ins) {
-        DiffRetryController.handleFailedEvent(
-          {
-            diffId: row.diff.diffId,
-            code: 'E_APPLY_FAILED',
-            retryable: true,
-            route_source: row.diff.positioningPath === 'Anchor' ? 'reference' : 'block_search',
-            agentTaskId: row.diff.agentTaskId ?? agentTaskId,
-            chatTabId: row.diff.chatTabId ?? chatTabId,
-            timestamp: Date.now(),
-            retryCount: 0,
-          },
-          filePath,
-          'apply_replace_failed',
-        );
-        expired++;
-        continue;
-      }
-      store.acceptDiff(filePath, row.diff.diffId, {
-        from: ins.insertFrom,
-        to: ins.insertTo,
-      });
-      applied++;
-    }
+    const result = await runAcceptAllOrchestrator({
+      filePath,
+      editor,
+      diffIds,
+      tabDocumentRevision: options.tabDocumentRevision,
+      chatTabId,
+      agentTaskId,
+    });
 
     AgentTaskController.checkAndAdvanceStage(agentTaskId, chatTabId, filePath);
+    DiffActionService.reconcileVerificationAfterSuccess(chatTabId, agentTaskId);
 
-    return { applied, expired, anyApplied: applied > 0 };
+    return result;
+  },
+
+  /**
+   * 接受一个已 resolve（byTab + byFilePath 双轨）的 diff 卡片。
+   *
+   * 应用场景：`update_file` 进入 contentBlocks 后、文件已打开并 resolve 为 DiffCard。
+   * 执行顺序：
+   *   1. acceptDiff —— 接受 byTab diff
+   *   2. acceptFileDiffs —— 清除对应 byFilePath 条目并写回 workspace
+   */
+  async acceptResolvedDiffCard(
+    filePath: string,
+    diffId: string,
+    fileDiffIndex: number | undefined,
+    workspacePath: string,
+    editor: Editor,
+    options: {
+      tabDocumentRevision: number;
+      chatTabId?: string;
+      agentTaskId?: string;
+    },
+  ): Promise<DiffActionResult> {
+    console.log('[CROSS_FILE_TRACE][ACCEPT_ROUTE]', JSON.stringify({
+      method: 'acceptResolvedDiffCard',
+      filePath,
+      chatTabId: options.chatTabId ?? '',
+      agentTaskId: options.agentTaskId ?? null,
+      sourceDiffPool: 'byTab + byFilePath(resolved)',
+      hasEditorInstance: !!editor,
+      editorBoundFilePath: resolveEditorBoundFilePath(editor),
+      downstream: ['acceptDiff', 'acceptFileDiffs'],
+      backendApplyTargetFilePath: filePath,
+      fileDiffIndex: fileDiffIndex ?? null,
+    }));
+    const result = await DiffActionService.acceptDiff(filePath, diffId, editor, options);
+    if (!result.success) return result;
+    if (fileDiffIndex == null || fileDiffIndex < 0) {
+      return result;
+    }
+    await DiffActionService.acceptFileDiffs(filePath, workspacePath, {
+      chatTabId: options.chatTabId,
+      agentTaskId: options.agentTaskId,
+      diffIndices: [fileDiffIndex],
+    });
+    return result;
+  },
+
+  /**
+   * 拒绝一个已 resolve（byTab + byFilePath 双轨）的 diff 卡片。
+   *
+   * 应用场景：DiffCard（已 resolve 状态）onReject 按钮 —— 此时 byFilePath 和 byTab 各有一条记录。
+   * 内部：
+   *   1. diffStore.removeFileDiffEntry — 移除 byFilePath 条目
+   *   2. diffStore.rejectDiff — 标记 byTab 条目为 rejected
+   *   3. AgentTaskController.checkAndAdvanceStage
+   */
+  rejectResolvedDiffCard(
+    filePath: string,
+    diffId: string,
+    fileDiffIndex: number,
+    options: {
+      chatTabId?: string;
+      agentTaskId?: string;
+    } = {},
+  ): void {
+    const { chatTabId = '', agentTaskId } = options;
+    if (fileDiffIndex < 0) {
+      useDiffStore.getState().rejectDiff(filePath, diffId);
+      AgentTaskController.checkAndAdvanceStage(agentTaskId, chatTabId, filePath);
+      return;
+    }
+    useDiffStore.getState().removeFileDiffEntry(filePath, fileDiffIndex);
+    useDiffStore.getState().rejectDiff(filePath, diffId);
+    AgentTaskController.checkAndAdvanceStage(agentTaskId, chatTabId, filePath);
+  },
+
+  /**
+   * 拒绝单条未 resolve 的 workspace file diff（仅 byFilePath 路径）。
+   *
+   * 应用场景：FileDiffCard onReject — 此时只有 byFilePath 条目，无对应 byTab diff。
+   * 内部：
+   *   1. diffStore.removeFileDiffEntry — 移除 byFilePath 条目
+   *   2. AgentTaskController.handleFileDiffResolution(rejected)
+   */
+  rejectFileDiffEntry(
+    filePath: string,
+    fileDiffIndex: number,
+    _workspacePath: string,
+    options: {
+      chatTabId?: string;
+      agentTaskId?: string;
+    } = {},
+  ): void {
+    const { chatTabId = '', agentTaskId } = options;
+    useDiffStore.getState().removeFileDiffEntry(filePath, fileDiffIndex);
+    AgentTaskController.handleFileDiffResolution({ agentTaskId, chatTabId, outcome: 'rejected' });
   },
 
   /**
@@ -282,8 +335,21 @@ export const DiffActionService = {
       agentTaskId,
       diffIndices,
     }));
+    console.log('[CROSS_FILE_TRACE][ACCEPT_ROUTE]', JSON.stringify({
+      method: 'acceptFileDiffs',
+      filePath,
+      chatTabId,
+      agentTaskId: agentTaskId ?? null,
+      sourceDiffPool: 'byFilePath',
+      hasEditorInstance: false,
+      editorBoundFilePath: null,
+      downstream: ['diffStore.acceptFileDiffs', 'AgentTaskController.handleFileDiffResolution'],
+      backendApplyTargetFilePath: filePath,
+      diffIndices: diffIndices ?? null,
+    }));
     await useDiffStore.getState().acceptFileDiffs(filePath, workspacePath, diffIndices);
     AgentTaskController.handleFileDiffResolution({ agentTaskId, chatTabId, outcome: 'accepted' });
+    DiffActionService.reconcileVerificationAfterSuccess(chatTabId, agentTaskId);
   },
 
   /**
@@ -309,5 +375,27 @@ export const DiffActionService = {
     }));
     await useDiffStore.getState().rejectFileDiffs(filePath, workspacePath);
     AgentTaskController.handleFileDiffResolution({ agentTaskId, chatTabId, outcome: 'rejected' });
+  },
+
+  reconcileVerificationAfterSuccess(
+    chatTabId: string | undefined,
+    agentTaskId: string | undefined,
+  ): void {
+    if (!chatTabId || !agentTaskId) return;
+    const runtime = useAgentStore.getState().runtimesByTab[chatTabId];
+    if (!runtime?.currentTask || runtime.currentTask.id !== agentTaskId) return;
+
+    const hasOutstandingDiffFailure = Object.values(useDiffStore.getState().byTab).some((tab) =>
+      [...tab.diffs.values()].some(
+        (entry) =>
+          entry.agentTaskId === agentTaskId &&
+          (entry.status === 'expired' || entry.executionExposure != null),
+      ),
+    );
+    if (hasOutstandingDiffFailure) return;
+
+    useAgentStore
+      .getState()
+      .setVerification(chatTabId, createPassedVerificationRecord(agentTaskId, 'diff_errors_cleared'));
   },
 };

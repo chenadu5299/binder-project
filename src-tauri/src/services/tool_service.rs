@@ -975,9 +975,16 @@ impl ToolService {
     if use_diff {
       let diffs =
         diff_engine::generate_pending_diffs_for_file_type(&old_content, content, &file_type);
-      let rows: Vec<(String, String, i32)> = diffs
+      let rows: Vec<(String, String, i32, String)> = diffs
         .iter()
-        .map(|d| (d.original_text.clone(), d.new_text.clone(), d.para_index))
+        .map(|d| {
+          (
+            d.original_text.clone(),
+            d.new_text.clone(),
+            d.para_index,
+            d.diff_type.clone(),
+          )
+        })
         .collect();
 
       let entries = db.insert_pending_diffs(file_path, &rows)?;
@@ -2092,12 +2099,42 @@ impl ToolService {
         let eo = input.selection_end_offset.unwrap_or(so);
         let route_source = Self::resolve_zero_search_route_source(input.selected_text.as_ref());
 
+        // Step 2a 辅助：在 selected_text 缺失时从文档 HTML 提取原文。
+        // 若 extract_block_range 失败（block ID 过期 / 文档已变更），返回结构化错误，
+        // 不允许 unwrap_or_default() 产生空 originalText 继续下游。
+        let resolve_original_text_from_range = || -> Result<String, String> {
+          match input.selected_text.as_ref() {
+            Some(t) => Ok(t.clone()),
+            None => Self::extract_block_range(
+              &input.current_editor_content,
+              sbid,
+              so,
+              &ebid,
+              eo,
+            )
+            .map_err(|e| {
+              format!(
+                "E_ANCHOR_STALE: block anchor (start={sbid}:{so}, end={ebid}:{eo}) \
+                 not found in document. The anchor is stale or the document has changed. \
+                 Inner: {e}"
+              )
+            }),
+          }
+        };
+
         return match mode {
           "delete" => {
-            let original_text = input.selected_text.clone().unwrap_or_else(|| {
-              Self::extract_block_range(&input.current_editor_content, sbid, so, &ebid, eo)
-                .unwrap_or_default()
-            });
+            let original_text = resolve_original_text_from_range().map_err(|e| {
+              build_error(
+                E_RANGE_UNRESOLVABLE,
+                ExposurePhase::Resolve,
+                ExposureLevel::Error,
+                Some("selection"),
+                e,
+                ToolErrorKind::Retryable,
+                "定位锚点已失效，无法执行删除操作（文档可能已被修改）",
+              )
+            })?;
             Ok(CanonicalDiffBuilt {
               start_block_id: sbid.clone(),
               start_offset: so,
@@ -2112,7 +2149,7 @@ impl ToolService {
             })
           }
           "insert" => {
-            // 在选区结束位置插入（0 长度 range）
+            // insert：原文为空（0 长度 range）是设计上正确的，不需要 extract_block_range
             Ok(CanonicalDiffBuilt {
               start_block_id: ebid.clone(),
               start_offset: eo,
@@ -2127,11 +2164,18 @@ impl ToolService {
             })
           }
           _ => {
-            // replace → 以选区为 anchor
-            let original_text = input.selected_text.clone().unwrap_or_else(|| {
-              Self::extract_block_range(&input.current_editor_content, sbid, so, &ebid, eo)
-                .unwrap_or_default()
-            });
+            // replace → 以选区为 anchor；锚点失效时结构化失败，不允许继续
+            let original_text = resolve_original_text_from_range().map_err(|e| {
+              build_error(
+                E_RANGE_UNRESOLVABLE,
+                ExposurePhase::Resolve,
+                ExposureLevel::Error,
+                Some("selection"),
+                e,
+                ToolErrorKind::Retryable,
+                "定位锚点已失效，无法执行替换操作（文档可能已被修改）",
+              )
+            })?;
             Ok(CanonicalDiffBuilt {
               start_block_id: sbid.clone(),
               start_offset: so,
@@ -2696,18 +2740,40 @@ impl ToolService {
           let diff_type = cd.diff_type.clone();
           let resolver_error_codes = cd.resolver_error_codes.clone();
           let route_source = cd.route_source.clone();
+          let start_block_id = cd.start_block_id.clone();
+          let end_block_id = cd.end_block_id.clone();
+          let original_text = cd.original_text.clone();
+          let start_offset = cd.start_offset;
+          let end_offset = cd.end_offset;
+          let baseline_id_for_anchor = tool_call
+            .arguments
+            .get("baseline_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
           let diff_id = format!("diff_{}", uuid::Uuid::new_v4());
+          let execution_anchor = serde_json::json!({
+            "filePath": current_file_new,
+            "baselineId": baseline_id_for_anchor,
+            "documentRevision": doc_rev,
+            "startBlockId": start_block_id,
+            "endBlockId": end_block_id,
+            "startOffset": start_offset,
+            "endOffset": end_offset,
+            "originalText": original_text,
+            "routeSource": route_source.clone(),
+          });
           let canonical_diff = serde_json::json!({
             "diffId": diff_id,
             "startBlockId": cd.start_block_id,
             "endBlockId": cd.end_block_id,
-            "startOffset": cd.start_offset,
-            "endOffset": cd.end_offset,
+            "startOffset": start_offset,
+            "endOffset": end_offset,
             "originalText": cd.original_text,
             "newText": cd.new_text,
             "type": cd.edit_type,
             "diff_type": diff_type.clone(),
             "route_source": route_source.clone(),
+            "execution_anchor": execution_anchor,
           });
           let diff_area_id = format!("diff_area_{}", uuid::Uuid::new_v4());
           eprintln!(

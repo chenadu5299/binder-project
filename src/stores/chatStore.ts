@@ -11,12 +11,12 @@ import { ToolCall, MessageContentBlock } from '../types/tool';
 import type { KnowledgeInjectionSlice } from '../types/ai';
 import type { KnowledgeQueryMetadata, KnowledgeQueryWarning } from '../types/knowledge';
 import type { DisplayNode } from '../utils/inlineContentParser';
+import type { FileReference } from '../types/reference';
+import { ReferenceType } from '../types/reference';
 import {
-    createPendingConfirmationRecord,
-    createPendingVerificationRecord,
-    createShadowStageState,
     createShadowTaskRecord,
 } from '../types/agent_state';
+import { AgentTaskController } from '../services/AgentTaskController';
 
 /**
  * Phase 1 边界说明：
@@ -484,18 +484,11 @@ export const useChatStore = create<ChatState>()(persist((set, get) => {
                 const agentStore = useAgentStore.getState();
                 const shadowTask = createShadowTaskRecord(tabId, content);
                 agentStore.setCurrentTask(tabId, shadowTask);
-                agentStore.setStageState(
-                    tabId,
-                    createShadowStageState(shadowTask.id, 'structured', 'user_message_received'),
-                );
-                agentStore.setVerification(
-                    tabId,
-                    createPendingVerificationRecord(shadowTask.id, 'shadow_registry_initialized'),
-                );
-                agentStore.setConfirmation(
-                    tabId,
-                    createPendingConfirmationRecord(shadowTask.id, 'awaiting_candidate_generation'),
-                );
+                AgentTaskController.bootstrapTaskAfterUserMessage({
+                    chatTabId: tabId,
+                    agentTaskId: shadowTask.id,
+                    stageReason: 'user_message_received',
+                });
                 import('../services/agentTaskPersistence').then(({ persistAgentTask }) => {
                     persistAgentTask(
                         shadowTask.id, tabId, content,
@@ -558,6 +551,12 @@ export const useChatStore = create<ChatState>()(persist((set, get) => {
                 if (runtimeWorkspace && runtimeWorkspace !== currentTab.workspacePath) {
                     get().bindToWorkspace(tabId, runtimeWorkspace);
                 }
+
+                // P0-4: Agent mode 必须绑定工作区，无工作区时阻止发送并给出明确错误
+                // 避免后端执行 watcher/cwd 静默兜底导致跨工作区污染
+                if (currentTab.mode === 'agent' && !tabWorkspacePath) {
+                    throw new Error('请先打开一个工作区，再使用 Agent 模式对话。Agent 功能需要绑定工作区才能执行文件操作。');
+                }
                 
                 // P3 + §十三：注入 tab 与 RequestContext 同源（determineInjectionEditorTab）
                 const { getActiveTab, getTabByFilePath } = useEditorStore.getState();
@@ -567,9 +566,6 @@ export const useChatStore = create<ChatState>()(persist((set, get) => {
                 const validRefIdSet = options?.validRefIds?.length
                     ? new Set(options.validRefIds)
                     : undefined;
-                const effectiveRefs = validRefIdSet
-                    ? refs.filter((r) => validRefIdSet.has(r.id))
-                    : refs;
                 const { determineInjectionEditorTab, buildPositioningRequestContext, setPositioningRequestContextForChat } =
                     await import('../utils/requestContext');
                 const { injectionTab, fileRefsForInjection } = determineInjectionEditorTab(
@@ -597,7 +593,11 @@ export const useChatStore = create<ChatState>()(persist((set, get) => {
                 let cursorBlockId: string | null = null;
                 let cursorOffset: number | null = null;
                 if (selectionSameAsInjectionTab && activeEditorTab?.editor) {
-                    const { from, to } = activeEditorTab.editor.state.selection;
+                    // §逻辑选区：优先读取 editorStore 缓存的 lastActiveSelection（跨焦点持久化），
+                    // 仅当缓存为空时才 fallback 到实时 editor.state.selection。
+                    // 这解决了"用户选文字后点击聊天框失焦，sendMessage 才读取导致选区已丢失"的问题。
+                    const cachedSel = activeEditorTab.lastActiveSelection;
+                    const { from, to } = cachedSel ?? activeEditorTab.editor.state.selection;
                     const { createAnchorFromSelection } = await import('../utils/anchorFromSelection');
                     if (from !== to) {
                         selectedText = activeEditorTab.editor.state.doc.textBetween(from, to);
@@ -618,43 +618,9 @@ export const useChatStore = create<ChatState>()(persist((set, get) => {
                         }
                     }
                 }
-                // 12.5：无显式选区时，@ 文本引用四元组作为一级定位输入（route_source=reference）
-                if (
-                    selectionStartBlockId == null ||
-                    selectionStartOffset == null ||
-                    selectionEndBlockId == null ||
-                    selectionEndOffset == null
-                ) {
-                    const { ReferenceType } = await import('../types/reference');
-                    const { extractTextReferenceAnchor } = await import('../utils/referenceProtocolAdapter');
-                    const { isSameDocumentForEdit } = await import('../utils/pathUtils');
-                    const preciseTextRef = effectiveRefs.find((ref) => {
-                        if (ref.type !== ReferenceType.TEXT) return false;
-                        const tr = ref as import('../types/reference').TextReference;
-                        if (!extractTextReferenceAnchor(tr)) return false;
-                        if (!currentFile) return true;
-                        return isSameDocumentForEdit(tr.sourceFile, currentFile);
-                    }) as import('../types/reference').TextReference | undefined;
-
-                    if (preciseTextRef) {
-                        const anchor = extractTextReferenceAnchor(preciseTextRef);
-                        if (anchor) {
-                            selectionStartBlockId = anchor.startBlockId;
-                            selectionStartOffset = anchor.startOffset;
-                            selectionEndBlockId = anchor.endBlockId;
-                            selectionEndOffset = anchor.endOffset;
-                            // 关键：reference 路径强制不注入 selectedText，Resolver 才会稳定标 route_source=reference
-                            selectedText = null;
-                            console.debug('[chatStore] 使用 TextReference 四元组作为零搜索输入', {
-                                sourceFile: preciseTextRef.sourceFile,
-                                startBlockId: anchor.startBlockId,
-                                endBlockId: anchor.endBlockId,
-                            });
-                        }
-                    }
-                }
-                // 旧的 editTarget 构造链已禁用。
-                // 选区/引用定位统一走 selectedText + selectionStart/EndBlockId + selectionStart/EndOffset。
+                // 旧的 TextReference → _sel_* 自动升级路径已禁用。
+                // 执行级零搜索只接受显式编辑器选区；TextReference 保持为阅读/定位上下文，不再冒充 selection。
+                // 旧的 editTarget 构造链也已禁用。
                 
                 // P1 + §十三：L/revision 与 RequestContext 一致；baseline 仅用于 diff 卡 UI（首送写入）
                 const positioningCtx = await buildPositioningRequestContext(injectionTab);
@@ -717,6 +683,33 @@ export const useChatStore = create<ChatState>()(persist((set, get) => {
                             primaryEditTarget = getRelativePath(absRef, wsNorm);
                         }
                     }
+                }
+
+                {
+                    const lastUserMessageId = [...allMessages]
+                        .reverse()
+                        .find((m) => m.role === 'user')?.id ?? null;
+                    const referencedFilePaths = refs
+                        .filter((ref) => ref.type === ReferenceType.FILE)
+                        .filter((ref) => !validRefIdSet || validRefIdSet.has(ref.id))
+                        .map((ref) => (ref as FileReference).path);
+                    console.log('[CROSS_FILE_TRACE][REQUEST_CONTEXT]', JSON.stringify({
+                        messageId: lastUserMessageId,
+                        chatTabId: tabId,
+                        workspacePath: tabWorkspacePath,
+                        activeEditorTabId: activeEditorTab?.id ?? null,
+                        activeEditorFilePath: activeEditorTab?.filePath ?? null,
+                        requestContextTargetFile: positioningCtx?.targetFile ?? null,
+                        requestContextEditorTabId: positioningCtx?.editorTabId ?? null,
+                        injectionTabId: injectionTab?.id ?? null,
+                        injectionFilePath: injectionTab?.filePath ?? null,
+                        referencesFilePaths: referencedFilePaths,
+                        hasOpenedEditorSelection: !!selectedText,
+                        isModifyUnopenedFileScenario: primaryEditTarget != null,
+                        primaryEditTarget,
+                        currentFile,
+                        currentFileExplicitlyReferenced,
+                    }));
                 }
                 
                 await invoke('ai_chat_stream', {

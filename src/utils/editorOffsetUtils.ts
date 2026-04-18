@@ -385,14 +385,3 @@ export function blockRangeToPMRange(
     endOffset
   );
 }
-
-/**
- * 根据文档位置计算行号（1-based）
- * 按换行符切分，position 前的文本中换行符数量 + 1
- */
-export function positionToLine(doc: PMNode, pos: number): number {
-  if (pos <= 0) return 1;
-  const textBefore = doc.textBetween(0, Math.min(pos, doc.content.size));
-  const newlineCount = (textBefore.match(/\n/g) || []).length;
-  return newlineCount + 1;
-}

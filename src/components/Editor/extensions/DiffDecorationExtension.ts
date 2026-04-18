@@ -1,6 +1,6 @@
 /**
  * Phase 2b / Phase 3：基于 blockId 的 Diff 删除标记
- * 从 diffStore 获取 diffs，优先使用 mappedFrom/mappedTo，否则 blockRangeToPMRange
+ * 从 diffStore 获取 diffs，统一先经 ExecutionAnchor 解析，再在运行时派生 mappedFrom/mappedTo
  * appendTransaction：用户编辑时 mapping 跟随
  * 使用 Plugin state 存储 DecorationSet，通过 meta 事务刷新，确保视图正确更新
  * 见《对话编辑 Diff 前端实现规范》
@@ -9,8 +9,8 @@
 import { Extension } from '@tiptap/core';
 import { Plugin, PluginKey, StateField } from '@tiptap/pm/state';
 import { Decoration, DecorationSet } from '@tiptap/pm/view';
-import { blockRangeToPMRange, clampDocRangeToContainingBlock } from '../../../utils/editorOffsetUtils';
-import { useDiffStore } from '../../../stores/diffStore';
+import { clampDocRangeToContainingBlock } from '../../../utils/editorOffsetUtils';
+import { resolvePendingDiffRange, useDiffStore } from '../../../stores/diffStore';
 
 const DIFF_DELETE_STYLE = 'background-color: #FCEBEB; color: #A32D2D; text-decoration: line-through;';
 const DIFF_ACCEPTED_STYLE = 'background-color: rgba(34, 197, 94, 0.2);';
@@ -27,22 +27,10 @@ export interface DiffDecorationOptions {
 
 function getRangeForDiff(
   doc: import('@tiptap/pm/model').Node,
+  filePath: string,
   d: import('../../../stores/diffStore').DiffEntry
 ): { from: number; to: number } | null {
-  if (d.mappedFrom != null && d.mappedTo != null && d.mappedFrom < d.mappedTo) {
-    return { from: d.mappedFrom, to: d.mappedTo };
-  }
-  return blockRangeToPMRange(
-    doc,
-    d.startBlockId,
-    d.startOffset,
-    d.endBlockId,
-    d.endOffset,
-    {
-      occurrenceIndex: d.occurrenceIndex,
-      originalTextFallback: d.originalText,
-    }
-  );
+  return resolvePendingDiffRange(doc, filePath, d);
 }
 
 function computeDecorationSet(
@@ -87,7 +75,7 @@ function computeDecorationSet(
     }
     // pending → 红色删除线（问题5：超长时先尝试块内裁剪，再跳过）
     if (d.status === 'pending') {
-      const range = getRangeForDiff(doc, d);
+      const range = getRangeForDiff(doc, filePath, d);
       if (!range) continue;
       if (range.from < 0 || range.to > docSize || range.from >= range.to) continue;
       let from = range.from;
@@ -186,34 +174,17 @@ export const DiffDecorationExtension = Extension.create<DiffDecorationOptions>({
           }> = [];
 
           for (const d of pending) {
-            const rangeOpts = {
-              occurrenceIndex: d.occurrenceIndex,
-              originalTextFallback: d.originalText,
-            };
             const decoratedRange = decoratedRangesByDiffId.get(d.diffId);
+            const anchorRange =
+              decoratedRange ??
+              resolvePendingDiffRange(oldState.doc, filePath, d);
             let from =
               d.mappedFrom ??
-              decoratedRange?.from ??
-              blockRangeToPMRange(
-                oldState.doc,
-                d.startBlockId,
-                d.startOffset,
-                d.endBlockId,
-                d.endOffset,
-                rangeOpts
-              )?.from ??
+              anchorRange?.from ??
               -1;
             let to =
               d.mappedTo ??
-              decoratedRange?.to ??
-              blockRangeToPMRange(
-                oldState.doc,
-                d.startBlockId,
-                d.startOffset,
-                d.endBlockId,
-                d.endOffset,
-                rangeOpts
-              )?.to ??
+              anchorRange?.to ??
               -1;
             if (from < 0 || to < 0 || from >= to) {
               updates.push({ diffId: d.diffId, partial: { status: 'expired' } });

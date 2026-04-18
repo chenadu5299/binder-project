@@ -1,10 +1,24 @@
 // 引用创建辅助函数
+// 依据：A-CORE-C-D-02 §3.3（TextReference 主定义）/ A-DE-M-D-01 §5.8（精确引用四元组要求）
+//
+// 引用精度协议（Protocol）：
+//   TextReference + textReference 四元组  → 精确引用锚点（precise reference anchor）
+//   TextReference（行级，无四元组）        → 阅读上下文（reading context）
+//   FileReference                         → 阅读上下文，无位置信息，不承担执行锚点职责
+//
+// 标签格式标准（A-CORE-C-D-02 §3.3 引用标签）：
+//   TextReference：内容摘要主标签，位置仅作弱后缀去重
+//   文件级引用：filename
 
 import { TextReference, ReferenceType, TextReferenceAnchor } from '../types/reference';
+import { buildContentLabel } from './contentLabel';
 
 /**
  * 创建完整的 TextReference
  * 依据：A-DE-M-D-01 §5.8 第4条——行级引用可携带可选四元组
+ *
+ * ⚠️ 若调用时能提供 textReference 四元组，必须传入；否则产出"行级精度"对象，
+ *    只能作为阅读上下文，不能直接直通执行链。
  */
 export function createTextReference(params: {
     content: string;
@@ -17,9 +31,15 @@ export function createTextReference(params: {
 }): Omit<TextReference, 'id' | 'createdAt'> {
     const fileName = params.fileName || params.sourceFile.split('/').pop() || params.sourceFile.split('\\').pop() || '未命名文件';
     const preview = params.preview || params.content.substring(0, 100) + (params.content.length > 100 ? '...' : '');
-    const displayText = params.lineRange
-        ? `${fileName} (行 ${params.lineRange.start}-${params.lineRange.end})`
-        : fileName;
+
+    const snippet = buildContentLabel(params.content || params.preview, fileName);
+    const displayText = params.textReference
+        ? `${snippet} · @${params.textReference.startOffset}`
+        : params.lineRange
+            ? params.lineRange.start === params.lineRange.end
+                ? `${snippet} · L${params.lineRange.start}`
+                : `${snippet} · L${params.lineRange.start}-${params.lineRange.end}`
+            : snippet;
 
     const base: Omit<TextReference, 'id' | 'createdAt'> = {
         type: ReferenceType.TEXT,
@@ -93,6 +113,62 @@ export function createTextReferenceFromClipboard(source: {
             endOffset: textReference.endOffset,
         }),
     };
+}
+
+/**
+ * 尝试用 Editor DOM 补齐 TextReference 的精确四元组。
+ *
+ * 适用场景：TextReference 通过剪贴板或其它路径创建，已有 lineRange，但 textReference
+ * 四元组缺失（CopyReferenceExtension 在无 BlockId 时的退化情形）。
+ *
+ * 若目标文件已在编辑器中打开且 doc 有效，则通过行号计算 ProseMirror 位置并解析出
+ * block ID + offset，填入 textReference 字段，使该引用升级为"精确引用锚点"精度。
+ *
+ * 若文件未打开或计算失败，原样返回（保持"行级精度/阅读上下文"语义，不抛异常）。
+ *
+ * 依据：A-DE-M-D-01 §5.8.4 / A-AST-M-P-01 §12.1
+ *
+ * @param ref       已创建但缺少四元组的 TextReference
+ * @returns         补齐后的引用（或原对象）
+ */
+export async function enrichTextReferenceAnchor(
+    ref: TextReference,
+): Promise<TextReference> {
+    // 已有四元组，直接返回
+    if (ref.textReference) return ref;
+    // 没有行号范围，无法推导 PM 位置
+    if (!ref.lineRange || !ref.sourceFile) return ref;
+
+    try {
+        // 动态导入，避免循环依赖（referenceHelpers ← editorStore ← 各组件）
+        const { useEditorStore } = await import('../stores/editorStore');
+        const editorTabs = useEditorStore.getState().tabs;
+        const editorTab = editorTabs.find((t: any) => t.filePath === ref.sourceFile);
+        if (!editorTab?.editor) return ref;
+
+        const { createAnchorFromLineRange } = await import('./anchorFromSelection');
+        const anchor = createAnchorFromLineRange(
+            editorTab.editor.state.doc,
+            ref.lineRange.start,
+            ref.lineRange.end,
+        );
+        if (!anchor) return ref;
+
+        // 升级为精确引用锚点精度；不直接等于执行级真源
+        return {
+            ...ref,
+            textReference: anchor,
+            startBlockId: anchor.startBlockId,
+            endBlockId: anchor.endBlockId,
+            // 兼容旧字段同步更新
+            blockId: anchor.startBlockId,
+            startOffset: anchor.startOffset,
+            endOffset: anchor.endOffset,
+        };
+    } catch {
+        // 补齐失败时保留原始行级精度，不抛异常
+        return ref;
+    }
 }
 
 /**

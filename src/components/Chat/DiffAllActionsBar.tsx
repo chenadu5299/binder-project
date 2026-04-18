@@ -26,7 +26,6 @@ export const DiffAllActionsBar: React.FC = () => {
   const byTab = useDiffStore((s) => s.byTab);
   const byFilePath = useDiffStore((s) => s.byFilePath);
   const getPendingForBulk = useDiffStore((s) => s.getPendingForBulk);
-  const updateTabContent = useEditorStore((s) => s.updateTabContent);
   const editorTabs = useEditorStore((s) => s.tabs);
   const editorActiveTabId = useEditorStore((s) => s.activeTabId);
   const { currentWorkspace } = useFileStore();
@@ -129,6 +128,7 @@ export const DiffAllActionsBar: React.FC = () => {
       let applied = 0;
       let expired = 0;
       let skippedFiles = 0;
+      let backendWriteFailedFiles = 0;
       const refreshFilePaths = new Set<string>();
       for (const { filePath: tabFp, entries } of pending.byTab) {
         const tab = editorTabs.find((t) => t.filePath === tabFp);
@@ -139,6 +139,17 @@ export const DiffAllActionsBar: React.FC = () => {
         }
         // 关键：同文件同次批量必须一次事务执行，不能按 toolCallId 分批执行。
         const scopedDiffIds = [...new Set(entries.map((e) => e.diffId).filter(Boolean))];
+        console.log('[CROSS_FILE_TRACE][ACCEPT_ENTRY]', JSON.stringify({
+          sourceComponent: 'DiffAllActionsBar',
+          method: 'DiffActionService.acceptAll',
+          filePath: tabFp,
+          diffIds: scopedDiffIds,
+          sourcePool: 'byTab',
+          route: 'editor_apply_batch',
+          activeEditorFilePath: activeEditorTab?.filePath ?? null,
+          chatTabId: activeChatTabId ?? null,
+          scope,
+        }));
         // 取首个有效的 chatTabId/agentTaskId 作为代表（同批 diff 通常属同一 task）
         const rep = entries.find((e) => e.chatTabId && e.agentTaskId);
         const result = await DiffActionService.acceptAll(
@@ -154,7 +165,6 @@ export const DiffAllActionsBar: React.FC = () => {
         applied += result.applied;
         expired += result.expired;
         if (result.anyApplied) refreshFilePaths.add(tabFp);
-        updateTabContent(tab.id, tab.editor.getHTML());
         tab.editor.view.dispatch(tab.editor.state.tr);
       }
       // 所有文件批量处理完成后统一刷新一次，避免中途刷新导致后续同轮批量误判。
@@ -168,14 +178,34 @@ export const DiffAllActionsBar: React.FC = () => {
           skippedFiles++;
           continue;
         }
-        const indices = entries.map((e) => e.diff_index);
+        const indices = [...new Set(entries.map((e) => e.diff_index))];
         const rep = entries.find((e) => e.chatTabId && e.agentTaskId);
-        await DiffActionService.acceptFileDiffs(filePath, currentWorkspace, {
-          chatTabId: rep?.chatTabId,
-          agentTaskId: rep?.agentTaskId,
+        console.log('[CROSS_FILE_TRACE][ACCEPT_ENTRY]', JSON.stringify({
+          sourceComponent: 'DiffAllActionsBar',
+          method: 'DiffActionService.acceptFileDiffs',
+          filePath,
           diffIndices: indices,
-        });
-        applied += entries.length;
+          sourcePool: 'byFilePath',
+          route: 'backend_accept_file_diffs',
+          activeEditorFilePath: activeEditorTab?.filePath ?? null,
+          chatTabId: activeChatTabId ?? null,
+          scope,
+        }));
+        try {
+          await DiffActionService.acceptFileDiffs(filePath, currentWorkspace, {
+            chatTabId: rep?.chatTabId,
+            agentTaskId: rep?.agentTaskId,
+            diffIndices: indices,
+          });
+          applied += entries.length;
+        } catch (error) {
+          backendWriteFailedFiles++;
+          toast.error(
+            `写盘失败（后端）: ${filePath.split('/').pop() || filePath} · ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
       }
       if (skippedFiles > 0) {
         toast.info(
@@ -184,16 +214,25 @@ export const DiffAllActionsBar: React.FC = () => {
       }
       if (applied > 0 || expired > 0) {
         if (expired > 0) {
-          toast.info(`部分修改已过期（共 ${expired} 处），已跳过。其余 ${applied} 处已应用。`);
+          toast.info(`部分修改因文档已变化或解析失败被跳过（共 ${expired} 处），其余 ${applied} 处已应用。`);
         } else {
           toast.success(`已应用 ${applied} 处修改（${SCOPE_LABELS[scope]}）`);
         }
       }
+      if (backendWriteFailedFiles > 0) {
+        toast.error(`后端写盘失败：${backendWriteFailedFiles} 个文件未完成写入。`);
+      }
       if ((import.meta as any).env?.DEV) {
-        console.debug('[diffStore] DIFF_BULK_ACTION accept', { scope, applied, expired, skippedFiles });
+        console.debug('[diffStore] DIFF_BULK_ACTION accept', {
+          scope,
+          applied,
+          expired,
+          skippedFiles,
+          backendWriteFailedFiles,
+        });
       }
     } catch (e) {
-      toast.error('全部接受时出错');
+      toast.error('批量接受中断：可能包含前端解析/应用异常。');
       console.error(e);
     }
   };
@@ -202,6 +241,7 @@ export const DiffAllActionsBar: React.FC = () => {
     if (scope === 'global' && !confirmGlobal('reject')) return;
     try {
       let skippedFiles = 0;
+      let backendRejectFailedFiles = 0;
       for (const { filePath: tabFp, entries } of pending.byTab) {
         const tab = editorTabs.find((t) => t.filePath === tabFp);
         for (const entry of entries) {
@@ -221,10 +261,19 @@ export const DiffAllActionsBar: React.FC = () => {
           continue;
         }
         const rep = entries.find((e) => e.chatTabId && e.agentTaskId);
-        await DiffActionService.rejectFileDiffs(filePath, currentWorkspace, {
-          chatTabId: rep?.chatTabId,
-          agentTaskId: rep?.agentTaskId,
-        });
+        try {
+          await DiffActionService.rejectFileDiffs(filePath, currentWorkspace, {
+            chatTabId: rep?.chatTabId,
+            agentTaskId: rep?.agentTaskId,
+          });
+        } catch (error) {
+          backendRejectFailedFiles++;
+          toast.error(
+            `后端队列清理失败: ${filePath.split('/').pop() || filePath} · ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
       }
       if (skippedFiles > 0) {
         toast.info(
@@ -232,11 +281,18 @@ export const DiffAllActionsBar: React.FC = () => {
         );
       }
       toast.info(`已拒绝全部修改（${SCOPE_LABELS[scope]}）`);
+      if (backendRejectFailedFiles > 0) {
+        toast.error(`后端拒绝队列处理失败：${backendRejectFailedFiles} 个文件未完成。`);
+      }
       if ((import.meta as any).env?.DEV) {
-        console.debug('[diffStore] DIFF_BULK_ACTION reject', { scope, skippedFiles });
+        console.debug('[diffStore] DIFF_BULK_ACTION reject', {
+          scope,
+          skippedFiles,
+          backendRejectFailedFiles,
+        });
       }
     } catch (e) {
-      toast.error('全部拒绝时出错');
+      toast.error('批量拒绝中断：包含前端处理异常。');
       console.error(e);
     }
   };

@@ -22,10 +22,12 @@ import { CopyReferenceExtension } from './extensions/CopyReferenceExtension';
 import { BlockIdExtension } from './extensions/BlockIdExtension';
 import { FontSize } from './extensions/FontSize';
 import { DiffDecorationExtension } from './extensions/DiffDecorationExtension';
+import { SelectionHighlightExtension } from './extensions/SelectionHighlightExtension';
 import { PageTopCaretExtension } from './extensions/PageTopCaretExtension';
 import { BlankLineDebugExtension } from './extensions/BlankLineDebugExtension';
 import { useEditorStore } from '../../stores/editorStore';
 import { useDiffStore } from '../../stores/diffStore';
+import { registerPendingDiffContentSync } from '../../services/diffPendingContentSync';
 import { PaginationPlus } from 'tiptap-pagination-plus';
 interface TipTapEditorProps {
   content: string;
@@ -183,6 +185,8 @@ const TipTapEditor: React.FC<TipTapEditorProps> = ({
           return currentTab?.filePath ?? null;
         },
       }),
+      // 失焦选区幽灵高亮：editor 失焦后保留视觉选区
+      SelectionHighlightExtension,
     ],
     content,
     editable,
@@ -232,6 +236,14 @@ const TipTapEditor: React.FC<TipTapEditorProps> = ({
     }
   }, [editor, tabId, pendingScrollTo]);
 
+  // Diff 卡片状态机：pending 区间随文档事务与 originalText 对齐，漂移则失效
+  useEffect(() => {
+    if (!editor || !tabId) return;
+    const filePath = useEditorStore.getState().tabs.find((t) => t.id === tabId)?.filePath;
+    if (!filePath) return;
+    return registerPendingDiffContentSync(editor, filePath);
+  }, [editor, tabId]);
+
   // Phase 2b：diffStore 更新时强制刷新文档内 Diff 装饰（红色删除线）
   // ProseMirror decorations 仅在视图更新时重算，diffStore 变化不会触发，需主动 dispatch
   useEffect(() => {
@@ -256,6 +268,38 @@ const TipTapEditor: React.FC<TipTapEditorProps> = ({
     const currentContent = editor.getHTML();
     // 只有当外部内容与编辑器内容不同时才更新
     if (content !== currentContent && content !== lastContentRef.current) {
+      const store = useEditorStore.getState();
+      const currentTab = tabId
+        ? store.tabs.find((t) => t.id === tabId)
+        : store.tabs.find((t) => t.id === store.activeTabId);
+      const activeEditorTab = store.tabs.find((t) => t.id === store.activeTabId) ?? null;
+      if (currentTab?.filePath) {
+        console.log('[CROSS_FILE_TRACE][DOC_REBUILD_INVALIDATE_RANGES]', JSON.stringify({
+          targetFilePath: currentTab.filePath,
+          sourceReason: 'tiptap_set_content_external_sync',
+          oldRevision: currentTab.documentRevision ?? null,
+          newRevision: null,
+          hasPendingByFilePath: (useDiffStore.getState().byFilePath[currentTab.filePath]?.length ?? 0) > 0,
+          hasResolvedByTab: (useDiffStore.getState().byTab[currentTab.filePath]?.diffs.size ?? 0) > 0,
+          triggeredByActiveTab: activeEditorTab?.id === currentTab.id,
+        }));
+        useDiffStore.getState().invalidateDocRangesForFile(
+          currentTab.filePath,
+          'tiptap_set_content_external_sync',
+        );
+      }
+      console.log('[CROSS_FILE_TRACE][SET_CONTENT]', JSON.stringify({
+        sourceFile: 'TipTapEditor.tsx',
+        sourceFunction: 'content_sync_useEffect',
+        reason: 'external_sync',
+        targetTabId: currentTab?.id ?? tabId ?? null,
+        targetFilePath: currentTab?.filePath ?? null,
+        oldRevision: currentTab?.documentRevision ?? null,
+        newRevision: null,
+        contentLength: content.length,
+        contentPreview: content.slice(0, 120),
+        activeEditorFilePath: activeEditorTab?.filePath ?? null,
+      }));
       console.warn('[对话编辑] TipTapEditor setContent 被触发，可能覆盖文档导致 Diff 失效', {
         contentLen: content.length,
         currentContentLen: currentContent.length,

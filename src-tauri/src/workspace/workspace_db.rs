@@ -495,17 +495,30 @@ impl WorkspaceDb {
   pub fn insert_pending_diffs(
     &self,
     file_path: &str,
-    diffs: &[(String, String, i32)], // (original_text, new_text, para_index)
+    diffs: &[(String, String, i32, String)], // (original_text, new_text, para_index, diff_type)
   ) -> Result<Vec<PendingDiffEntry>, String> {
     let conn = self.conn.lock().map_err(|e| format!("锁失败: {}", e))?;
     let now = chrono::Utc::now().timestamp();
     let mut result = Vec::new();
+    let replaced = conn
+      .execute(
+        "DELETE FROM pending_diffs WHERE file_path = ?1 AND status = 'pending'",
+        params![file_path],
+      )
+      .map_err(|e| format!("replace pending_diffs 失败: {}", e))?;
+    if replaced > 0 {
+      eprintln!(
+        "[CROSS_FILE_TRACE][DB] {{\"op\":\"insert_pending_diffs:replace_existing\",\"file_path\":{:?},\"deleted\":{}}}",
+        file_path,
+        replaced,
+      );
+    }
 
-    for (idx, (original_text, new_text, para_index)) in diffs.iter().enumerate() {
+    for (idx, (original_text, new_text, para_index, diff_type)) in diffs.iter().enumerate() {
       conn.execute(
                 "INSERT INTO pending_diffs (file_path, diff_index, original_text, new_text, para_index, diff_type, status, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'replace', 'pending', ?6)",
-                params![file_path, idx as i32, original_text, new_text, para_index, now],
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)",
+                params![file_path, idx as i32, original_text, new_text, para_index, diff_type, now],
             )
             .map_err(|e| format!("insert pending_diff 失败: {}", e))?;
 
@@ -517,7 +530,7 @@ impl WorkspaceDb {
         original_text: original_text.clone(),
         new_text: new_text.clone(),
         para_index: *para_index,
-        diff_type: "replace".to_string(),
+        diff_type: diff_type.clone(),
         status: "pending".to_string(),
         created_at: now,
       });
@@ -588,6 +601,28 @@ impl WorkspaceDb {
       )
       .map_err(|e| format!("delete pending_diffs 失败: {}", e))?;
     Ok(n)
+  }
+
+  pub fn delete_pending_diffs_for_indices(
+    &self,
+    file_path: &str,
+    diff_indices: &[i32],
+  ) -> Result<usize, String> {
+    if diff_indices.is_empty() {
+      return Ok(0);
+    }
+
+    let conn = self.conn.lock().map_err(|e| format!("锁失败: {}", e))?;
+    let mut deleted = 0usize;
+    for diff_index in diff_indices {
+      deleted += conn
+        .execute(
+          "DELETE FROM pending_diffs WHERE file_path = ?1 AND diff_index = ?2 AND status = 'pending'",
+          params![file_path, diff_index],
+        )
+        .map_err(|e| format!("按 diff_index 删除 pending_diffs 失败: {}", e))?;
+    }
+    Ok(deleted)
   }
 
   pub fn delete_pending_diffs_for_paths(&self, file_paths: &[String]) -> Result<usize, String> {

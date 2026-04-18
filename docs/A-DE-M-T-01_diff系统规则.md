@@ -72,7 +72,17 @@ MUST：
 1. 每条 diff 必须包含：`diffId/startBlockId/startOffset/endBlockId/endOffset/originalText/newText/type/diff_type/route_source`。
 2. 字段缺失的 diff 条目不得进入渲染与执行链。
 3. `route_source` 必须保留用于追踪路由来源。
-4. 当输入来源为精确引用四元组且无显式选区时，`route_source` 必须为 `reference`，不得写成 `block_search`。
+4. `route_source` 仅描述 canonical diff 的实际解析来源；当前已生效枚举为 `selection/block_search/workspace_resolve`。
+5. 精确引用锚点（`TextReference.textReference`）属于上游定位辅助，不得再因为“无显式选区”而自动写出 `route_source=reference`。
+
+### 3.1a ExecutionAnchor（执行真源）
+
+MUST：
+1. 当前进入执行链的 canonical diff，必须绑定 `ExecutionAnchor`。
+2. `ExecutionAnchor` 最小字段集为：`filePath/startBlockId/endBlockId/startOffset/endOffset/originalText`。
+3. 若执行链已知 `baselineId/documentRevision`，必须与 `ExecutionAnchor` 一同写入。
+4. `block_index`、`target` 命中区间、`TextReference.textReference`、`para_index + original_text` 都只是上游定位信号；进入执行链前必须先归一到 `ExecutionAnchor`。
+5. 无法归一为 `ExecutionAnchor` 的对象不得冒充 canonical diff 执行真源，只能停留在待 resolve / 待读取阶段。
 
 ### 3.2 区间关系
 
@@ -108,11 +118,12 @@ MUST：
 2. `mappedFrom`、`mappedTo`
 3. `executionExposure`
 4. `expireReason`
+5. `executionAnchor`
 
 MUST：
 1. 同一次工具返回中各 diff 区间不重叠。
 2. `originalText` 必须与生成时逻辑态区间一致。
-3. `route_source`、`baselineId`、`documentRevision(revision)` 属于主链执行字段，主定义以 `A-CORE-C-D-02_产品术语边界.md` 与 `A-DE-M-D-01_对话编辑统一方案.md` 为准，不得作为可缺省扩展字段处理。
+3. `route_source`、`baselineId`、`documentRevision(revision)`、`executionAnchor` 属于主链执行字段，主定义以 `A-CORE-C-D-02_产品术语边界.md` 与 `A-DE-M-D-01_对话编辑统一方案.md` 为准，不得作为可缺省扩展字段处理。
 4. 只有展示增强类扩展字段缺失时，才允许在不破坏主链语义的前提下临时兼容读取。
 5. 上述临时兼容仅限旧存量 diff 记录的展示读取，不得作为新写入、新协议输出或执行链缺字段兜底；待旧记录迁移完成后应删除该兼容。
 
@@ -137,8 +148,9 @@ MUST：
 MUST：
 1. 聊天侧承担完整 diff 信息展示（原文/新文/状态/定位）。
 2. 卡片状态最小集：`pending/expired/accepted/rejected`。
-3. 标题格式统一：`路径 + 标题 + 块号`；`document_level` 可省块号。
+3. 标题格式统一为：`路径栏 + 内容摘要标题`。标题主文案取引用内容前缀，中文按前 5 个字近似，英文/半宽字符按约 10 个字符近似；不得再以“第几行/第几处”作为主标题。
 4. 历史卡片默认折叠策略保持一致，不允许按来源分叉。
+5. TextReference 引用标签与 diff 卡标题保持同一命名原则：内容摘要为主，位置只允许作为弱后缀去重，不得再以“文件名 + 位置简述”充当主标签。
 
 diff_type 展示定型（来源：主控 §7.4）：
 1. `precise`：正常展示，不加额外标签。
@@ -159,9 +171,17 @@ MUST：
 ### 5.1 单卡执行
 
 MUST：
-1. 执行前校验目标区间与 `originalText`。
+1. 执行前必须先以 `ExecutionAnchor` 解析目标区间，再校验 `originalText`。
 2. 校验失败进入失败暴露，不得静默吞掉。
 3. 单卡成功后仅更新对应 diff 状态，不影响同批其他卡。
+
+### 5.1a 红删 / 应用 / 绿高亮同源约束
+
+MUST：
+1. 红删定位范围必须从 `ExecutionAnchor` 解析，并允许通过 ProseMirror `mapping` 派生为 `mappedFrom/mappedTo`。
+2. accept 读范围必须与红删使用同一 `ExecutionAnchor` 解析结果，不得另起一套范围来源。
+3. 绿高亮范围必须是该次 accept 应用成功后的派生结果（`acceptedFrom/acceptedTo`），不得脱离本次 apply 事务单独生成。
+4. `mappedFrom/mappedTo` 与 `acceptedFrom/acceptedTo` 都是展示/运行时派生字段，不是执行真源。
 
 ### 5.2 批量执行
 
@@ -227,7 +247,7 @@ interface DiffExecuteFailedEvent {
   diffId: string;
   code: ExecutionErrorCode;        // 错误码，见 diffStore ExecutionErrorCode 枚举
   retryable: boolean;              // 是否允许重试
-  route_source: 'selection' | 'reference' | 'block_search';
+  route_source: 'selection' | 'block_search' | 'workspace_resolve';
   agentTaskId?: string;
   chatTabId?: string;
   timestamp: number;
@@ -343,6 +363,7 @@ const MAX_RETRY = 2;
 - 正常的"接受/拒绝"按钮**保留**（用户可选择直接拒绝而非重试）。
 - "重试执行"点击 → `DiffRetryController.retryDiff(diff.diffId, editor, options)`。
 - 重试过程中按钮显示加载态，禁止并发触发。
+- 持久错误暴露主链只保留 `DiffEntry.executionExposure + agentStore.verification`；toast 仅作瞬时提示。
 
 #### 6.6.5 `DiffActionService` 侧变更
 
@@ -365,6 +386,69 @@ const MAX_RETRY = 2;
 3. 禁止文档侧与聊天侧展示口径分叉。
 4. 禁止把失败暴露事件写成业务失效状态。
 5. 禁止绕过排序直接并发写入同一重叠区间。
+6. 禁止 `update_file` 的 diff 审阅只出现在 ToolCallCard 或 PendingDiffPanel，不出现在消息流（`ChatMessages.contentBlocks` 主链）。
+7. 禁止 ToolCallCard 或 PendingDiffPanel 的 accept/reject 绕过 `DiffActionService`。
+
+---
+
+## 九、对话编辑双轨模型（edit_current_editor_document vs update_file）
+
+### 9.1 统一渲染主链（2026-04-17 收口）
+
+| 维度 | edit_current_editor_document | update_file |
+|------|------------------------------|-------------|
+| 数据结构 | `DiffEntry`（`byTab[filePath]`）| `FileDiffEntry`（`byFilePath[filePath]`）；resolve 后同步为 `DiffEntry`（`byTab`）|
+| 执行真源 | 生成时即绑定 `ExecutionAnchor` | 初始仅有 `para_index + original_text`；resolve 后补齐为 `ExecutionAnchor` |
+| **消息流渲染（主链）** | **`ChatMessages.contentBlocks`** DiffCard | **`ChatMessages.contentBlocks`** DiffCard（resolved）或 FileDiffCard（未 resolve）|
+| accept/reject 入口 | `DiffActionService.acceptDiff/rejectDiff` | `DiffActionService.acceptFileDiffs/rejectFileDiffEntry`（未 resolve）或 `acceptResolvedDiffCard/rejectResolvedDiffCard`（resolved）|
+| stage 推进 | `AgentTaskController.checkAndAdvanceStage` | `acceptResolvedDiffCard` 先走 `acceptDiff -> checkAndAdvanceStage`，再走 `acceptFileDiffs -> handleFileDiffResolution`；最终裁决需同时满足 byTab / byFilePath 无 pending |
+| 批量 accept/reject | `DiffAllActionsBar` → byTab（acceptAll）+ byFilePath（acceptFileDiffs）**统一处理** | 同左 |
+
+### 9.2 ToolCallCard 职责（收口后）
+
+- **旧格式消息（无 contentBlocks）**：ToolCallCard 仅保留兼容摘要与基础文件打开提示；不再渲染完整可操作 diff 卡，也不再承担 `setFilePathDiffs` / `resolveFilePathDiffs` / `notifyDiffsReady`。
+- **新格式消息（有 contentBlocks）**：ToolCallCard **不再**被渲染，diff 审阅由 `ChatMessages.contentBlocks` 分支处理。
+- `toolCall.result.meta.verification` 不再作为 `update_file` 的持久 diff 错误状态展示；以消息流 diff 卡和 agent shadow 状态为准。
+
+### 9.3 PendingDiffPanel 职责
+
+- `PendingDiffPanel` 已退出默认可见运行时主链，不再作为常驻聚合提示条挂载在主界面。
+- 当前可见审阅入口只保留消息流 `ChatMessages.contentBlocks`；工作区级 `byFilePath` 仍是运行时状态池，但不再额外投射为顶部/底部提示条。
+- 若后续恢复 `PendingDiffPanel`，只能以调试或辅助导航形态回归，不得重新形成第二套常驻审阅体感。
+
+### 9.4 水合机制（历史消息加载）
+
+| 格式 | 水合路径 |
+|------|---------|
+| 旧格式（无 contentBlocks）| `UnopenedDocumentDiffRuntime.start()` 订阅 chatStore，扫描 `message.toolCalls` 并按 `toolCallId + filePath + diff_index` 语义守卫水合 |
+| 新格式（有 contentBlocks）| `UnopenedDocumentDiffRuntime.start()` 订阅 chatStore，扫描 `message.contentBlocks` 并按 `toolCallId + filePath + diff_index` 语义守卫水合 |
+
+ChatPanel 流式事件是主写路径（经 `UnopenedDocumentDiffRuntime.ingestUpdateFileToolCall` 写入 byFilePath）。历史水合统一收口到 `UnopenedDocumentDiffRuntime.start()`，不再只看“当前 byFilePath 是否为空”，而是按以下语义守卫逐条过滤：
+1. 同一 `toolCallId + filePath + diff_index` 若仍在 `byFilePath`，视为 pending，禁止重复注入。
+2. 同一对象若已在 `byTab` 以 `accepted/rejected/expired` 终态存在，禁止回填为 pending。
+3. 同一对象若已从 `byFilePath` 清除，但已记录为 workspace 终态（accepted/rejected），禁止因历史消息再次写回。
+
+### 9.5 临时桥接层：byFilePath
+
+`byFilePath` 是 workspace 未打开文档 diff 的临时承载池。当前状态与退出条件：
+
+| 状态 | 说明 |
+|------|------|
+| 当前定位 | 临时承载池：存储 FileDiffEntry，供消息流卡片和 runtime 消费 |
+| **禁止**扩展的方向 | 不得为 FileDiffEntry 添加 `status` 枚举，不得发展成第二套完整状态机 |
+| 当前主权 | `UnopenedDocumentDiffRuntime` 统一负责流式写入、历史水合、打开后 resolve；`ChatPanel/documentService` 只把事件交给 runtime；`ToolCallCard` 只保留兼容展示与用户交互 |
+| 退出条件 | 当 `resolveFilePathDiffs`（FileDiffEntry→DiffEntry）覆盖率足够高时，可考虑废弃 byFilePath；但需先确保全格式消息的 resolve 路径稳定 |
+
+补充说明：
+1. `byFilePath` 中未 resolve 的 workspace diff 当前仍以 `para_index + original_text` 为暂存定位信号，尚未在生成瞬间冻结为 `ExecutionAnchor`。
+2. 一旦 `resolveFilePathDiffs` 成功，后续红删、accept 读范围与定位跳转统一改用 `ExecutionAnchor`。
+
+补充：
+- 后端 `pending_diffs` 现已区分 `diff_type=precise|block_level`。
+- 单行 / 单块 `replace` 会先裁掉共同前后缀，若仍保留非空 `original_text`，则前端 resolve 会对准更小的真实修改片段。
+- 插入、跨多行替换、无法缩小到非空 `original_text` 的场景仍可能停留在 `block_level`，当前未彻底消除所有整块替换。
+- editor 打开触发 resolve 已从 `EditorPanel.handleEditorReady` 移出，改由 `UnopenedDocumentDiffRuntime.start()` 订阅 editorStore，在 tab 拥有 editor 且 `byFilePath[filePath]` 非空时自动执行。
+- `EditorPanel` 顶部不再承担 workspace diff 审阅，也不再显示常驻提示条；可见审阅提示统一收口到消息流。
 
 ---
 
@@ -381,7 +465,7 @@ const MAX_RETRY = 2;
 1. 同批 diff 的排序与执行结果可重放。
 2. 非法重叠 diff 被拦截且有失败暴露。
 3. 文档侧与聊天侧状态对齐一致。
-4. 复制粘贴生成的精确引用在无显式选区场景下，diff 的 `route_source` 必须稳定为 `reference`。
+4. 复制粘贴生成的精确引用在无显式选区场景下，不得自动回填 `_sel_*` 冒充 selection；若后续成功冻结 `ExecutionAnchor`，其 `route_source` 必须与实际解析路径一致。
 
 ### 8.3 观测验收
 

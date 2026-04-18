@@ -58,6 +58,46 @@ export function findBlockAtPos(
 }
 
 /**
+ * 从行号范围创建 Anchor（将 1-indexed 行号转换为 block ID + offset）
+ *
+ * 行号定义与 CopyReferenceExtension.buildSourceData 保持一致：
+ * doc.content 的第 i 个顶层子节点对应第 i+1 行。
+ *
+ * @param doc   ProseMirror 文档
+ * @param startLine  起始行号（1-indexed，含）
+ * @param endLine    结束行号（1-indexed，含）
+ * @returns 成功时返回四元组，失败（行号越界 / 无 block ID）返回 null
+ */
+export function createAnchorFromLineRange(
+  doc: PMNode,
+  startLine: number,
+  endLine: number,
+): BlockAnchor | null {
+  const childCount = doc.content.childCount;
+  if (startLine < 1 || endLine < startLine || endLine > childCount) return null;
+
+  let currentPos = 0;
+  let startPmPos = -1;
+  let endPmPos = -1;
+
+  for (let i = 0; i < childCount; i++) {
+    const child = doc.content.child(i);
+    const lineNum = i + 1; // 1-indexed
+    if (lineNum === startLine) {
+      startPmPos = currentPos + 1; // +1：进入节点内容（跳过开放 token）
+    }
+    if (lineNum === endLine) {
+      endPmPos = currentPos + child.nodeSize - 1; // -1：停在内容末尾（跳过关闭 token）
+      break;
+    }
+    currentPos += child.nodeSize;
+  }
+
+  if (startPmPos < 0 || endPmPos < 0 || endPmPos <= startPmPos) return null;
+  return createAnchorFromSelection(doc, startPmPos, endPmPos);
+}
+
+/**
  * 从选区创建 Anchor（支持单块与跨块）
  * @returns 成功时返回 { startBlockId, startOffset, endBlockId, endOffset }，失败返回 null
  * 单块时 startBlockId === endBlockId

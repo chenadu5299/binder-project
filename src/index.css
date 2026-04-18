@@ -54,6 +54,14 @@ code {
   outline: none !important;
 }
 
+/* 隐藏原生选区高亮，统一由 SelectionHighlightExtension ghost 装饰渲染 */
+.ProseMirror ::selection {
+  background: transparent !important;
+}
+.ProseMirror::-moz-selection {
+  background: transparent !important;
+}
+
 /* Bug 4：空段落行高与正常段落一致，避免回车新建行高度偏矮 */
 .ProseMirror p:has(>br.ProseMirror-trailingBreak:only-child),
 .ProseMirror p:has(>br:only-child) {

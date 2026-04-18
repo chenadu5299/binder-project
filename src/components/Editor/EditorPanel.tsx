@@ -63,7 +63,6 @@ const HTMLPreview: React.FC<{ content: string }> = ({ content }) => {
 const EditorPanel: React.FC = () => {
   const { currentWorkspace, markEditorSaveComplete } = useFileStore();
   const { tabs, activeTabId, updateTabContent, markTabSaved, setTabEditor, setTabSaving, updateTabModifiedTime, setInvalidCommandHint } = useEditorStore();
-  useDiffStore((s) => s.byTab); // 问题7：订阅以在 diff 变化时重渲染审阅确认栏
   const { analysis, setAnalysisVisible: _setAnalysisVisible, editor: editorLayout, setEditorVisible } = useLayoutStore();
   const editorZoom = editorLayout?.zoom ?? 100;
 
@@ -108,6 +107,31 @@ const EditorPanel: React.FC = () => {
 
           const tab = tabs.find(t => t.id === payload.tabId);
           if (tab && tab.editor) {
+            const activeEditorTab = tabs.find((t) => t.id === activeTabId) ?? null;
+            console.log('[CROSS_FILE_TRACE][DOC_REBUILD_INVALIDATE_RANGES]', JSON.stringify({
+              targetFilePath: tab.filePath,
+              sourceReason: 'editor_update_content_event',
+              oldRevision: tab.documentRevision ?? null,
+              newRevision: (tab.documentRevision ?? 1) + 1,
+              hasPendingByFilePath: (useDiffStore.getState().byFilePath[tab.filePath]?.length ?? 0) > 0,
+              hasResolvedByTab: (useDiffStore.getState().byTab[tab.filePath]?.diffs.size ?? 0) > 0,
+              triggeredByActiveTab: activeEditorTab?.id === tab.id,
+            }));
+            console.log('[CROSS_FILE_TRACE][SET_CONTENT]', JSON.stringify({
+              sourceFile: 'EditorPanel.tsx',
+              sourceFunction: 'listen(editor-update-content)',
+              reason: 'editor_update_content_event',
+              targetTabId: tab.id,
+              targetFilePath: tab.filePath,
+              oldRevision: tab.documentRevision ?? null,
+              newRevision: (tab.documentRevision ?? 1) + 1,
+              contentLength: payload.content.length,
+              contentPreview: payload.content.slice(0, 120),
+              activeEditorFilePath: activeEditorTab?.filePath ?? null,
+            }));
+            useDiffStore
+              .getState()
+              .invalidateDocRangesForFile(tab.filePath, 'editor_update_content_event');
             // 更新编辑器内容
             tab.editor.commands.setContent(payload.content);
             // 更新 store 中的内容（状态栏会显示未保存/已保存）
@@ -203,6 +227,41 @@ const EditorPanel: React.FC = () => {
       const newContent = isDocx
         ? await invoke<string>('open_docx_for_edit', { path: filePath })
         : await invoke<string>('read_file_content', { path: filePath });
+      const activeEditorTab = useEditorStore.getState().tabs.find((tab) => tab.id === useEditorStore.getState().activeTabId) ?? null;
+      const targetTab = useEditorStore.getState().tabs.find((tab) => tab.id === id);
+      console.log('[CROSS_FILE_TRACE][DOC_REBUILD_INVALIDATE_RANGES]', JSON.stringify({
+        targetFilePath: filePath,
+        sourceReason: 'external_reload_content',
+        oldRevision: targetTab?.documentRevision ?? null,
+        newRevision: ((targetTab?.documentRevision ?? 1) + 1),
+        hasPendingByFilePath: (useDiffStore.getState().byFilePath[filePath]?.length ?? 0) > 0,
+        hasResolvedByTab: (useDiffStore.getState().byTab[filePath]?.diffs.size ?? 0) > 0,
+        triggeredByActiveTab: activeEditorTab?.id === id,
+      }));
+      console.log('[CROSS_FILE_TRACE][SET_CONTENT]', JSON.stringify({
+        sourceFile: 'EditorPanel.tsx',
+        sourceFunction: 'handleLoadExternalChanges',
+        reason: 'external_reload_content',
+        targetTabId: id,
+        targetFilePath: filePath,
+        oldRevision: targetTab?.documentRevision ?? null,
+        newRevision: ((targetTab?.documentRevision ?? 1) + 1),
+        contentLength: newContent.length,
+        contentPreview: newContent.slice(0, 120),
+        activeEditorFilePath: activeEditorTab?.filePath ?? null,
+      }));
+      useDiffStore
+        .getState()
+        .invalidateDocRangesForFile(filePath, 'external_reload_content');
+      if (targetTab?.editor) {
+        // 先同步 editor doc，再写 store revision，避免 reconcile 在旧 doc 上提前 resolve。
+        targetTab.editor.commands.setContent(newContent, {
+          emitUpdate: false,
+          parseOptions: {
+            preserveWhitespace: 'full',
+          },
+        });
+      }
       useEditorStore.getState().updateTabContent(id, newContent);
       // 更新 mtime
       const newModifiedTime = await invoke<number>('get_file_modified_time', { path: filePath });
@@ -290,6 +349,25 @@ const EditorPanel: React.FC = () => {
     return () => { editor.off('selectionUpdate', handleSelectionUpdate); };
   }, [activeTab, inlineAssist.state.isVisible, inlineAssist.updateSelectedText]);
 
+  // 逻辑选区同步主链：无条件监听 selectionUpdate，把有效选区持久化到 editorStore。
+  // 目的：chat 链路在编辑器失焦后仍能读取"最后一次有效选区"。
+  // 策略：from !== to 时写入；from === to（含 blur 后 cursor）时不清空，
+  //       使逻辑选区跨焦点切换保留，直到用户建立新的非空选区。
+  useEffect(() => {
+    if (!activeTab?.editor || activeTab.isReadOnly) return;
+    const editor = activeTab.editor;
+    const tabId = activeTab.id;
+    const handleLogicalSelectionUpdate = () => {
+      const { from, to } = editor.state.selection;
+      if (from !== to) {
+        useEditorStore.getState().setLastActiveSelection(tabId, { from, to });
+      }
+      // from === to：不清空，保留上一次有效选区
+    };
+    editor.on('selectionUpdate', handleLogicalSelectionUpdate);
+    return () => { editor.off('selectionUpdate', handleLogicalSelectionUpdate); };
+  }, [activeTab]);
+
   // 使用 useCallback 稳定函数引用
   const saveTimerRef = useRef<NodeJS.Timeout | null>(null);
   const lastContentRef = useRef<string>('');
@@ -363,23 +441,6 @@ const EditorPanel: React.FC = () => {
   const handleEditorReady = useCallback((editor: any) => {
     if (activeTab && editor && activeTab.editor !== editor) {
       setTabEditor(activeTab.id, editor);
-      // Phase 2：editor 就绪后 resolve pending diffs（6.2）
-      const pending = useDiffStore.getState().byFilePath[activeTab.filePath];
-      if (pending?.length && editor.state?.doc) {
-        const { resolved, total, unmapped } = useDiffStore.getState().resolveFilePathDiffs(
-          activeTab.filePath,
-          editor.state.doc
-        );
-        const miss = unmapped ?? Math.max(0, total - resolved);
-        if (miss > 0) {
-          console.warn(`[EditorPanel] resolveFilePathDiffs: ${miss} 处未能映射到编辑器（可聊天内接受或重新解析）`, {
-            filePath: activeTab.filePath,
-            resolved,
-            total,
-            unmapped,
-          });
-        }
-      }
     }
   }, [activeTab, setTabEditor]);
 
@@ -543,72 +604,6 @@ const EditorPanel: React.FC = () => {
         />
       )}
 
-      {/* Phase 3：当前文件有 workspace pending diffs 时显示确认栏 */}
-      {activeTab && currentWorkspace && (() => {
-        const pending = useDiffStore.getState().byFilePath[activeTab.filePath];
-        const stats = useDiffStore.getState().byFilePathResolveStats[activeTab.filePath];
-        if (!pending?.length) return null;
-        const total = pending.length;
-        const resolved = stats?.resolved ?? total;
-        const rep = pending.find((e) => e.chatTabId && e.agentTaskId);
-        return (
-          <div className="flex-shrink-0 px-3 py-2 bg-amber-50 dark:bg-amber-900/20 border-b border-amber-200 dark:border-amber-700 flex items-center justify-between">
-            <span className="text-xs text-amber-800 dark:text-amber-200">
-              {resolved < total
-                ? `${total} 处修改待确认（${total - resolved} 处未能精准显示）`
-                : `${total} 处修改待确认`}
-            </span>
-            <div className="flex gap-2">
-              <button
-                onClick={async () => {
-                  try {
-                    const { DiffActionService } = await import('../../services/DiffActionService');
-                    await DiffActionService.acceptFileDiffs(activeTab.filePath, currentWorkspace, {
-                      chatTabId: rep?.chatTabId,
-                      agentTaskId: rep?.agentTaskId,
-                    });
-                    const { updateTabContent } = useEditorStore.getState();
-                    const ext = activeTab.filePath.split('.').pop()?.toLowerCase();
-                    const isDocx = ['docx', 'doc', 'odt', 'rtf'].includes(ext || '');
-                    const content = isDocx
-                      ? await invoke<string>('open_docx_for_edit', { path: activeTab.filePath })
-                      : await invoke<string>('read_file_content', { path: activeTab.filePath });
-                    updateTabContent(activeTab.id, content);
-                    const { toast } = await import('../Common/Toast');
-                    toast.success('已应用修改并写入文件');
-                  } catch (e) {
-                    const { toast } = await import('../Common/Toast');
-                    toast.error(`接受失败: ${e instanceof Error ? e.message : String(e)}`);
-                  }
-                }}
-                className="px-2 py-1 text-xs rounded bg-green-600 text-white hover:bg-green-700"
-              >
-                全部接受
-              </button>
-              <button
-                onClick={async () => {
-                  try {
-                    const { DiffActionService } = await import('../../services/DiffActionService');
-                    await DiffActionService.rejectFileDiffs(activeTab.filePath, currentWorkspace, {
-                      chatTabId: rep?.chatTabId,
-                      agentTaskId: rep?.agentTaskId,
-                    });
-                    const { toast } = await import('../Common/Toast');
-                    toast.info('已拒绝修改');
-                  } catch (e) {
-                    const { toast } = await import('../Common/Toast');
-                    toast.error(`拒绝失败: ${e instanceof Error ? e.message : String(e)}`);
-                  }
-                }}
-                className="px-2 py-1 text-xs rounded bg-gray-200 dark:bg-gray-600 text-gray-700 dark:text-gray-300 hover:bg-gray-300 dark:hover:bg-gray-500"
-              >
-                全部拒绝
-              </button>
-            </div>
-          </div>
-        );
-      })()}
-      
       {/* 编辑器内容区域（包含编辑器和分析面板） */}
       <div className="flex-1 overflow-hidden flex" style={{ minWidth: 0 }}>
         {/* 编辑器内容（支持缩放，T-DOCX 时外部区域淡灰、滚动条固定） */}
@@ -925,4 +920,3 @@ const EditorPanel: React.FC = () => {
 };
 
 export default EditorPanel;
-

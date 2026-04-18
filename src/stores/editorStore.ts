@@ -1,8 +1,6 @@
 import { create } from 'zustand';
 import { Editor } from '@tiptap/react';
 import { isSameDocumentForEdit } from '../utils/pathUtils';
-import { useDiffStore } from './diffStore';
-
 // Phase 0.1：指令无效提示的 timer，防止连续触发时前一次 timer 提前清除本次提示
 let invalidCommandHintTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -20,6 +18,12 @@ export interface EditorTab {
   editor: Editor | null;
   /** 文档定位版本戳：内容变化时递增，用于 diff 与 (L, revision) 门禁（§2.1.1） */
   documentRevision: number;
+  /**
+   * 最后一次有效（非空）的编辑器选区，供 chat AI 上下文跨焦点消费。
+   * 语义：用户最后一次在本 tab 建立的有意图选区（from !== to）。
+   * 不因编辑器 blur 自动清空，仅在用户建立新的非空选区时覆盖。
+   */
+  lastActiveSelection: { from: number; to: number } | null;
 }
 
 interface EditorState {
@@ -41,6 +45,11 @@ interface EditorState {
   markTabConflict: (tabId: string) => void; // ⚠️ 新增：标记冲突
   updateTabModifiedTime: (tabId: string, modifiedTime: number) => void; // ⚠️ Week 17.1.2：更新文件修改时间
   setInvalidCommandHint: (hint: string) => void; // Phase 0.1：设置指令无效提示，2 秒后自动清除
+  /**
+   * 写入最后一次有效选区（from !== to 时调用）。
+   * 传 null 可显式清除（tab 关闭时自然销毁，通常不需要手动清除）。
+   */
+  setLastActiveSelection: (tabId: string, selection: { from: number; to: number } | null) => void;
   /** Diff 卡定位：打开文件后请求滚动到此位置 */
   setPendingScrollTo: (tabId: string, from: number, to: number) => void;
   getPendingScrollTo: () => { tabId: string; from: number; to: number } | null;
@@ -84,6 +93,7 @@ export const useEditorStore = create<EditorStoreState>((set, get) => ({
       lastModifiedTime, // ⚠️ Week 17.1.2：文件最后修改时间
       editor: null,
       documentRevision: 1,
+      lastActiveSelection: null,
     };
     
     set((state) => ({
@@ -140,7 +150,6 @@ export const useEditorStore = create<EditorStoreState>((set, get) => ({
           : tab
       ),
     }));
-    useDiffStore.getState().expirePendingForStaleRevision(prev.filePath, nextRev);
   },
 
   markTabSaved: (tabId, savedContent) => {
@@ -238,6 +247,14 @@ export const useEditorStore = create<EditorStoreState>((set, get) => ({
       set({ invalidCommandHint: null });
       invalidCommandHintTimer = null;
     }, 2000);
+  },
+
+  setLastActiveSelection: (tabId, selection) => {
+    set((state) => ({
+      tabs: state.tabs.map((tab) =>
+        tab.id === tabId ? { ...tab, lastActiveSelection: selection } : tab
+      ),
+    }));
   },
 }));
 

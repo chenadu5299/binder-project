@@ -8,8 +8,8 @@ import React, { useState } from 'react';
 import { CheckIcon, XMarkIcon, ChevronDownIcon, ChevronUpIcon, ArrowPathIcon } from '@heroicons/react/24/outline';
 import type { DiffEntry } from '../../stores/diffStore';
 import { RETRYABLE_EXECUTION_CODES } from '../../stores/diffStore';
-import { ExecutionPanel } from '../Debug/ExecutionPanel';
 import { AgentShadowStateSummary } from './AgentShadowStateSummary';
+import { buildContentLabel } from '../../utils/contentLabel';
 
 interface DiffCardProps {
   diff: DiffEntry;
@@ -18,10 +18,6 @@ interface DiffCardProps {
   filePath: string;
   /** 工作区路径，用于显示相对路径 */
   workspacePath?: string | null;
-  /** 修改起始行号（1-based） */
-  lineStart?: number;
-  /** 修改结束行号（1-based） */
-  lineEnd?: number;
   onAccept: () => void;
   onReject: () => void;
   /** 执行失败后手动重试（A-DE-M-T-01 §6.6.4），由父组件提供编辑器上下文 */
@@ -37,24 +33,24 @@ function getFileName(path: string): string {
 }
 
 const DIFF_EXPIRE_HINTS: Record<string, string> = {
-  document_revision_mismatch: '文档版本与生成该建议时的快照不一致',
-  document_revision_advanced: '文档已编辑，该建议基于旧版本',
-  content_snapshot_mismatch: '当前文档内容与生成建议时的正文不一致（已非同一版 L）',
-  block_order_snapshot_mismatch: '块 ID 顺序或结构与生成建议时不一致（结构已漂移）',
-  original_text_mismatch: '当前正文与建议中的原文不一致',
-  pm_range_invalid: '编辑器中的定位范围无效',
-  block_resolve_failed: '无法在编辑器中解析到对应块',
-  apply_replace_failed: '应用替换失败',
+  document_revision_mismatch: '文档已变化：版本与生成该建议时不一致',
+  document_revision_advanced: '文档已变化：建议基于旧版本',
+  content_snapshot_mismatch: '文档已变化：正文与生成建议时不一致',
+  block_order_snapshot_mismatch: '文档已变化：块结构顺序已漂移',
+  original_text_mismatch: '解析失败：当前正文与建议原文不一致',
+  pm_range_invalid: '解析失败：编辑器定位范围无效',
+  block_resolve_failed: '解析失败：无法定位到对应块',
+  apply_replace_failed: '应用失败：替换执行未成功',
 };
 
 const EXECUTION_CODE_HINTS: Record<string, string> = {
   E_ROUTE_MISMATCH: '路由不匹配',
   E_TARGET_NOT_READY: '目标未就绪',
-  E_RANGE_UNRESOLVABLE: '范围不可解析',
+  E_RANGE_UNRESOLVABLE: '解析范围不可用',
   E_ORIGINALTEXT_MISMATCH: '原文校验失败',
   E_PARTIAL_OVERLAP: '非法部分重叠',
   E_BASELINE_MISMATCH: 'baseline 不匹配',
-  E_APPLY_FAILED: '应用失败',
+  E_APPLY_FAILED: '写入应用失败',
   E_REFRESH_FAILED: '刷新失败',
   E_BLOCKTREE_NODE_MISSING: 'BlockTree 节点缺失',
   E_BLOCKTREE_STALE: 'BlockTree 过期',
@@ -84,8 +80,6 @@ export const DiffCard: React.FC<DiffCardProps> = ({
   chatTabId,
   filePath,
   workspacePath = null,
-  lineStart,
-  lineEnd,
   onAccept,
   onReject,
   onRetry,
@@ -104,17 +98,11 @@ export const DiffCard: React.FC<DiffCardProps> = ({
     diff.executionExposure != null &&
     RETRYABLE_EXECUTION_CODES.has(diff.executionExposure.code as any) &&
     onRetry != null;
+  const retryFailureCategory =
+    diff.executionExposure?.code === 'E_APPLY_FAILED' ? '应用失败' : '解析/展示失败';
 
   const relativePath = getRelativePathDisplay(filePath, workspacePath);
-  const fileName = getFileName(filePath);
-  const lineRangeStr =
-    lineStart != null && lineEnd != null
-      ? lineStart === lineEnd
-        ? `第${lineStart}行`
-        : `第${lineStart}-${lineEnd}行`
-      : '';
-
-  const titleText = lineRangeStr ? `${fileName} ${lineRangeStr}` : fileName;
+  const titleText = buildContentLabel(diff.originalText || diff.newText, getFileName(filePath));
 
   // diff_type 标签（§7.4）
   const diffTypeBadge =
@@ -274,15 +262,14 @@ export const DiffCard: React.FC<DiffCardProps> = ({
   );
 
   return (
-    <>
-      <div
-        className={`rounded-lg border overflow-hidden ${
-          isExpired
-            ? 'border-gray-300 dark:border-gray-600 bg-gray-100 dark:bg-gray-800'
-            : 'border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 border-l-4'
-        }`}
-        style={!isExpired && !isAccepted ? { borderLeftColor: '#A32D2D' } : undefined}
-      >
+    <div
+      className={`rounded-lg border overflow-hidden ${
+        isExpired
+          ? 'border-gray-300 dark:border-gray-600 bg-gray-100 dark:bg-gray-800'
+          : 'border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 border-l-4'
+      }`}
+      style={!isExpired && !isAccepted ? { borderLeftColor: '#A32D2D' } : undefined}
+    >
         {pathBar}
         {sourceHint}
         {shadowStateBar}
@@ -292,7 +279,7 @@ export const DiffCard: React.FC<DiffCardProps> = ({
         {showRetryBanner && (
           <div className="flex items-center justify-between gap-2 px-2 py-1.5 bg-orange-50 dark:bg-orange-900/20 border-b border-orange-200 dark:border-orange-700">
             <span className="text-xs text-orange-700 dark:text-orange-300 truncate">
-              执行失败（{diff.executionExposure!.code}）
+              {retryFailureCategory}（{diff.executionExposure!.code}）
               {EXECUTION_CODE_HINTS[diff.executionExposure!.code]
                 ? `：${EXECUTION_CODE_HINTS[diff.executionExposure!.code]}`
                 : ''}
@@ -321,8 +308,6 @@ export const DiffCard: React.FC<DiffCardProps> = ({
             {actionArea}
           </>
         )}
-      </div>
-      <ExecutionPanel />
-    </>
+    </div>
   );
 };

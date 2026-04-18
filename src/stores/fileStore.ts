@@ -31,6 +31,31 @@ export const useFileStore = create<FileState>((set) => ({
   lastEditorSaveWorkspace: null,
 
   setCurrentWorkspace: (path) => {
+    // P0-4: 工作区切换时中断所有活跃流，防止新工作区下的 agent 操作旧工作区文件
+    void import('./chatStore')
+      .then(({ useChatStore }) => {
+        const streamingTabs = useChatStore
+          .getState()
+          .tabs
+          .filter((t: { messages: Array<{ isLoading?: boolean }> }) =>
+            t.messages.some((m: { isLoading?: boolean }) => m.isLoading),
+          );
+        if (streamingTabs.length > 0) {
+          // 中断所有活跃流（fire-and-forget），并标记消息完成
+          for (const tab of streamingTabs) {
+            const tabId = (tab as { id: string }).id;
+            invoke('ai_cancel_chat_stream', { tabId }).catch(() => {});
+            const { setMessageLoading } = useChatStore.getState();
+            (tab as { messages: Array<{ id: string; isLoading?: boolean }> }).messages.forEach(
+              (m: { id: string; isLoading?: boolean }) => {
+                if (m.isLoading) setMessageLoading(tabId, m.id, false);
+              },
+            );
+          }
+          console.warn('[fileStore] 工作区切换：已中断', streamingTabs.length, '个活跃流');
+        }
+      })
+      .catch(() => {});
     set({ currentWorkspace: path });
     // P0.5: 工作区加载完成后异步清理孤立 tab 记忆（fire-and-forget）
     if (path) {

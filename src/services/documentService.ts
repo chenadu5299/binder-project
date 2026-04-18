@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { useEditorStore } from '../stores/editorStore';
 import { useFileStore } from '../stores/fileStore';
-import { useDiffStore } from '../stores/diffStore';
+import { UnopenedDocumentDiffRuntime } from './unopenedDocumentDiffRuntime';
 import { getRelativePath, normalizeWorkspacePath } from '../utils/pathUtils';
 import { FileType, FileSource, FileOpenStrategy } from '../types/file';
 
@@ -451,7 +451,7 @@ export const documentService = {
               lastModifiedTime
             );
             if (pendingDiffs?.length) {
-              useDiffStore.getState().setFilePathDiffs(filePath, pendingDiffs);
+              UnopenedDocumentDiffRuntime.seedPendingDiffsFromWorkspaceOpen(filePath, pendingDiffs);
             }
           } catch (error) {
             console.error('[documentService.openFileWithStrategy] 添加标签页失败:', error);
@@ -501,7 +501,7 @@ export const documentService = {
               lastModifiedTime
             );
             if (pendingDiffs?.length) {
-              useDiffStore.getState().setFilePathDiffs(filePath, pendingDiffs);
+              UnopenedDocumentDiffRuntime.seedPendingDiffsFromWorkspaceOpen(filePath, pendingDiffs);
             }
           } catch (error) {
             console.error('[documentService.openFileWithStrategy] 添加标签页失败:', error);
@@ -582,7 +582,7 @@ export const documentService = {
                 lastModifiedTime
               );
               if (pendingDiffs?.length) {
-                useDiffStore.getState().setFilePathDiffs(filePath, pendingDiffs);
+                UnopenedDocumentDiffRuntime.seedPendingDiffsFromWorkspaceOpen(filePath, pendingDiffs);
               }
             } catch (error) {
               // LibreOffice + ODT 转换失败，显示错误提示

@@ -7,6 +7,7 @@
 
 import type { Editor } from '@tiptap/react';
 import type { DiffEntry } from '../stores/diffStore';
+import type { DiffRouteSource, ExecutionAnchor } from '../stores/diffStore';
 
 interface CanonicalDiff {
   diffId?: string;
@@ -19,6 +20,8 @@ interface CanonicalDiff {
   type?: 'replace' | 'delete' | 'insert';
   occurrenceIndex?: number;
   diff_type?: string;
+  route_source?: DiffRouteSource;
+  execution_anchor?: Partial<ExecutionAnchor> | null;
 }
 
 function asNonNegativeInt(input: unknown, fallback: number): number {
@@ -46,6 +49,45 @@ export function convertLegacyDiffToEntry(d: CanonicalDiff, index: number): DiffE
     newText: typeof d.newText === 'string' ? d.newText : '',
     type,
     status: 'pending',
+    ...(d.execution_anchor
+      ? {
+          executionAnchor: {
+            filePath: typeof d.execution_anchor.filePath === 'string' ? d.execution_anchor.filePath : '',
+            startBlockId:
+              typeof d.execution_anchor.startBlockId === 'string'
+                ? d.execution_anchor.startBlockId
+                : d.startBlockId,
+            endBlockId:
+              typeof d.execution_anchor.endBlockId === 'string'
+                ? d.execution_anchor.endBlockId
+                : d.endBlockId,
+            startOffset:
+              typeof d.execution_anchor.startOffset === 'number'
+                ? Math.floor(d.execution_anchor.startOffset)
+                : asNonNegativeInt(d.startOffset, 0),
+            endOffset:
+              typeof d.execution_anchor.endOffset === 'number'
+                ? Math.floor(d.execution_anchor.endOffset)
+                : asNonNegativeInt(d.endOffset, 0),
+            originalText:
+              typeof d.execution_anchor.originalText === 'string'
+                ? d.execution_anchor.originalText
+                : typeof d.originalText === 'string'
+                  ? d.originalText
+                  : '',
+            ...(typeof d.execution_anchor.baselineId === 'string'
+              ? { baselineId: d.execution_anchor.baselineId }
+              : {}),
+            ...(typeof d.execution_anchor.documentRevision === 'number'
+              ? { documentRevision: Math.floor(d.execution_anchor.documentRevision) }
+              : {}),
+            ...(typeof d.execution_anchor.routeSource === 'string'
+              ? { routeSource: d.execution_anchor.routeSource as DiffRouteSource }
+              : {}),
+          },
+        }
+      : {}),
+    ...(typeof d.route_source === 'string' ? { routeSource: d.route_source } : {}),
     ...(occurrenceIndex !== undefined ? { occurrenceIndex } : {}),
     ...(typeof d.diff_type === 'string' && d.diff_type ? { diffType: d.diff_type } : {}),
   };

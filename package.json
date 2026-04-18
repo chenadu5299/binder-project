@@ -46,6 +46,7 @@
     "react-dom": "^18.2.0",
     "tiptap-pagination-plus": "file:tiptap-pagination-plus",
     "xlsx": "^0.18.5",
+    "xstate": "^5.30.0",
     "zustand": "^4.4.7"
   },
   "devDependencies": {

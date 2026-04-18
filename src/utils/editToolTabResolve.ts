@@ -53,14 +53,15 @@ export function resolveEditorTabForEditResultWithRequestContext(
 export function inferPositioningPath(toolCall: Pick<ToolCall, 'arguments'> | undefined): 'Anchor' | 'Resolver' | 'Legacy' {
   const args = toolCall?.arguments as Record<string, unknown> | undefined;
   if (!args) return 'Legacy';
-  const et = args.edit_target as { anchor?: unknown } | undefined;
-  if (et && et.anchor != null && typeof et.anchor === 'object' && Object.keys(et.anchor as object).length > 0) {
+  const hasSelectionAnchor =
+    typeof args._sel_start_block_id === 'string' &&
+    typeof args._sel_end_block_id === 'string';
+  if (hasSelectionAnchor) {
     return 'Anchor';
   }
   const mode = String(args.edit_mode ?? '').toLowerCase();
-  const scope = String(args.scope ?? '').toLowerCase();
   const hasTarget = typeof args.target === 'string' && String(args.target).trim() !== '';
-  if (mode === 'replace' && scope === 'one' && hasTarget) {
+  if (mode === 'replace' && hasTarget) {
     return 'Resolver';
   }
   return 'Legacy';

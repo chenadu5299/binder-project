@@ -208,7 +208,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId, pendingMode = 'agen
         if (droppedText && binderSourceStr) {
             try {
                 const source = JSON.parse(binderSourceStr);
-                const { createTextReferenceFromClipboard } = await import('../../utils/referenceHelpers');
+                const { createTextReferenceFromClipboard, enrichTextReferenceAnchor } = await import('../../utils/referenceHelpers');
                 const textRefBase = createTextReferenceFromClipboard(
                     {
                         filePath: source.filePath,
@@ -223,11 +223,14 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId, pendingMode = 'agen
                     },
                     droppedText,
                 );
-                const textRef = {
+                const textRefPartial = {
                     ...textRefBase,
                     id: `ref-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
                     createdAt: Date.now(),
-                };
+                } as TextReference;
+                // 若四元组缺失（CopyReferenceExtension 在无 block ID 时的退化情形），尝试从
+                // editor DOM 按行号补齐，使其升级为精确引用锚点精度
+                const textRef = await enrichTextReferenceAnchor(textRefPartial);
                 addReference(currentTabId, textRef);
             } catch (err) {
                 console.error('❌ 创建文本引用失败:', err);
@@ -621,7 +624,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId, pendingMode = 'agen
                     }
                 } else {
                     // 创建文本引用
-                    const { createTextReferenceFromClipboard } = await import('../../utils/referenceHelpers');
+                    const { createTextReferenceFromClipboard, enrichTextReferenceAnchor } = await import('../../utils/referenceHelpers');
                     const textRefBase = createTextReferenceFromClipboard(
                         {
                             filePath: source.filePath,
@@ -637,16 +640,19 @@ export const ChatInput: React.FC<ChatInputProps> = ({ tabId, pendingMode = 'agen
                         text
                     );
                     
-                    const textRef: TextReference = {
+                    const textRefPartial: TextReference = {
                         ...textRefBase,
                         id: `ref-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
                         createdAt: Date.now(),
                     };
+                    // 若四元组缺失，尝试从 editor DOM 按行号补齐（精确引用锚点升级）
+                    const textRef = await enrichTextReferenceAnchor(textRefPartial);
                     
                     console.log('✅ 创建文本引用:', {
                         contentLength: text.length,
                         sourceFile: source.filePath,
                         lineRange: source.lineRange,
+                        hasAnchor: !!textRef.textReference,
                     });
                     
                     if (tabId) {

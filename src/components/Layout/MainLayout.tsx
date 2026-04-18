@@ -9,9 +9,10 @@ import ChatPanel from '../Chat/ChatPanel';
 import FloatingActionButton from '../Chat/FloatingActionButton';
 import PanelResizer from './PanelResizer';
 import StatusBar from '../StatusBar/StatusBar';
-import { PendingDiffPanel } from '../Editor/PendingDiffPanel';
+import { ExecutionPanel } from '../Debug/ExecutionPanel';
 import { ToastContainer, useToastStore, toast } from '../Common/Toast';
 import { fileService } from '../../services/fileService';
+import { UnopenedDocumentDiffRuntime } from '../../services/unopenedDocumentDiffRuntime';
 import { setupPositioningEditorSnapshotListener } from '../../utils/positioningEditorSnapshotListener';
 import { useDiffStore } from '../../stores/diffStore';
 import { getCurrentWindow } from '@tauri-apps/api/window';
@@ -72,6 +73,15 @@ const MainLayout: React.FC = () => {
     return () => {
       cancelled = true;
       unlisten?.();
+    };
+  }, [shouldShowWelcome]);
+
+  // 未打开文档编辑 runtime：统一处理历史水合、pending diff 写入后的文件打开 resolve。
+  useEffect(() => {
+    if (shouldShowWelcome) return;
+    const stop = UnopenedDocumentDiffRuntime.start();
+    return () => {
+      stop();
     };
   }, [shouldShowWelcome]);
   
@@ -312,8 +322,6 @@ const MainLayout: React.FC = () => {
             </>
           )}
           </div>
-          {/* Phase 5：待确认修改面板（有 pending 时显示） */}
-          {!isFullscreenChatMode && currentWorkspace && <PendingDiffPanel />}
         </div>
       )}
 
@@ -321,6 +329,7 @@ const MainLayout: React.FC = () => {
       {!shouldShowWelcome && (
         <StatusBar />
       )}
+      {!shouldShowWelcome && <ExecutionPanel />}
     </div>
   );
 };

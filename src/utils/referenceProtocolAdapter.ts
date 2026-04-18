@@ -34,7 +34,10 @@ export interface ReferenceProtocol {
     knowledgeCitationKey?: string;
     knowledgeRetrievalMode?: 'manual_query' | 'explicit' | 'automatic';
     textReference?: { startBlockId: string; startOffset: number; endBlockId: string; endOffset: number };
-    /** 兼容旧后端字段，后续由 textReference 统一替代 */
+    /**
+     * @deprecated editTarget 已废弃，前端不再写入，后端不再读取。
+     * 字段保留仅用于描述旧客户端可能发送的 JSON 结构，类型层面不应再使用。
+     */
     editTarget?: { blockId: string; startOffset: number; endOffset: number };
     /**
      * TMP-P0 冻结：模板协议只允许 workflow。
@@ -130,14 +133,20 @@ export function hasExplicitCurrentFileReference(
     });
 }
 
-/** 判断是否为当前打开文件的引用（需忽略） */
+/**
+ * 判断是否为当前打开文件的"全文件引用"（需忽略，避免与文档事实层重复注入全文）。
+ *
+ * 只对 FileReference（全文件）返回 true；TextReference（用户选中片段）即使来自当前文件
+ * 也不过滤，其内容和位置信息对模型仍有独立价值（作为 references 注入）。
+ *
+ * 依据：A-DE-M-D-01 §5.8.3 / A-CORE-C-D-02 §3.3（FileReference 与 TextReference 语义分离）
+ */
 function isCurrentFileRef(ref: Reference, currentFile: string): boolean {
     if (ref.type === ReferenceType.FILE) {
         return isSameDocumentForEdit((ref as FileReference).path, currentFile);
     }
-    if (ref.type === ReferenceType.TEXT) {
-        return isSameDocumentForEdit((ref as TextReference).sourceFile, currentFile);
-    }
+    // TextReference 是用户选中的内容片段，即使来自当前文件也不过滤：
+    // 片段内容 + 精确引用锚点对模型有独立价值，不等于全文重复注入
     return false;
 }
 
@@ -153,16 +162,13 @@ async function refToProtocol(ref: Reference): Promise<ReferenceProtocol | null> 
             };
             const anchor = extractTextReferenceAnchor(r);
             if (anchor) {
+                // 只写 textReference（精确引用锚点的唯一表达形式）。
+                // editTarget 已废弃，不再写入：后端 extract_reference_anchor_for_zero_search
+                // 已改为只读 text_reference，不再 fallback 到 edit_target。
                 protocol.textReference = {
                     startBlockId: anchor.startBlockId,
                     startOffset: anchor.startOffset,
                     endBlockId: anchor.endBlockId,
-                    endOffset: anchor.endOffset,
-                };
-                // 兼容旧字段：保留单块入口
-                protocol.editTarget = {
-                    blockId: anchor.startBlockId,
-                    startOffset: anchor.startOffset,
                     endOffset: anchor.endOffset,
                 };
             }
@@ -231,39 +237,30 @@ async function refToProtocol(ref: Reference): Promise<ReferenceProtocol | null> 
             const r = ref as MemoryReference;
             let content = '[记忆内容不可用]';
             if (r.items && r.items.length > 0) {
+                // 精确路径：items 已在引用创建时预加载，直接使用
                 content = r.items
                     .map((item: { content?: string; text?: string }) => item.content ?? item.text ?? '')
                     .filter(Boolean)
                     .join('\n\n');
-            } else {
-                // 无 items 时优先按真实 memory_id 精确回填，回填失败再走检索兜底
+            } else if (r.memoryId) {
+                // 精确 ID 回填路径：仅按 memoryId 精确查找，不允许降级为模糊检索
                 try {
                     const { useFileStore } = await import('../stores/fileStore');
                     const workspacePath = useFileStore.getState().currentWorkspace;
                     if (workspacePath) {
                         const { memoryService } = await import('../services/memoryService');
-                        if (r.memoryId) {
-                            const all = await memoryService.getAllMemories(workspacePath);
-                            const exact = all.find((m) => m.id === r.memoryId);
-                            if (exact?.content) {
-                                content = exact.content;
-                            }
+                        const all = await memoryService.getAllMemories(workspacePath);
+                        const exact = all.find((m) => m.id === r.memoryId);
+                        if (exact?.content) {
+                            content = exact.content;
                         }
-                        if (!content || content === '[记忆内容不可用]') {
-                            const resp = await memoryService.searchMemories({
-                                query: r.name || '',
-                                workspacePath,
-                                limit: 5,
-                            });
-                            if (resp.items.length > 0) {
-                                content = resp.items.map(r2 => r2.item.content).filter(Boolean).join('\n\n');
-                            }
-                        }
+                        // 精确查找失败 → 保持 '[记忆内容不可用]'，不走模糊检索兜底
                     }
                 } catch {
                     // 保持占位
                 }
             }
+            // 无 items 且无 memoryId → 记忆内容不可用，不走模糊检索
             return {
                 type: 'memory',
                 source: r.memoryId || r.name,
@@ -301,6 +298,7 @@ async function refToProtocol(ref: Reference): Promise<ReferenceProtocol | null> 
         case ReferenceType.KNOWLEDGE_BASE: {
             const r = ref as KnowledgeBaseReference;
             if (r.injectionSlices && r.injectionSlices.length > 0) {
+                // 精确路径：slices 已在引用创建时预加载，直接使用
                 const firstSlice = r.injectionSlices[0];
                 return {
                     type: 'kb',
@@ -314,6 +312,20 @@ async function refToProtocol(ref: Reference): Promise<ReferenceProtocol | null> 
                         r.injectionSlices.map(slice => slice.content).join('\n\n'),
                         4000
                     ),
+                };
+            }
+
+            // 无预加载 slices 时，只允许在有明确锚点（kbId 或 entryId）的前提下按锚点精确查询
+            // 若完全无锚点，返回错误标记，不允许发起模糊检索冒充显式引用结果
+            if (!r.kbId && !r.entryId) {
+                return {
+                    type: 'kb',
+                    source: r.kbName ?? '[未知知识库]',
+                    knowledgeBaseId: r.kbId,
+                    knowledgeEntryId: r.entryId,
+                    knowledgeDocumentId: r.documentId,
+                    knowledgeRetrievalMode: 'explicit',
+                    content: '[知识库引用缺少定位锚点，无法加载内容]',
                 };
             }
 

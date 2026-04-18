@@ -1,14 +1,10 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useMemo, useState } from 'react';
+import type { DiffEntry, ExecutionExposure } from '../../stores/diffStore';
+import { useDiffStore } from '../../stores/diffStore';
 import { useChatStore } from '../../stores/chatStore';
 import { useAgentStore } from '../../stores/agentStore';
-import {
-  ExecutionExposure,
-  extractExecutionExposuresFromToolResultData,
-  useDiffStore,
-} from '../../stores/diffStore';
 
 const PANEL_TOGGLE_KEY = 'binder.debug.execution_panel';
-let PANEL_OWNER_CLAIMED = false;
 
 function readExecutionPanelToggle(): boolean {
   if (typeof window === 'undefined') return false;
@@ -31,19 +27,17 @@ function dedupeAndSortExposures(list: ExecutionExposure[]): ExecutionExposure[] 
   return deduped.sort((a, b) => b.timestamp - a.timestamp);
 }
 
-function collectBackendExposuresFromActiveTab(
-  tabs: ReturnType<typeof useChatStore.getState>['tabs'],
-  activeTabId: string | null
+function collectDiffExposures(
+  byTab: Record<string, { baseline: string | null; baselineSetAt: number; diffs: Map<string, DiffEntry> }>,
+  activeChatTabId: string | null,
 ): ExecutionExposure[] {
-  const tab = tabs.find((t) => t.id === activeTabId);
-  if (!tab) return [];
+  if (!activeChatTabId) return [];
   const result: ExecutionExposure[] = [];
-  for (const message of tab.messages) {
-    for (const block of message.contentBlocks ?? []) {
-      if (block.type !== 'tool' && block.type !== 'authorization') continue;
-      const exposures = extractExecutionExposuresFromToolResultData(block.toolCall?.result?.data);
-      if (exposures.length > 0) {
-        result.push(...exposures);
+  for (const tab of Object.values(byTab)) {
+    for (const diff of tab.diffs.values()) {
+      if (diff.chatTabId !== activeChatTabId) continue;
+      if (diff.executionExposure) {
+        result.push(diff.executionExposure);
       }
     }
   }
@@ -51,32 +45,15 @@ function collectBackendExposuresFromActiveTab(
 }
 
 export const ExecutionPanel: React.FC = () => {
-  const ownerRef = useRef(false);
-  if (!ownerRef.current && !PANEL_OWNER_CLAIMED) {
-    PANEL_OWNER_CLAIMED = true;
-    ownerRef.current = true;
-  }
-  useEffect(() => {
-    return () => {
-      if (ownerRef.current) {
-        PANEL_OWNER_CLAIMED = false;
-      }
-    };
-  }, []);
-  if (!ownerRef.current) return null;
-
   const [enabled, setEnabled] = useState<boolean>(() => readExecutionPanelToggle());
-  const storeExposures = useDiffStore((s) => s.executionExposures);
-  const chatTabs = useChatStore((s) => s.tabs);
-  const activeTabId = useChatStore((s) => s.activeTabId);
-  const activeRuntime = useAgentStore((s) => (activeTabId ? s.runtimesByTab[activeTabId] : undefined));
-  const backendExposures = useMemo(
-    () => collectBackendExposuresFromActiveTab(chatTabs, activeTabId),
-    [chatTabs, activeTabId]
+  const byTab = useDiffStore((s) => s.byTab);
+  const activeChatTabId = useChatStore((s) => s.activeTabId);
+  const activeRuntime = useAgentStore((s) =>
+    activeChatTabId ? s.runtimesByTab[activeChatTabId] : undefined,
   );
-  const merged = useMemo(
-    () => dedupeAndSortExposures([...storeExposures, ...backendExposures]),
-    [storeExposures, backendExposures]
+  const exposures = useMemo(
+    () => dedupeAndSortExposures(collectDiffExposures(byTab, activeChatTabId)),
+    [byTab, activeChatTabId],
   );
 
   if (!enabled) return null;
@@ -86,7 +63,7 @@ export const ExecutionPanel: React.FC = () => {
       <div className="flex items-center justify-between border-b border-gray-200 px-3 py-2 dark:border-gray-700">
         <div>
           <div className="text-xs font-semibold text-gray-700 dark:text-gray-200">
-            ExecutionExposure ({merged.length})
+            ExecutionExposure ({exposures.length})
           </div>
           {activeRuntime?.currentTask && (
             <div className="mt-1 text-[10px] text-gray-500 dark:text-gray-400">
@@ -108,7 +85,7 @@ export const ExecutionPanel: React.FC = () => {
         </button>
       </div>
       <div className="max-h-[calc(42vh-36px)] overflow-auto">
-        {merged.length === 0 ? (
+        {exposures.length === 0 ? (
           <div className="px-3 py-2 text-xs text-gray-500 dark:text-gray-400">暂无执行观测</div>
         ) : (
           <table className="w-full table-fixed text-[11px]">
@@ -122,7 +99,7 @@ export const ExecutionPanel: React.FC = () => {
               </tr>
             </thead>
             <tbody>
-              {merged.map((item) => (
+              {exposures.map((item) => (
                 <tr key={item.exposureId} className="border-t border-gray-100 dark:border-gray-800 align-top">
                   <td className="px-2 py-1 text-gray-500 dark:text-gray-400">
                     {new Date(item.timestamp).toLocaleTimeString()}

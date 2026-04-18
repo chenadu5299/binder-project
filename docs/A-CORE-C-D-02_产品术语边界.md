@@ -86,10 +86,13 @@
 | TemplateReference | 模板库引用对象 | 工作流模板定义/约束信息 | 文档当前区间定位 |
 | ChatReference | 会话引用对象 | 指定聊天标签或消息片段 | 编辑器选区定位 |
 | LinkReference | 链接引用对象 | URL/标题/预览信息 | 本地文件路径语义 |
-| 精确引用四元组 | 引用中可用于定位的精确区间 | startBlockId/startOffset/endBlockId/endOffset | 模糊文本位置描述 |
+| 精确引用四元组 | 引用中可用于锁定原文位置的精确区间 | startBlockId/startOffset/endBlockId/endOffset | 模糊文本位置描述 |
+| 精确引用锚点（precise reference anchor）| TextReference 携带完整四元组时的精度档，用于锁定正确块与阅读上下文 | `prompt [precise reference anchor]` 标注；同文件引用内容 + 位置 | 显式 selection 零搜索输入；执行级真源 |
+| 执行锚点（ExecutionAnchor）| 进入 diff 执行、accept、红删、高亮主链的唯一执行真源对象 | `filePath + blockId/startOffset/endOffset + originalText + baseline/revision` | 仅给模型看的 `block_index`、`target` 命中区间、`para_index`、引用标签文本 |
+| 阅读上下文（reading context）| TextReference 行级精度或 FileReference 时的精度档，仅供模型理解 | `prompt no precise anchor` 标注，块内搜索定位 | 伪装为执行锚点；`"apply your best judgment"` 类文案 |
 | RichReferenceInfo | 后端引用传输对象，IPC 接收后的统一内部表示 | ref_type/source/content/text_reference(四元组)/knowledge 细粒度 ID | 仅含 type/source/content 的拍平形式 |
 | build_reference_prompt | 后端引用提示拼装函数 | 引用类型标题、source 路径、text_reference 位置（若有）、content 正文 | 仅输出 content 而不输出路径和位置的拍平形式 |
-| 引用标签（Reference Label） | 引用在 UI 和消息记录中的统一简写标识 | 统一函数生成、`@来源名:位置简写` 格式 | 各入口各自拼装的非统一标签 |
+| 引用标签（Reference Label） | 引用在 UI 和消息记录中的统一简写标识 | 统一函数生成；主标签为内容摘要，位置只作弱后缀去重，文件级引用 `${fileName}` | 各入口各自拼装的非统一标签；旧格式 `${fileName} (行 N-N)` |
 | 引用降级为文本 | 引用标签失效后的退化机制 | 删除引用标记后转普通文本 | 保留结构化引用语义 |
 | 引用结构保真 | 引用的结构化字段在传输链路中不被丢弃的约束 | IPC → 后端 → prompt 各层必须保留 source/position/type | 中途将结构化引用拍平为匿名文本 |
 
@@ -118,13 +121,13 @@
 | logicalContent | 当前文档真实逻辑内容状态的实现名 | 已生效真实内容、用于构建 `L` 的源内容 | pending diff 叠加后的展示内容 |
 | baselineId | 一轮请求链路唯一基线标识 | 生成/校验/执行追踪绑定 | 统一判死其他 diff 的开关 |
 | revision | 真实内容版本序号 | 真实内容变更后递增 | 视觉装饰变更递增 |
-| 零搜索路径 | 直接使用精确坐标定位的路径 | 选区坐标、精确引用坐标 | 块内 target 文本搜索 |
+| 零搜索路径 | 直接使用显式执行坐标定位的路径 | 编辑器显式选区冻结后的 ExecutionAnchor | 块内 target 文本搜索、精确引用锚点自动冒充 selection |
 | 块内搜索路径 | 在指定块内按 target 查找定位 | block_index + target + occurrence_index | 跨块精确坐标直达 |
 | 整块替换降级 | 块内精确命中失败后的受控降级 | rewrite_block 或自动 block_level | 无约束整文替换 |
 | rewrite_document | 全文重写模式 | 明确全文改写任务 | 多块局部任务偷懒替代 |
 | canonical diff | 统一 diff 输出对象 | diffId、区间、原文、新文、类型、路由 | 仅 new_content 全文回写 |
 | diff_type | diff 粒度分类 | precise/block_level/document_level | 自定义未登记分类 |
-| route_source | diff 路由来源 | selection/reference/block_search | 未标来源 |
+| route_source | canonical diff 的解析来源 | selection/block_search/workspace_resolve | 未标来源 |
 | originalText | diff 生成区间原文基准 | 执行前校验、失效判定 | 仅展示文本 |
 | occurrence_index | 同块重复命中索引 | 0-based 目标出现次序 | 跨块顺序编号 |
 | block_index | 暴露给模型的块编号 | 0-based 块列表索引 | blockId |
@@ -164,6 +167,8 @@
 | 删除标记（Deletion Mark） | 文档侧待确认修改可视标记 | 红底、删除线、状态联动清理 | 新增内容正文直写 |
 | Decoration | 文档侧动态渲染装饰层 | 删除标记、状态映射 | 真实内容存储 |
 | Mapping | 用户编辑后位置映射机制 | mappedFrom/mappedTo 更新 | 逻辑状态重建主算法 |
+| 红删范围 | 待审阅 diff 在文档中的删除定位范围 | 从 ExecutionAnchor 解析，并可派生 mappedFrom/mappedTo | 独立于执行真源的第二套定位 |
+| 绿高亮范围 | diff 接受后对新写入内容的反馈范围 | 接受应用事务产生的 acceptedFrom/acceptedTo | 原始 ExecutionAnchor 本体 |
 
 ### 3.8 Chat Build（当前唯一生效构建主线）
 
@@ -229,6 +234,7 @@
 | scope（旧编辑协议） | edit_mode + block_index 体系 | 旧字段禁用 |
 | target_content / instruction | target / content | 旧字段禁用 |
 | edit_target.anchor（模型直接给 blockId） | 零搜索坐标注入或 block_index | 模型不直接接触 blockId |
+| `editTarget`（`ReferenceProtocol` 旧字段） | **已废弃（2026-04）**：前端不再写入，后端不再读取 | 执行锚点统一由 `ExecutionAnchor` 承载；`textReference` 只保留精确引用锚点语义 |
 
 ---
 
@@ -240,6 +246,12 @@
 > 3. §3.6 `shadow runtime`：补充生命周期边界（会话内存）与持久化禁止范围。  
 > 4. §3.6 `execute_failed`：补充 `retryable` 字段语义与 `DiffRetryController` 消费规则。  
 > 新增关联文档：`A-AG-M-T-05_AgentTaskController设计.md`。
+>
+> **本轮修订说明（2026-04-16）**：  
+> 1. §4 禁用术语表：新增 `editTarget`（`ReferenceProtocol` 旧字段）废弃说明。  
+>    前端 `referenceProtocolAdapter.ts` 不再写入，后端 `ai_commands.rs` `extract_reference_anchor_for_zero_search` 不再读取。  
+>    执行级真源统一收口为 `ExecutionAnchor`；`textReference` 只保留精确引用锚点语义。  
+> 2. §5 清单第 12 条：新增零搜索路径锚点失效必须结构化报错，禁止 `unwrap_or_default` 兜底。
 
 ## 五、MVP 术语一致性检查清单
 
@@ -253,5 +265,6 @@
 
 8. "RichReferenceInfo"必须保留 text_reference 四元组（若前端提供），不得在 IPC 转换层丢弃。  
 9. "build_reference_prompt"输出必须包含 source 路径和 text_reference 位置（若有），不得仅输出 content。  
-10. 引用标签必须由统一函数生成，禁止各入口各自拼装。  
-11. 引用正文不得同时通过用户消息 content 展开和 references 协议双重注入。
+10. 引用标签必须由统一函数生成，禁止各入口各自拼装。主标签格式为内容摘要，位置只允许作为弱后缀去重，文件级引用保留 `${fileName}`。  
+11. 引用正文不得同时通过用户消息 content 展开和 references 协议双重注入。  
+12. 零搜索路径（Step 2a）中若 `extract_block_range` 失败（block anchor 过期），必须返回结构化 `Err`（`E_RANGE_UNRESOLVABLE`），**禁止** `unwrap_or_default()` 产生空 `originalText` 继续下游，避免生成无效 diff。

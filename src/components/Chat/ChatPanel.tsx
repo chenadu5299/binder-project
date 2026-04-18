@@ -13,19 +13,17 @@ import { ToolCall, MessageContentBlock } from '../../types/tool';
 import { aggressiveJSONRepair } from '../../utils/jsonRepair';
 import { buildContentBlocks } from '../../utils/contentBlockBuilder';
 import { useFileStore } from '../../stores/fileStore';
-import { useEditorStore } from '../../stores/editorStore';
 import { useDiffStore } from '../../stores/diffStore';
+import { useEditorStore } from '../../stores/editorStore';
 import { convertLegacyDiffsToEntriesWithFallback } from '../../utils/diffFormatAdapter';
 import { resolveEditorTabForEditResultWithRequestContext, inferPositioningPath } from '../../utils/editToolTabResolve';
+import { getPositioningRequestContextForChat } from '../../utils/requestContext';
 import { sha256HexUtf8, blockOrderSnapshotHashFromHtml } from '../../utils/contentSnapshotHash';
 import { isAwaitingAuthorization } from '../../utils/toolDescription';
 import { useAgentStore } from '../../stores/agentStore';
 import type { KnowledgeInjectionSlice, KnowledgeQueryMetadata, KnowledgeQueryWarning } from '../../types/knowledge';
-import {
-    createPassedVerificationRecord,
-    createPendingConfirmationRecord,
-    createShadowStageState,
-} from '../../types/agent_state';
+import { AgentTaskController } from '../../services/AgentTaskController';
+import { UnopenedDocumentDiffRuntime } from '../../services/unopenedDocumentDiffRuntime';
 
 function normalizeToolResultData(result: any): Record<string, any> {
     if (!result) return {};
@@ -500,24 +498,11 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                                         result: toolCall.result,
                                     });
                                     if (hasCandidatePayload(toolCallObj.name, toolCall.result)) {
-                                        const agentStore = useAgentStore.getState();
-                                        const runtime = agentStore.runtimesByTab[payload.tab_id];
-                                        const taskId = runtime?.currentTask?.id ?? null;
-                                        const currentStage = runtime?.stageState.stage;
-                                        if (taskId && ['draft', 'structured', 'candidate_ready'].includes(currentStage ?? 'draft')) {
-                                            agentStore.setStageState(
-                                                payload.tab_id,
-                                                createShadowStageState(taskId, 'candidate_ready', `${toolCallObj.name}:candidate_emitted`)
-                                            );
-                                            agentStore.setVerification(
-                                                payload.tab_id,
-                                                createPassedVerificationRecord(taskId, `${toolCallObj.name}:candidate_verified`)
-                                            );
-                                            agentStore.setConfirmation(
-                                                payload.tab_id,
-                                                createPendingConfirmationRecord(taskId, `${toolCallObj.name}:awaiting_review_render`)
-                                            );
-                                        }
+                                        AgentTaskController.notifyCandidateReady(
+                                            toolCallObj.agentTaskId,
+                                            payload.tab_id,
+                                            `${toolCallObj.name}:candidate_emitted`,
+                                        );
                                     }
                                     // AI 通过 create_file/update_file 创建或更新文件时，立即记录元数据（便于从文件树打开时进入编辑模式）
                                     if (
@@ -551,41 +536,36 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                                             })();
                                         }
                                     }
-                                    // Phase 3：update_file 返回 pending_diffs 时写入 byFilePath
-                                    if (
-                                        toolCallObj.name === 'update_file' &&
-                                        toolCall.result?.success &&
-                                        currentWorkspace
-                                    ) {
-                                        const rawData = toolCall.result.data;
-                                        const data = typeof rawData === 'object' && rawData !== null
-                                            ? rawData
-                                            : typeof rawData === 'string'
-                                                ? (() => { try { return JSON.parse(rawData); } catch { return {}; } })()
-                                                : {};
-                                        const pendingDiffs = data.pending_diffs;
-                                        const pathFromResult = data.path;
-                                        if (Array.isArray(pendingDiffs) && pendingDiffs.length > 0 && pathFromResult) {
-                                            (async () => {
-                                                try {
-                                                    const { normalizePath, normalizeWorkspacePath, getAbsolutePath } = await import('../../utils/pathUtils');
-                                                    const normalizedPath = normalizePath(pathFromResult);
-                                                    const normalizedWorkspacePath = normalizeWorkspacePath(currentWorkspace);
-                                                    const filePath = getAbsolutePath(normalizedPath, normalizedWorkspacePath);
-                                                    useDiffStore.getState().setFilePathDiffs(filePath, pendingDiffs, {
-                                                        chatTabId: payload.tab_id,
-                                                        sourceToolCallId: toolCallObj.id,
-                                                        messageId: lastMessage.id,
-                                                        agentTaskId: toolCallObj.agentTaskId,
-                                                    });
-                                                    const tab = useEditorStore.getState().tabs.find((t) => t.filePath === filePath);
-                                                    if (tab?.editor?.state?.doc) {
-                                                        useDiffStore.getState().resolveFilePathDiffs(filePath, tab.editor.state.doc);
-                                                    }
-                                                } catch (e) {
-                                                    console.warn('[ChatPanel] 处理 update_file pending_diffs 失败:', e);
-                                                }
-                                            })();
+                                    // Phase 3：update_file → byFilePath 主链收口至 UnopenedDocumentDiffRuntime
+                                    if (toolCallObj.name === 'update_file' && toolCall.result?.success && currentWorkspace) {
+                                        try {
+                                            const resultData = typeof toolCall.result?.data === 'object' && toolCall.result?.data != null
+                                                ? toolCall.result.data as any
+                                                : typeof toolCall.result?.data === 'string'
+                                                    ? (() => { try { return JSON.parse(toolCall.result.data); } catch { return {}; } })()
+                                                    : {};
+                                            const activeEditor = useEditorStore.getState().getActiveTab();
+                                            const reqCtx = getPositioningRequestContextForChat(payload.tab_id);
+                                            console.log('[CROSS_FILE_TRACE][INGEST]', JSON.stringify({
+                                                op: 'chatPanel_before_ingest_update_file',
+                                                chatTabId: payload.tab_id,
+                                                messageId: lastMessage.id,
+                                                toolCallId: toolCallObj.id,
+                                                toolName: toolCallObj.name,
+                                                toolResultPath: typeof resultData.path === 'string' ? resultData.path : null,
+                                                pendingCount: Array.isArray(resultData.pending_diffs) ? resultData.pending_diffs.length : 0,
+                                                activeEditorFilePath: activeEditor?.filePath ?? null,
+                                                requestContextTargetFile: reqCtx?.targetFile ?? null,
+                                            }));
+                                            UnopenedDocumentDiffRuntime.ingestUpdateFileToolCall({
+                                                chatTabId: payload.tab_id,
+                                                workspacePath: currentWorkspace,
+                                                messageId: lastMessage.id,
+                                                toolCall: toolCallObj,
+                                                notifyReady: true,
+                                            });
+                                        } catch (e) {
+                                            console.warn('[ChatPanel] 处理 update_file pending_diffs 失败:', e);
                                         }
                                     }
                                     // 文档编辑工具：收到结果时同步到编辑器 store 与 diffStore（Phase 2a）
@@ -608,6 +588,7 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                                                 const entries = convertLegacyDiffsToEntriesWithFallback(diffs, targetTab.editor ?? null);
                                                 if (entries.length > 0) {
                                                     void (async () => {
+                                                        const positioningCtx = getPositioningRequestContextForChat(payload.tab_id);
                                                         const docRev =
                                                             typeof resultData.document_revision === 'number'
                                                                 ? resultData.document_revision
@@ -627,6 +608,10 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                                                             {
                                                                 sourceLabel: `助手消息 · ${toolCallObj.name}`,
                                                                 agentTaskId: toolCallObj.agentTaskId,
+                                                                baselineId:
+                                                                    positioningCtx && positioningCtx.targetFile === targetTab.filePath
+                                                                        ? positioningCtx.baselineId
+                                                                        : undefined,
                                                                 documentRevision: docRev,
                                                                 currentTabRevision: curRev,
                                                                 positioningPath: inferPositioningPath(toolCallObj),
@@ -634,6 +619,8 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                                                                 blockOrderSnapshotHash,
                                                             }
                                                         );
+                                                        // 通知 AgentTaskController：byTab diff 已就绪，可推进 review_ready
+                                                        AgentTaskController.notifyDiffsReady(toolCallObj.agentTaskId, payload.tab_id);
                                                     })();
                                                 }
                                             }
@@ -878,16 +865,11 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ isFullscreen = false }) => {
                 stage: string;
                 stageReason?: string;
             };
-            const agentStore = useAgentStore.getState();
-            const runtime = agentStore.runtimesByTab[tabId];
-            if (!runtime?.currentTask) return;
-            // 只在 task ID 匹配时更新（避免跨任务污染）
-            if (runtime.currentTask.id !== taskId && !taskId.startsWith('shadow-tab:')) return;
-            agentStore.setStageState(tabId, {
-                taskId: runtime.currentTask.id,
-                stage: stage as any,
-                updatedAt: Date.now(),
-                stageReason: stageReason,
+            AgentTaskController.syncBackendStageState({
+                chatTabId: tabId,
+                taskId,
+                stage,
+                stageReason,
             });
         }).then(unlisten => {
             if (cancelled) {

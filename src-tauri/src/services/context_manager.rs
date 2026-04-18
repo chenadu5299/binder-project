@@ -1268,13 +1268,19 @@ Only act on the LAST user message. Previous messages are completed history.
       ));
 
       // 输出精确位置（若有 text_reference 四元组）
+      // 有四元组 → 精确引用锚点：用于锁定正确 block，不再自动冒充 selection。
+      // 无四元组 → reading context（阅读上下文），仅供理解，不作为精确编辑目标。
       if let Some(tr) = &ref_info.text_reference {
         prompt.push_str(&format!(
-          "Position: block[{}] offset {} — block[{}] offset {}\n",
+          "Position: block[{}] offset {} — block[{}] offset {} [precise reference anchor]\n",
           tr.start_block_id, tr.start_offset, tr.end_block_id, tr.end_offset
         ));
       } else if matches!(ref_info.ref_type, ReferenceType::Text) {
-        prompt.push_str("Precision: line-level (no character-level anchor). The referenced text is fully included below. Use the document block list to locate the exact block. Do NOT ask the user for confirmation — apply your best judgment.\n");
+        prompt.push_str("Precision: reading context only (line-level, no precise anchor). \
+          This reference is provided for understanding. \
+          To edit content in this reference, identify the target location via the document block list \
+          and specify it using block_index. \
+          Do NOT treat this reference as a precise edit target.\n");
       }
 
       let is_current_file = current_file

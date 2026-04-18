@@ -15,25 +15,15 @@ import {
 import { invoke } from '@tauri-apps/api/core';
 // import { emit } from '@tauri-apps/api/event'; // ⚠️ 已废弃：不再使用事件系统，统一使用 EditorStore
 import { useFileStore } from '../../stores/fileStore';
-import { useEditorStore } from '../../stores/editorStore';
 import { documentService } from '../../services/documentService';
 import { DocumentDiffView } from './DocumentDiffView';
-import {
-  useDiffStore,
-  makeWorkspacePendingToolCallId,
-} from '../../stores/diffStore';
-import { blockRangeToPMRange, positionToLine } from '../../utils/editorOffsetUtils';
 import { getAbsolutePath, normalizePath, normalizeWorkspacePath } from '../../utils/pathUtils';
-import { DiffCard } from './DiffCard';
-import { FileDiffCard } from './FileDiffCard';
-import type { FileDiffEntry } from '../../stores/diffStore';
-import { toast } from '../Common/Toast';
 import { AgentShadowStateSummary } from './AgentShadowStateSummary';
-import { DiffActionService } from '../../services/DiffActionService';
-import { DiffRetryController } from '../../services/DiffRetryController';
 
 interface ToolCallCardProps {
     toolCall: ToolCall;
+    /** 仅旧格式消息（无 contentBlocks）允许进入 ToolCallCard 的 update_file 兼容链。 */
+    legacyMode?: boolean;
     /** 当前聊天 tab，用于 diff 归属与底部批量操作作用域 */
     chatTabId?: string;
     /** 助手消息 id（生命周期与「最后一条助手」批量） */
@@ -41,11 +31,8 @@ interface ToolCallCardProps {
     onResult?: (result: ToolResult) => void;
 }
 
-export const ToolCallCard: React.FC<ToolCallCardProps> = ({ toolCall, chatTabId, messageId, onResult }) => {
+export const ToolCallCard: React.FC<ToolCallCardProps> = ({ toolCall, legacyMode = false, chatTabId, onResult }) => {
     const { currentWorkspace } = useFileStore();
-    const { updateTabContent } = useEditorStore();
-    useDiffStore((s) => s.byFilePath); // 订阅以在 update_file 接受/拒绝后重新渲染
-    useDiffStore((s) => s.byTab);
     const [isExecuting, setIsExecuting] = useState(false);
     const [showPreview, setShowPreview] = useState(false);
     const [showDiff, setShowDiff] = useState(false);
@@ -54,41 +41,8 @@ export const ToolCallCard: React.FC<ToolCallCardProps> = ({ toolCall, chatTabId,
     // edit_current_editor_document 的 diff 同步只保留 ChatPanel（流式）单一路径。
     // ToolCallCard 不再参与，避免并发写入同一 byTab[filePath]。
 
-    // update_file 返回 pending_diffs 时，确保写入 byFilePath（与 ChatPanel 一致，避免首次渲染时无数据）
-    useEffect(() => {
-        if (toolCall.name !== 'update_file' || !toolCall.result?.success || !currentWorkspace) return;
-        const rawData = toolCall.result.data;
-        const data = typeof rawData === 'object' && rawData !== null
-            ? rawData
-            : typeof rawData === 'string'
-                ? (() => { try { return JSON.parse(rawData); } catch { return {}; } })()
-                : {};
-        const pendingDiffsRaw = data.pending_diffs;
-        const pathFromResult = data.path;
-        if (Array.isArray(pendingDiffsRaw) && pendingDiffsRaw.length > 0 && pathFromResult) {
-            const filePath = getAbsolutePath(normalizePath(pathFromResult), normalizeWorkspacePath(currentWorkspace));
-            const normalized = pendingDiffsRaw.map((p: Record<string, unknown>) => ({
-                id: p.id ?? 0,
-                file_path: p.file_path ?? pathFromResult,
-                diff_index: p.diff_index ?? 0,
-                original_text: p.original_text ?? '',
-                new_text: p.new_text ?? '',
-                para_index: p.para_index ?? 0,
-                diff_type: p.diff_type ?? 'replace',
-                status: p.status ?? 'pending',
-            } as FileDiffEntry));
-            useDiffStore.getState().setFilePathDiffs(filePath, normalized, {
-                chatTabId,
-                sourceToolCallId: toolCall.id,
-                ...(messageId != null ? { messageId } : {}),
-                ...(toolCall.agentTaskId != null ? { agentTaskId: toolCall.agentTaskId } : {}),
-            });
-            const tab = useEditorStore.getState().tabs.find((t) => t.filePath === filePath);
-            if (tab?.editor?.state?.doc) {
-                useDiffStore.getState().resolveFilePathDiffs(filePath, tab.editor.state.doc);
-            }
-        }
-    }, [toolCall.name, toolCall.id, toolCall.result?.success, toolCall.result?.data, currentWorkspace, chatTabId, messageId]);
+    // update_file 的 pending hydration 已统一收口到 ChatMessages。
+    // ToolCallCard 仅保留旧格式兼容展示与用户触发的 locate/retry 交互，不再承担 byFilePath 主写入。
 
     // 当 AI 通过 create_file 或 update_file 成功创建/更新文件时，自动记录元数据（便于后续从文件树打开时进入编辑模式）
     useEffect(() => {
@@ -311,8 +265,8 @@ export const ToolCallCard: React.FC<ToolCallCardProps> = ({ toolCall, chatTabId,
 
     const formattedArgs = formatArguments();
 
-    // Phase 3：update_file 返回 pending_diffs 时，逐条显示 DiffCard/FileDiffCard（全部接受/拒绝由 DiffAllActionsBar 统一处理）
-    if (toolCall.name === 'update_file' && toolCall.result?.success && currentWorkspace) {
+    // 旧格式兼容：只保留 update_file 摘要，不再在 ToolCallCard 内形成正式 diff 审阅链。
+    if (legacyMode && toolCall.name === 'update_file' && toolCall.result?.success && currentWorkspace) {
         const rawData = toolCall.result.data;
         const data = typeof rawData === 'object' && rawData !== null
             ? rawData
@@ -323,216 +277,26 @@ export const ToolCallCard: React.FC<ToolCallCardProps> = ({ toolCall, chatTabId,
         const pathFromResult = data.path;
         if (Array.isArray(pendingDiffsRaw) && pendingDiffsRaw.length > 0 && pathFromResult) {
             const filePath = getAbsolutePath(normalizePath(pathFromResult), normalizeWorkspacePath(currentWorkspace));
-            const workspacePath = normalizeWorkspacePath(currentWorkspace);
-            const tab = useEditorStore.getState().tabs.find((t) => t.filePath === filePath);
-            const workspaceToolCallId = makeWorkspacePendingToolCallId(filePath, toolCall.id);
-            const resolvedDisplayDiffs = tab ? useDiffStore.getState().getDisplayDiffs(tab.filePath, workspaceToolCallId) : [];
-            const diffStore = useDiffStore.getState();
-            const fileEntries = useDiffStore.getState().byFilePath[filePath];
-            const isCleared = useDiffStore.getState().isFileDiffsCleared(filePath);
-
-            // 已全部处理（接受/拒绝后）：显示已应用
-            if (isCleared) {
-                return (
-                    <div className="mt-2 w-full p-3 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-700 rounded-lg">
-                        <p className="text-xs text-green-700 dark:text-green-300">修改已应用。如需撤销可编辑文档后手动恢复。</p>
-                    </div>
-                );
-            }
-
-            // 优先使用 resolved 的 DiffEntry（文件已打开且 resolve 成功）
-            if (resolvedDisplayDiffs.length > 0 && tab?.editor) {
-                const doc = tab.editor.state.doc;
-                return (
-                    <div className="mt-2 w-full space-y-2 p-3 bg-gray-50 dark:bg-gray-800/50 rounded-lg">
-                        {resolvedDisplayDiffs.map((entry) => {
-                            const entryBrOpts = {
-                                occurrenceIndex: entry.occurrenceIndex,
-                                originalTextFallback: entry.originalText,
-                            };
-                            const range =
-                                entry.mappedFrom != null && entry.mappedTo != null
-                                    ? { from: entry.mappedFrom, to: entry.mappedTo }
-                                    : entry.status === 'accepted' && entry.acceptedFrom != null && entry.acceptedTo != null
-                                      ? { from: entry.acceptedFrom, to: entry.acceptedTo }
-                                      : blockRangeToPMRange(
-                                            doc,
-                                            entry.startBlockId,
-                                            entry.startOffset,
-                                            entry.endBlockId,
-                                            entry.endOffset,
-                                            entryBrOpts
-                                        );
-                            const lineStart = range ? positionToLine(doc, range.from) : undefined;
-                            const lineEnd = range ? positionToLine(doc, Math.max(range.from, range.to - 1)) : undefined;
-                            return (
-                                <DiffCard
-                                    key={entry.diffId}
-                                    diff={entry}
-                                    chatTabId={chatTabId}
-                                    filePath={filePath}
-                                    workspacePath={workspacePath}
-                                    lineStart={lineStart}
-                                    lineEnd={lineEnd}
-                                    onLocate={range ? () => {
-                                        const { tabs, setActiveTab } = useEditorStore.getState();
-                                        const t = tabs.find((tb) => tb.filePath === filePath);
-                                        if (t) {
-                                            setActiveTab(t.id);
-                                            if (t.editor) {
-                                                try {
-                                                    const { node } = t.editor.view.domAtPos(Math.min(range.from, t.editor.state.doc.content.size - 1));
-                                                    const el = node.nodeType === Node.TEXT_NODE ? node.parentElement : (node as Element);
-                                                    if (el && el instanceof HTMLElement) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                                                } catch {
-                                                    useEditorStore.getState().setPendingScrollTo(t.id, range.from, range.to);
-                                                }
-                                            } else {
-                                                useEditorStore.getState().setPendingScrollTo(t.id, range.from, range.to);
-                                            }
-                                        } else {
-                                            documentService.openFile(filePath).then(() => {
-                                                const tt = useEditorStore.getState().tabs.find((tb) => tb.filePath === filePath);
-                                                if (tt) useEditorStore.getState().setPendingScrollTo(tt.id, range.from, range.to);
-                                            });
-                                        }
-                                    } : undefined}
-                                    onAccept={async () => {
-                                        const editor = tab.editor;
-                                        if (!editor) return;
-                                        const tabRev = tab.documentRevision ?? 1;
-                                        const agentTaskId = entry.agentTaskId ?? toolCall.agentTaskId;
-                                        const result = await DiffActionService.acceptDiff(
-                                            tab.filePath,
-                                            entry.diffId,
-                                            editor,
-                                            {
-                                                tabDocumentRevision: tabRev,
-                                                chatTabId: chatTabId ?? '',
-                                                agentTaskId,
-                                            },
-                                        );
-                                        if (!result.success) {
-                                            if (result.toastMessage) toast.warning(result.toastMessage);
-                                            return;
-                                        }
-                                        // 同时有关联文件 diff 时，写入工作区文件
-                                        if (entry.fileDiffIndex != null) {
-                                            (async () => {
-                                                try {
-                                                    await DiffActionService.acceptFileDiffs(
-                                                        filePath,
-                                                        currentWorkspace ?? '',
-                                                        { chatTabId: chatTabId ?? '', agentTaskId, diffIndices: [entry.fileDiffIndex!] },
-                                                    );
-                                                    toast.success('已应用修改并写入文件');
-                                                } catch (e) {
-                                                    toast.error(`接受失败: ${e instanceof Error ? e.message : String(e)}`);
-                                                }
-                                            })();
-                                        }
-                                    }}
-                                    onReject={() => {
-                                        if (entry.fileDiffIndex != null) {
-                                            diffStore.removeFileDiffEntry(filePath, entry.fileDiffIndex);
-                                        }
-                                        DiffActionService.rejectDiff(tab.filePath, entry.diffId, {
-                                            chatTabId: chatTabId ?? '',
-                                            agentTaskId: entry.agentTaskId ?? toolCall.agentTaskId,
-                                        });
-                                        tab.editor?.view.dispatch(tab.editor.state.tr);
-                                    }}
-                                    onRetry={async () => {
-                                        const editor = tab.editor;
-                                        if (!editor) return;
-                                        await DiffRetryController.retryDiff(
-                                            entry.diffId,
-                                            editor,
-                                            {
-                                                tabDocumentRevision: tab.documentRevision ?? 1,
-                                                chatTabId: chatTabId ?? '',
-                                                agentTaskId: entry.agentTaskId ?? toolCall.agentTaskId,
-                                            },
-                                        );
-                                    }}
-                                />
-                            );
-                        })}
-                    </div>
-                );
-            }
-
-            // 未 resolve 且无 fileEntries：可能尚未同步，用 result 数据兜底
-            const entriesToShow = fileEntries?.length
-                ? fileEntries
-                : pendingDiffsRaw.map((p: Record<string, unknown>) => ({
-                    id: p.id ?? 0,
-                    file_path: p.file_path ?? pathFromResult,
-                    diff_index: p.diff_index ?? 0,
-                    original_text: p.original_text ?? '',
-                    new_text: p.new_text ?? '',
-                    para_index: p.para_index ?? 0,
-                    diff_type: p.diff_type ?? 'replace',
-                    status: p.status ?? 'pending',
-                } as FileDiffEntry));
-
-            if (entriesToShow.length === 0) return null;
-
-            // 未 resolve 或文件未打开：使用 FileDiffCard
             return (
-                <div className="mt-2 w-full space-y-2 p-3 bg-gray-50 dark:bg-gray-800/50 rounded-lg">
-                    {entriesToShow.map((entry, idx) => (
-                        <FileDiffCard
-                            key={`${entry.id}-${entry.diff_index}`}
-                            entry={entry}
-                            chatTabId={chatTabId}
-                            filePath={filePath}
-                            workspacePath={workspacePath}
-                            index={idx}
-                            onAccept={async () => {
-                                try {
-                                    await DiffActionService.acceptFileDiffs(
-                                        filePath,
-                                        currentWorkspace ?? '',
-                                        {
-                                            chatTabId: chatTabId ?? '',
-                                            agentTaskId: entry.agentTaskId ?? toolCall.agentTaskId,
-                                            diffIndices: [entry.diff_index],
-                                        },
-                                    );
-                                    toast.success('已应用修改并写入文件');
-                                } catch (e) {
-                                    toast.error(`接受失败: ${e instanceof Error ? e.message : String(e)}`);
-                                }
+                <div className="mt-2 w-full p-3 bg-gray-50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-600 rounded-lg space-y-2">
+                    <p className="text-xs text-gray-700 dark:text-gray-300">
+                        该旧格式消息包含 <span className="font-medium">{pendingDiffsRaw.length}</span> 处 `update_file` 修改建议。
+                        正式审阅入口已收口到消息流 diff 卡；此处仅保留兼容摘要。
+                    </p>
+                    <div className="flex items-center gap-2">
+                        <button
+                            type="button"
+                            onClick={() => {
+                                void documentService.openFile(filePath);
                             }}
-                            onReject={() => diffStore.removeFileDiffEntry(filePath, entry.diff_index)}
-                            onRetryResolve={
-                                tab?.editor?.state?.doc
-                                    ? () => {
-                                        const doc = tab.editor!.state.doc;
-                                        const r = diffStore.retryResolveFilePathDiffs(filePath, doc);
-                                        if ((import.meta as any).env?.DEV) {
-                                          console.debug('[FileDiffCard] retry resolve', r);
-                                        }
-                                        if (r.resolved > 0) {
-                                          useEditorStore.getState().setPendingScrollTo(tab.id, 0, 0);
-                                        }
-                                      }
-                                    : undefined
-                            }
-                            onLocate={tab ? () => {
-                                const { setActiveTab } = useEditorStore.getState();
-                                setActiveTab(tab.id);
-                                documentService.openFile(filePath).then(() => {
-                                    const t = useEditorStore.getState().tabs.find((tb) => tb.filePath === filePath);
-                                    if (t) {
-                                        const resolved = diffStore.resolveFilePathDiffs(filePath, t.editor!.state.doc);
-                                        if (resolved.resolved > 0) useEditorStore.getState().setPendingScrollTo(t.id, 0, 0);
-                                    }
-                                });
-                            } : () => documentService.openFile(filePath)}
-                        />
-                    ))}
+                            className="px-2 py-1 text-xs rounded bg-blue-600 text-white hover:bg-blue-700"
+                        >
+                            打开文件
+                        </button>
+                        <span className="text-[11px] text-gray-500 dark:text-gray-400 truncate">
+                            {filePath}
+                        </span>
+                    </div>
                 </div>
             );
         }
@@ -656,7 +420,7 @@ export const ToolCallCard: React.FC<ToolCallCardProps> = ({ toolCall, chatTabId,
                                             {toolCall.result.meta.gate.status === 'candidate_ready' ? '📋 候选就绪' : toolCall.result.meta.gate.status === 'no_op' ? '⏭ 无变更' : toolCall.result.meta.gate.status}
                                         </span>
                                     )}
-                                    {toolCall.result.meta.verification?.status && (
+                                    {toolCall.name !== 'update_file' && toolCall.result.meta.verification?.status && (
                                         <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium ${
                                             toolCall.result.meta.verification.status === 'passed' ? 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300'
                                             : toolCall.result.meta.verification.status === 'failed' ? 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300'

@@ -52,7 +52,7 @@ export interface TextReference extends BaseReference {
         start: number;
         end: number;
     };
-    displayText: string;       // 显示文本：如 "main.ts (行 10-15)"
+    displayText: string;       // 显示文本：内容摘要主标签，位置仅作弱后缀
     /** 精确引用四元组（优先使用） */
     textReference?: TextReferenceAnchor;
     /** 兼容字段：单块引用时可作为 startBlockId/endBlockId 的别名 */

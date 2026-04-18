@@ -94,7 +94,7 @@
 
 MUST：
 1. 输入必须归一化为“消息 + 位置线索 + 目标文件”三元组（`DE-CORE-001`）。
-2. 若提供精确引用坐标，后续路由必须优先走零搜索（`DE-ROUTE-001`）。
+2. 零搜索只接受显式编辑器选区；精确引用坐标只作为定位辅助，不得自动回填 `_sel_*`（`DE-ROUTE-001`）。
 3. 模型输入中禁止暴露 `blockId`，只能使用 `block_index`（`DE-CORE-002`）。
 4. 非当前文档场景按需求链路分流，不能仅按“是否打开”硬拦截（`DE-SCENE-001/002`）。
 
@@ -132,8 +132,8 @@ MUST：
 | 场景6：首次打开 md/txt | 后端注入 `block-ws-*` | 块内搜索 | 需门禁链全部通过 |
 
 意图状态切换（A/B/C）：
-1. A（精确引用）-> 零搜索，且优先级高于 B/C。
-2. B（显式选区）-> 零搜索；若 A/B 同时存在，使用时间戳更晚的坐标源并记录冲突事件。
+1. A（精确引用）-> 精确引用锚点，仅用于锁定正确 block，不直接进入零搜索。
+2. B（显式选区）-> 零搜索；若 A/B 同时存在，显式选区拥有执行级优先权。
 3. C（仅光标）-> 块内搜索，不得伪造精确区间。
 
 非当前文档门禁失败暴露（MUST）：
@@ -373,14 +373,14 @@ MUST：
 MUST：
 1. 复制引用标签时，`TextReference` 必须保留四元组：`startBlockId/startOffset/endBlockId/endOffset`。
 2. 粘贴生成引用标签时，前端不得只保留 `blockId` 单块别名；跨块引用必须保留 `startBlockId != endBlockId`。
-3. 发送前若无显式选区，必须用引用四元组回填 `_sel_*` 进入零搜索链；不得直接退化为块内搜索。
+3. 发送前若无显式选区，不得用引用四元组回填 `_sel_*` 冒充 selection；TextReference 只能作为精确引用锚点或阅读上下文。
 4. 若引用元数据缺失或过期，必须显式标记为降级引用并输出可观测日志；不得伪装成精确引用。
-5. `route_source=reference` 仅在 `_sel_*` 由引用四元组稳定回填后生效，禁止仅凭 UI 标签判定。
+5. 当前运行时已取消 `route_source=reference` 直通执行；精确引用锚点只能参与锁定 block，真正进入执行链时必须冻结为 `ExecutionAnchor` 并按实际解析结果输出 `route_source`。
 
 验收：
-1. 同文档单块复制粘贴引用，执行链输出 `route_source=reference`。
-2. 同文档跨块复制粘贴引用，执行链输出 `route_source=reference` 且区间为跨块闭区间。
-3. 引用元数据失效时，链路可观测到降级，不得误报为 `reference`。
+1. 同文档单块复制粘贴引用，不得自动回填 `_sel_*` 冒充 selection。
+2. 同文档跨块复制粘贴引用，执行链只能在成功冻结 `ExecutionAnchor` 后进入 canonical diff；不得凭引用标签直通执行。
+3. 引用元数据失效时，链路可观测到降级，不得误报为显式选区零搜索。
 
 ### 5.8 引用结构保真与传输约束（MUST）
 
@@ -389,7 +389,7 @@ MUST：
 1. 后端 IPC 接收层必须将前端 `ReferenceFromFrontend` 转换为 `RichReferenceInfo`（含 `ref_type`/`source`/`content`/`text_reference`/`knowledge_*`），不得丢弃 `text_reference` 四元组和知识库细粒度 ID。
 2. `build_reference_prompt` 输出每条引用必须包含：类型标题（如 `Text reference`）、`Source: {path}`、位置信息（若有 `text_reference`）和 `Content:`；无 text_reference 时必须附加明确提示，告知模型该引用为行级或文件级精度。
 3. 引用正文仅通过 `references` 协议单通道注入后端；前端用户消息 `content` 中不得展开引用正文。引用标签在 `content` 中以 `@{label}` 占位形式出现，不展开。
-4. 行级 `@` 引用（`createTextReference`）创建时，若目标文件已在编辑器中打开且有 block 结构，必须尝试从编辑器 DOM 解析对应行的 `data-block-id` 并填入 `textReference` 四元组。若解析失败或文件未打开，允许不填四元组，但 `build_reference_prompt` 必须明确标注该引用为行级精度。
+4. TextReference 创建后，若 `textReference` 四元组缺失但存在 `lineRange`，必须通过 `enrichTextReferenceAnchor`（`referenceHelpers.ts`）尝试从 editor DOM 按行号补齐四元组（使用 `createAnchorFromLineRange`）。若文件未打开或计算失败，保持行级精度（阅读上下文），`build_reference_prompt` 必须标注 `no precise anchor`，**禁止** 输出任何"自行判断目标块"语义。
 5. `agent_task_summary` 和 `agent_artifacts_summary` 在以下任一条件满足时不得注入：(a) 存在精确选区坐标（`_sel_*` 完整）；(b) 存在同文件 TextReference 引用且用户消息长度 < 100 字符。
 
 验收：
@@ -624,6 +624,102 @@ MUST：
 1. 每条 P0/P1 规则在 `A-DE-M-D-01_对话编辑统一方案.md`/`A-DE-M-T-01_diff系统规则.md`/`A-DE-M-T-02_baseline状态协作.md`/`A-DE-M-P-01_对话编辑提示词.md` 至少有一个“主定义+反向链接”。
 2. 无 `MUST` 条款的章节视为未完成。
 3. 无验收口径的规则视为未落地。
+
+---
+
+## 十二、P0 收口约束（2026-04）
+
+> 以下规则已在代码中收口，任何绕过均属违规。
+
+### 12.1 Diff 操作唯一入口
+
+所有 accepted / rejected / acceptAll / fileAccept / fileReject 操作必须经过 `DiffActionService`。
+
+**禁止**：任何 UI 组件直接调用 `diffStore.acceptDiff / rejectDiff / removeFileDiffEntry`。
+
+新增入口：
+- `DiffActionService.rejectResolvedDiffCard(filePath, diffId, fileDiffIndex, options)` — 已 resolve 的 DiffCard reject
+- `DiffActionService.rejectFileDiffEntry(filePath, fileDiffIndex, workspacePath, options)` — 未 resolve 的 FileDiffCard reject
+
+### 12.2 Agent Stage 推进唯一主体
+
+| Stage | 合法推进主体 | 调用方 |
+|-------|------------|-------|
+| `structured` | chatStore.sendMessage（初始化） | sendMessage |
+| `candidate_ready` | AgentTaskController.notifyCandidateReady | ChatPanel.tsx 流式处理 |
+| `review_ready` | AgentTaskController.notifyDiffsReady | setDiffsForToolCall / setFilePathDiffs 写入方 |
+| `stage_complete` | AgentTaskController.checkAndAdvanceStage | DiffActionService |
+| `invalidated` | AgentTaskController.forceInvalidate | DiffActionService / markAgentInvalidated |
+
+**已删除**：ChatMessages.tsx 中扫描 contentBlocks 推进 `review_ready` 的 useEffect。
+
+### 12.3 工作区边界
+
+- `workspace_path` 必须由前端 tab 显式提供，后端不再静默 fallback 到 watcher/cwd
+- Agent mode 发送前校验：无工作区时前端阻止并给出明确错误
+- 工作区切换时：`fileStore.setCurrentWorkspace` 自动中断所有活跃 stream
+
+### 12.4 TEXT 精确引用主链收口（2026-04）
+
+**引用精度双档语义**（与 A-AST-M-P-01 §12.4 对齐）：
+
+| 精度档 | 判断依据 | 执行链 | prompt 标注 |
+|------|---------|-------|------------|
+| 精确引用锚点 | `textReference` 四元组存在 | 锁定目标 block，不直接进入零搜索 | `[precise reference anchor]` |
+| 阅读上下文 | 无四元组（行级或文件级）| 块内搜索 `route_source=block_search` | `no precise anchor` |
+
+**创建入口约束**：
+
+- `FileReference`：纯文件级阅读上下文，**不承担执行锚点**，不得注入 `textReference` 字段
+- `TextReference` 创建后若缺失四元组：调用 `enrichTextReferenceAnchor`（`referenceHelpers.ts`）尝试按行号补齐
+- `@` 提及 → 选择文件 → 产出 `FileReference`（全文阅读上下文，无执行锚点）
+- 编辑器选中 → 复制/拖拽 → 产出 `TextReference`（携带 `textReference` 四元组）
+
+**引用标签格式标准**（A-CORE-C-D-02 §3.3 对齐）：
+
+- 内容摘要主标签；中文约前 5 字、英文/半宽约 10 字符
+- 位置仅作弱后缀去重，如 `· @12` / `· L3-4`
+
+**禁止的退化路径**：
+
+- `build_reference_prompt` 无四元组时，**禁止** 输出 `"apply your best judgment"` 或任何鼓励模型自行猜目标的文案
+- `FileReference` 不得通过兼容层升级为 `TextReference`（语义不等价）
+- `ReferenceProtocol.editTarget` 字段**已废弃（2026-04-16）**，不得再写入（已从 `referenceProtocolAdapter.ts` 移除）
+- 零搜索路径（Step 2a）锚点失效时，**禁止** `unwrap_or_default()` 兜底产生空 `originalText`；必须返回 `Err`（`E_RANGE_UNRESOLVABLE`）（已在 `tool_service.rs` Step 2a 修复）
+- 当前执行级唯一真源为 `ExecutionAnchor(filePath + blockId/startOffset/endOffset + originalText + baseline/revision)`；`block_index`、`TextReference`、`target`、`para_index` 都只能作为上游定位信号，进入执行链前必须先归一到该对象
+
+### 12.5 未打开文档编辑主链收口（2026-04-17）
+
+`update_file` 的 diff 审阅从 ToolCallCard 专属路径收口到消息流主链：
+
+**新格式消息（contentBlocks）主链**：
+
+1. 工具结果到达 → `ChatPanel` 调 `UnopenedDocumentDiffRuntime.ingestUpdateFileToolCall(...)`
+   - runtime 负责解析 `pending_diffs`、写入 `byFilePath`、必要时补 `notifyDiffsReady`
+   - 后端 `generate_pending_diffs_for_file_type` 会为 `pending_diffs` 标记 `diff_type`
+   - 单行 / 单块 `replace` 会先裁掉共同前后缀，能缩成真实修改片段时记为 `precise`
+   - 插入、跨多行替换、无法缩小到非空 `original_text` 的场景仍保留 `block_level`
+2. `ChatMessages.contentBlocks` 渲染：
+   - 文件已打开（resolved）→ DiffCard（byTab）
+   - 文件未打开 → FileDiffCard（byFilePath）
+3. 历史水合 → `UnopenedDocumentDiffRuntime.start()` 订阅 chatStore，只补写“语义上仍是 missing”的对象；唯一标识为 `toolCallId + filePath + diff_index`
+4. 文件打开 → `UnopenedDocumentDiffRuntime.start()` 订阅 editorStore；当 tab 拥有 editor 且 `byFilePath[filePath]` 非空时，自动执行 `resolveFilePathDiffs(filePath, currentDoc)`
+5. accept/reject → `ChatMessages` / `ToolCallCard` 只调用 `UnopenedDocumentDiffRuntime.acceptResolvedDiff / rejectResolvedDiff / acceptPendingDiff / rejectPendingDiff`
+6. stage 裁决：
+   - `checkAndAdvanceStage`：处理 `byTab` 路径，但若同 task 仍有 `byFilePath` pending 则不推进
+   - `handleFileDiffResolution`：处理 `byFilePath` 路径，但若同 task 仍有 `byTab` 或 `byFilePath` pending 也不推进
+   - 两条入口现已共享 `finalizeStageClosure(...)`，避免 `checkAndAdvanceStage / handleFileDiffResolution` 漂移
+   - resolved accept 的最终闭环为 `acceptResolvedDiffCard = acceptDiff + acceptFileDiffs`
+7. 批量 accept/reject → `DiffAllActionsBar`（同时覆盖 byTab + byFilePath）
+
+**旧格式消息（无 contentBlocks）兼容路径**：由 `UnopenedDocumentDiffRuntime.start()` 负责历史水合；ToolCallCard 仅在 `legacyMode=true` 时保留兼容展示与交互；不参与 `byFilePath` 主写入，也不参与 `resolveFilePathDiffs` / `notifyDiffsReady`。
+
+**职责边界（收口后）**：
+- `UnopenedDocumentDiffRuntime`：未打开文档编辑的运行时协调入口（流式写入 / 历史水合 / 打开后 resolve / update_file accept-reject 包装）
+- `ChatMessages`：新格式消息的 diff 审阅主渲染入口
+- `ToolCallCard`：旧格式消息兼容展示 + locate/retry/accept/reject 交互
+- `PendingDiffPanel`：工作区聚合导航视图，非主审阅入口
+- `DiffAllActionsBar`：批量操作，统一覆盖 byTab 和 byFilePath
 
 ---
 

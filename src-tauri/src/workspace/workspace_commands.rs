@@ -5,7 +5,7 @@
 use crate::commands::file_commands::{open_docx_for_edit, read_file_content};
 use crate::utils::path_validator::PathValidator;
 use crate::workspace::canonical_html::{
-  canonical_html_for_workspace_cache, inject_blockids_for_plain_text, inspect_block_id_map,
+  canonical_html_for_workspace_cache, content_hash_hex, inject_blockids_for_plain_text, inspect_block_id_map,
   materialize_cached_body_if_stale_hash, should_inject_block_ids_for_plain_text,
   should_run_workspace_canonical_pipeline,
 };
@@ -20,6 +20,7 @@ use crate::workspace::workspace_db::{
   PendingDiffEntry, TimelineNodeRecord, TimelineRestorePayloadRecord, WorkspaceDb,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, State};
@@ -375,9 +376,16 @@ pub async fn ai_edit_file_with_diff(
     return Ok(Vec::new());
   }
 
-  let rows: Vec<(String, String, i32)> = diffs
+  let rows: Vec<(String, String, i32, String)> = diffs
     .iter()
-    .map(|d| (d.original_text.clone(), d.new_text.clone(), d.para_index))
+    .map(|d| {
+      (
+        d.original_text.clone(),
+        d.new_text.clone(),
+        d.para_index,
+        d.diff_type.clone(),
+      )
+    })
     .collect();
 
   let entries = db.insert_pending_diffs(&file_path, &rows)?;
@@ -445,6 +453,25 @@ fn apply_diffs_to_content(content: &str, diffs: &[PendingDiffEntry]) -> Result<S
   Ok(lines.join("\n"))
 }
 
+fn dedupe_pending_diffs_by_index_keep_latest(
+  diffs: Vec<PendingDiffEntry>,
+) -> Vec<PendingDiffEntry> {
+  let mut by_index: HashMap<i32, PendingDiffEntry> = HashMap::new();
+  for diff in diffs {
+    match by_index.get(&diff.diff_index) {
+      Some(existing)
+        if (existing.created_at > diff.created_at)
+          || (existing.created_at == diff.created_at && existing.id > diff.id) => {}
+      _ => {
+        by_index.insert(diff.diff_index, diff);
+      }
+    }
+  }
+  let mut deduped: Vec<PendingDiffEntry> = by_index.into_values().collect();
+  deduped.sort_by(|a, b| a.diff_index.cmp(&b.diff_index));
+  deduped
+}
+
 /// accept_file_diffs：应用 pending diffs 并写盘（6.5）
 /// diff_indices 可选，不传则应用全部
 #[tauri::command]
@@ -459,6 +486,7 @@ pub async fn accept_file_diffs(
       .map_err(|e| format!("文件路径非法: {}", e))?;
 
   let mut diffs = db.get_pending_diffs(&file_path)?;
+  let diff_record_paths: Vec<String> = diffs.iter().map(|d| d.file_path.clone()).collect();
   {
     let diffs_summary: Vec<_> = diffs.iter().map(|d| {
       let orig_preview: String = d.original_text.chars().take(60).collect();
@@ -476,6 +504,13 @@ pub async fn accept_file_diffs(
       diff_indices,
       diffs_summary.join(","),
     );
+    eprintln!(
+      "[CROSS_FILE_TRACE][BACKEND_ACCEPT] {{\"phase\":\"query\",\"queried_file_path\":{:?},\"returned_count\":{},\"record_file_paths\":{:?},\"workspace_path\":{:?},\"tool_call_id\":null,\"message_id\":null}}",
+      file_path,
+      diffs.len(),
+      diff_record_paths,
+      workspace_path,
+    );
   }
   if diffs.is_empty() {
     return Err("没有待确认的修改".to_string());
@@ -486,6 +521,16 @@ pub async fn accept_file_diffs(
     if diffs.is_empty() {
       return Err("指定的 diff 不存在".to_string());
     }
+  }
+  let before_dedupe = diffs.len();
+  diffs = dedupe_pending_diffs_by_index_keep_latest(diffs);
+  if before_dedupe != diffs.len() {
+    eprintln!(
+      "[CROSS_FILE_TRACE][BACKEND_ACCEPT] {{\"phase\":\"dedupe\",\"queried_file_path\":{:?},\"before\":{},\"after\":{},\"reason\":\"duplicate_diff_index\"}}",
+      file_path,
+      before_dedupe,
+      diffs.len(),
+    );
   }
 
   let file_type = full_path
@@ -521,6 +566,8 @@ pub async fn accept_file_diffs(
       }
     }
   };
+  let before_hash = content_hash_hex(&base_content);
+  let before_len = base_content.len();
 
   let final_content = apply_diffs_to_content(&base_content, &diffs)?;
 
@@ -535,6 +582,19 @@ pub async fn accept_file_diffs(
   } else {
     (final_content.clone(), None)
   };
+  let after_hash = content_hash_hex(&body_to_store);
+  let after_len = body_to_store.len();
+  eprintln!(
+    "[CROSS_FILE_TRACE][BACKEND_ACCEPT] {{\"phase\":\"apply_ready\",\"queried_file_path\":{:?},\"write_target_full_path\":{:?},\"write_target_relative\":{:?},\"record_paths_all_match_query\":{},\"before_len\":{},\"before_hash\":{:?},\"after_len\":{},\"after_hash\":{:?}}}",
+    file_path,
+    full_path.to_string_lossy(),
+    file_path,
+    diffs.iter().all(|d| d.file_path == file_path),
+    before_len,
+    before_hash,
+    after_len,
+    after_hash,
+  );
 
   if file_type == "docx" {
     use crate::services::pandoc_service::PandocService;
@@ -558,8 +618,24 @@ pub async fn accept_file_diffs(
       body_to_store.len(),
       final_preview,
     );
+    eprintln!(
+      "[CROSS_FILE_TRACE][BACKEND_ACCEPT] {{\"phase\":\"post_write\",\"queried_file_path\":{:?},\"write_target_full_path\":{:?},\"before_len\":{},\"before_hash\":{:?},\"after_len\":{},\"after_hash\":{:?}}}",
+      file_path,
+      full_path.to_string_lossy(),
+      before_len,
+      before_hash,
+      after_len,
+      after_hash,
+    );
   }
-  db.delete_pending_diffs(&file_path)?;
+  if diff_indices.is_some() {
+    let mut indices_to_delete: Vec<i32> = diffs.iter().map(|d| d.diff_index).collect();
+    indices_to_delete.sort_unstable();
+    indices_to_delete.dedup();
+    db.delete_pending_diffs_for_indices(&file_path, &indices_to_delete)?;
+  } else {
+    db.delete_pending_diffs(&file_path)?;
+  }
   let mtime = std::fs::metadata(&full_path)
     .and_then(|m| m.modified())
     .map(|t| {

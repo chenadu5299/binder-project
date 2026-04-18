@@ -8,13 +8,13 @@ import React from 'react';
 import { CheckIcon, XMarkIcon } from '@heroicons/react/24/outline';
 import type { FileDiffEntry } from '../../stores/diffStore';
 import { AgentShadowStateSummary } from './AgentShadowStateSummary';
+import { buildContentLabel } from '../../utils/contentLabel';
 
 interface FileDiffCardProps {
   entry: FileDiffEntry;
   chatTabId?: string;
   filePath: string;
   workspacePath?: string | null;
-  index: number;
   onAccept: () => void;
   onReject: () => void;
   onLocate?: () => void;
@@ -43,7 +43,6 @@ export const FileDiffCard: React.FC<FileDiffCardProps> = ({
   chatTabId,
   filePath,
   workspacePath = null,
-  index,
   onAccept,
   onReject,
   onLocate,
@@ -51,8 +50,7 @@ export const FileDiffCard: React.FC<FileDiffCardProps> = ({
   disabled = false,
 }) => {
   const relativePath = getRelativePathDisplay(filePath, workspacePath);
-  const fileName = getFileName(filePath);
-  const titleText = `${fileName} 第${index + 1}处`;
+  const titleText = buildContentLabel(entry.original_text || entry.new_text, getFileName(filePath));
 
   const pathBar = (
     <div className="text-[10px] text-gray-500 dark:text-gray-400 truncate px-2 py-0.5 leading-tight">

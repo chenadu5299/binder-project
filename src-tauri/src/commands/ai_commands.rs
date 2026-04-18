@@ -734,8 +734,10 @@ pub struct ReferenceFromFrontend {
   _knowledge_retrieval_mode: Option<String>,
   #[serde(rename = "textReference")]
   text_reference: Option<TextReferenceInfo>,
+  /// editTarget 字段已废弃（前端不再写入，后端不再读取）。
+  /// 保留字段声明仅为向后兼容 JSON 反序列化，避免旧客户端数据导致解析失败。
   #[serde(rename = "editTarget")]
-  edit_target: Option<EditTargetInfo>,
+  _edit_target: Option<EditTargetInfo>,
   #[serde(rename = "templateType")]
   _template_type: Option<WorkflowTemplateReferenceType>,
 }
@@ -770,15 +772,6 @@ struct EditTargetInfo {
   end_offset: u32,
 }
 
-#[derive(Debug, Clone)]
-struct ReferenceAnchorSelection {
-  start_block_id: String,
-  start_offset: usize,
-  end_block_id: String,
-  end_offset: usize,
-  source: String,
-}
-
 #[derive(Debug, Default, Clone)]
 struct ExplicitKnowledgeSuppression {
   has_explicit_reference: bool,
@@ -811,42 +804,6 @@ fn same_source_file_for_reference(
   source_norm == current_norm
     || source_norm.ends_with(&current_norm)
     || current_norm.ends_with(&source_norm)
-}
-
-fn extract_reference_anchor_for_zero_search(
-  refs: Option<&Vec<ReferenceFromFrontend>>,
-  current_file: &Option<String>,
-  workspace: &std::path::Path,
-) -> Option<ReferenceAnchorSelection> {
-  let refs = refs?;
-  for r in refs {
-    if r.reference_type != "text" {
-      continue;
-    }
-    if !same_source_file_for_reference(&r.source, current_file, workspace) {
-      continue;
-    }
-    if let Some(tr) = &r.text_reference {
-      return Some(ReferenceAnchorSelection {
-        start_block_id: tr.start_block_id.clone(),
-        start_offset: tr.start_offset as usize,
-        end_block_id: tr.end_block_id.clone(),
-        end_offset: tr.end_offset as usize,
-        source: r.source.clone(),
-      });
-    }
-    if let Some(et) = &r.edit_target {
-      // 兼容旧字段：单块定位
-      return Some(ReferenceAnchorSelection {
-        start_block_id: et.block_id.clone(),
-        start_offset: et.start_offset as usize,
-        end_block_id: et.block_id.clone(),
-        end_offset: et.end_offset as usize,
-        source: r.source.clone(),
-      });
-    }
-  }
-  None
 }
 
 fn extract_explicit_knowledge_suppression(
@@ -1374,14 +1331,15 @@ pub async fn ai_chat_stream(
     None
   };
 
-  // 获取工作区路径（优先使用前端 tab 绑定路径，避免跨工作区污染）
+  // 获取工作区路径（必须由前端 tab 显式提供，禁止 watcher/cwd 静默兜底）
+  // P0-4: workspace_path 为空时直接返回结构化错误，避免跨工作区污染。
   let workspace_path: PathBuf = if let Some(ws) = workspace_path.filter(|w| !w.trim().is_empty()) {
     PathBuf::from(ws)
   } else {
-    let watcher_guard = watcher.lock().unwrap();
-    watcher_guard
-      .get_workspace_path()
-      .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+    return Err(format!(
+      "workspace_path is required but was not provided. \
+       Please open a workspace before starting an AI conversation."
+    ));
   };
 
   // 使用 ContextManager 统一构建多层提示词（方案A）
@@ -1478,45 +1436,20 @@ pub async fn ai_chat_stream(
     }
   }
 
-  // 12.5：无显式选区时，TextReference 四元组作为一级定位输入（reference 零搜索）
-  let mut effective_selection_start_block_id = selection_start_block_id.clone();
-  let mut effective_selection_start_offset = selection_start_offset;
-  let mut effective_selection_end_block_id = selection_end_block_id.clone();
-  let mut effective_selection_end_offset = selection_end_offset;
-  let mut effective_selected_text = selected_text.clone();
-  let mut selection_source = "selection";
-  let need_reference_fallback = effective_selection_start_block_id.is_none()
-    || effective_selection_start_offset.is_none()
-    || effective_selection_end_block_id.is_none()
-    || effective_selection_end_offset.is_none();
-  if need_reference_fallback {
-    if let Some(anchor) =
-      extract_reference_anchor_for_zero_search(references.as_ref(), &current_file, &workspace_path)
-    {
-      effective_selection_start_block_id = Some(anchor.start_block_id);
-      effective_selection_start_offset = Some(anchor.start_offset);
-      effective_selection_end_block_id = Some(anchor.end_block_id);
-      effective_selection_end_offset = Some(anchor.end_offset);
-      // 关键：reference 路径强制不注入 _sel_text，Resolver 才会稳定输出 route_source=reference
-      effective_selected_text = None;
-      selection_source = "reference";
-      eprintln!(
-        "📎 使用 TextReference 四元组回填零搜索坐标: source={} start=({:?}:{:?}) end=({:?}:{:?})",
-        anchor.source,
-        effective_selection_start_block_id,
-        effective_selection_start_offset,
-        effective_selection_end_block_id,
-        effective_selection_end_offset
-      );
-    }
-  }
-  // 后续流程统一使用“有效选区”变量（显式选区优先，其次引用四元组）
+  // 执行级零搜索只接受显式编辑器选区。
+  // TextReference 继续作为 prompt 中的精确引用/阅读上下文保留，但不再自动回填 _sel_*。
+  let effective_selection_start_block_id = selection_start_block_id.clone();
+  let effective_selection_start_offset = selection_start_offset;
+  let effective_selection_end_block_id = selection_end_block_id.clone();
+  let effective_selection_end_offset = selection_end_offset;
+  let effective_selected_text = selected_text.clone();
+  // 后续流程统一使用“有效选区”变量（仅显式选区）
   let selected_text = effective_selected_text;
   let selection_start_block_id = effective_selection_start_block_id.clone();
   let selection_start_offset = effective_selection_start_offset;
   let selection_end_block_id = effective_selection_end_block_id.clone();
   let selection_end_offset = effective_selection_end_offset;
-  eprintln!("📌 zero-search selection source={}", selection_source);
+  eprintln!("📌 zero-search selection source=selection");
 
   // §7.1：先 clone 选区坐标，再移入 context_info（clone 供后续 spawn 闭包使用）
   let selection_start_block_id_for_spawn = selection_start_block_id.clone();

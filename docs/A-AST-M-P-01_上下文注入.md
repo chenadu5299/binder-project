@@ -381,6 +381,103 @@ Reference 2: ...
 
 ---
 
+## 十二、引用精确性约束（P0-3 收口后生效）
+
+> 本节是 P0 收口修复的规范落地。约束对象：`referenceProtocolAdapter.ts`。
+
+### 12.1 三类引用的严格分层
+
+| 类型 | 语义 | 允许操作 | 禁止操作 |
+|------|------|---------|---------|
+| **显式精确引用** | 用户主动 @ 引用，带精确 ID / 位置 | 直接使用预加载内容（items / slices） | 不允许静默降级为模糊检索 |
+| **显式内容引用（缺位置）** | 用户主动引用，但未携带完整位置四元组 | 按已有锚点（ID）精确查找，找不到返回错误标记 | 不允许以名称/关键词替代精确查找 |
+| **自动检索增强** | 系统自动注入，非用户显式操作 | 关键词/语义模糊检索 | 不允许冒充"显式引用结果" |
+
+### 12.2 MEMORY 引用规则
+
+```
+若 r.items && r.items.length > 0
+  → 直接使用（精确路径）
+否则 若 r.memoryId
+  → memoryService.getAllMemories → 按 memoryId 精确查找
+  → 找到 → 使用
+  → 找不到 → 返回 '[记忆内容不可用]'（受控失败）
+  → 禁止 searchMemories fallback
+否则（无 items 无 memoryId）
+  → 返回 '[记忆内容不可用]'
+```
+
+**禁止的退化路径**：`searchMemories(query: r.name)` 作为 MEMORY 显式引用的兜底。
+
+### 12.3 KB 引用规则
+
+```
+若 r.injectionSlices && r.injectionSlices.length > 0
+  → 直接使用（精确路径）
+否则 若 !r.kbId && !r.entryId
+  → 返回 '[知识库引用缺少定位锚点，无法加载内容]'（受控失败）
+  → 禁止发起任何形式的模糊检索
+否则（有 kbId 或 entryId）
+  → 允许按锚点精确查询（非模糊 recall）
+  → knowledgeRetrievalMode 仍标记为 'explicit'
+```
+
+**禁止的退化路径**：无 kbId 无 entryId 时发起模糊 recall 查询冒充显式引用结果。
+
+### 12.4 TEXT 精确引用协议规则（2026-04 更新）
+
+#### 引用精度两档语义
+
+| 精度档 | 判断条件 | prompt 标注 | 执行链行为 | 标签格式 |
+|------|---------|------------|----------|---------|
+| **精确引用锚点**（precise reference anchor）| `textReference` 四元组存在 | `[precise reference anchor]` | 锁定正确 block；不得自动回填 `_sel_*` 冒充 selection | 内容摘要 + 弱位置后缀 |
+| **阅读上下文**（reading context）| 无四元组（行级或文件级）| `no precise anchor` | **不走零搜索**，由 `block_index` 块内搜索定位 | 内容摘要或文件名 |
+
+#### 字段传递链路（实现状态）
+
+| 字段 | 传递状态 | 备注 |
+|------|---------|------|
+| 文件路径 (`source`) | ✅ 已传 | `currentFile` 注入到 `ai_chat_stream` |
+| 选中内容文本 | ✅ 已传 | `selectedText` 注入 |
+| 精确位置四元组（startBlockId/Offset + endBlockId/Offset） | ✅ 已传 | 通过 `anchorFromSelection` 生成，注入为 `_sel_*` |
+| 工具调用精确定位（`extract_block_range`） | ✅ **已实现** | `tool_service.rs` L1674，Phase 0.5 **已完成** |
+| 行级引用 → block ID 补齐 | ✅ 已实现 | `enrichTextReferenceAnchor` (referenceHelpers.ts)，文件已打开时从 editor DOM 补齐；仅升级为精确引用锚点，不自动成为 `_sel_*` |
+
+#### 创建路径与精度档对应表
+
+| 创建路径 | 函数 | 四元组来源 | 精度档 |
+|---------|------|-----------|-------|
+| 编辑器选中 → 复制/拖拽 → 粘贴到 Chat | `createTextReferenceFromClipboard` + `enrichTextReferenceAnchor` | `CopyReferenceExtension.buildSourceData` → `createAnchorFromSelection` | 精确引用锚点 |
+| 发送时编辑器有活动选区 | `chatStore.sendMessage` 直接调用 `createAnchorFromSelection` | 编辑器当前 selection | 执行锚点 |
+| `@` 提及 → 文件选择 | `handleMentionSelect` → `FileReference` | 无（FileReference 不承担执行锚点）| — |
+| 剪贴板无 block ID（edge case）→ 文件已打开 | `enrichTextReferenceAnchor` 按行号补齐 | `createAnchorFromLineRange` → editor DOM | 精确引用锚点（升级） |
+| 剪贴板无 block ID → 文件未打开 | `createTextReferenceFromClipboard`，无补齐 | 无 | 阅读上下文 |
+
+#### 已废弃字段
+
+| 字段 | 状态 | 废弃原因 | 替代 |
+|------|------|---------|------|
+| `ReferenceProtocol.editTarget` | **废弃（2026-04-16）** | 仅支持单块定位，语义窄于四元组；前端已停止写入，后端已停止读取 | `ReferenceProtocol.textReference`（四元组） |
+
+`TextReference` 上的 `blockId` / `startOffset` / `endOffset` / `startBlockId` / `endBlockId` 兼容字段仍被 `extractTextReferenceAnchor` 读取（历史引用保护），但**新代码不得写入**这些字段，应直接写 `textReference`。
+
+#### Step 2a 锚点失效处理（2026-04-16 更新）
+
+当零搜索路径（`selection_start_block_id` 已注入）调用 `extract_block_range` 但块 ID 在文档中不存在时：
+
+- **正确行为**：返回 `Err`（错误码 `E_RANGE_UNRESOLVABLE`），前端展示受控错误，提示锚点已失效。
+- **禁止行为**：`unwrap_or_default()` 产生 `original_text=""` 并继续构造 `CanonicalDiffBuilt`。
+- **原因**：空 `originalText` 的 diff 在后续 `originalText` 校验时必然失败（`E_ORIGINALTEXT_MISMATCH`），但此时已消耗一次工具调用轮次，且前端会收到无效 diff 卡。
+
+#### 禁止的退化路径
+
+- 无四元组的 TEXT 引用不得伪装为执行锚点（prompt 必须标 `no precise anchor`）
+- 行级精度引用不得触发 `"apply your best judgment"` 类语义（已删除）
+- FileReference 不承担执行锚点职责，不得注入 `textReference` 字段
+- `editTarget` 字段不得再写入（`referenceProtocolAdapter.ts`）或读取（`ai_commands.rs`）
+
+---
+
 ## 十一、来源映射
 
 1. `R-AG-M-R-08_AI功能前置协议与标准.md`：前置约束、注入优先级、协议基线来源。  

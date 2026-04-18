@@ -1,6 +1,7 @@
 // 内联内容解析工具
 
 import { Reference, ReferenceType } from '../types/reference';
+import { buildContentLabel } from './contentLabel';
 
 // 输入节点类型（表示输入框中的一个节点：文本或引用）
 export interface InlineInputNode {
@@ -246,23 +247,25 @@ export async function loadChatMessagesForProtocol(chatTabId: string, messageIds:
 /**
  * 统一引用标签生成函数。
  * 依据：A-CORE-C-D-02 §3.3 引用标签 / §五 第10条
- * 格式：`来源名:位置简写`（有位置时）或 `来源名`（无位置时）
+ * 规则：
+ * - TextReference：内容摘要主标签，位置仅作弱后缀去重
+ * - 其他引用：保留各自资源名
  */
 export function getReferenceDisplayText(ref: Reference): string {
     switch (ref.type) {
         case ReferenceType.TEXT: {
             const textRef = ref as import('../types/reference').TextReference;
-            const name = textRef.fileName || '文本';
+            const snippet = buildContentLabel(textRef.content || textRef.preview, textRef.fileName || '文本');
             if (textRef.textReference) {
-                return `${name}:B${textRef.textReference.startBlockId.slice(-4)}`;
+                return `${snippet} · @${textRef.textReference.startOffset}`;
             }
             if (textRef.lineRange && (textRef.lineRange.start > 0 || textRef.lineRange.end > 0)) {
                 if (textRef.lineRange.start === textRef.lineRange.end) {
-                    return `${name}:L${textRef.lineRange.start}`;
+                    return `${snippet} · L${textRef.lineRange.start}`;
                 }
-                return `${name}:L${textRef.lineRange.start}-L${textRef.lineRange.end}`;
+                return `${snippet} · L${textRef.lineRange.start}-${textRef.lineRange.end}`;
             }
-            return name;
+            return snippet;
         }
         
         case ReferenceType.FILE: {
